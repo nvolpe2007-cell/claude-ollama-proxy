@@ -1,0 +1,22 @@
+{
+  "name": "claude-ollama-proxy",
+  "version": "1.0.0",
+  "description": "Proxy that translates Anthropic API (Claude) format to Ollama/OpenAI format",
+  "main": "proxy.js",
+  "scripts": {
+    "start": "node proxy.js",
+    "dev": "node --watch proxy.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "claude",
+    "ollama",
+    "anthropic",
+    "proxy",
+    "llm"
+  ],
+  "author": "nvolpe2007",
+  "license": "MIT"
+}

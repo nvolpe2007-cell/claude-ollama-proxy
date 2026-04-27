@@ -98,11 +98,17 @@ async function handleMessages(req, res) {
     ollamaRes = await fetch(`${OLLAMA_BASE}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(openaiReq)
+      body: JSON.stringify(openaiReq),
+      // No hard timeout on the request itself — models can be slow.
+      // Connection refused / DNS failures are caught below.
     });
   } catch (e) {
+    const isConnRefused = e.cause?.code === 'ECONNREFUSED' || e.message.includes('ECONNREFUSED');
+    const hint = isConnRefused
+      ? ' — is Ollama running? Try: ollama serve'
+      : '';
     res.writeHead(502);
-    res.end(JSON.stringify({ error: 'Ollama unreachable: ' + e.message }));
+    res.end(JSON.stringify({ error: { type: 'ollama_unreachable', message: e.message + hint } }));
     return;
   }
 
@@ -277,9 +283,35 @@ async function handleMessages(req, res) {
   res.end();
 }
 
+async function handleHealth(req, res) {
+  let ollamaOk = false;
+  let ollamaError = null;
+  try {
+    const check = await fetch(`${OLLAMA_BASE}/api/tags`, { signal: AbortSignal.timeout(3000) });
+    ollamaOk = check.ok;
+    if (!check.ok) ollamaError = `HTTP ${check.status}`;
+  } catch (e) {
+    ollamaError = e.message;
+  }
+
+  const status = ollamaOk ? 200 : 503;
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    status: ollamaOk ? 'ok' : 'degraded',
+    proxy: 'running',
+    ollama: ollamaOk ? 'reachable' : 'unreachable',
+    ollamaError: ollamaError || undefined,
+    model: MODEL,
+    port: Number(PORT),
+    timestamp: new Date().toISOString()
+  }));
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url === '/v1/messages') {
     await handleMessages(req, res);
+  } else if (req.method === 'GET' && req.url === '/health') {
+    await handleHealth(req, res);
   } else {
     res.writeHead(404);
     res.end('{"error":"not found"}');
