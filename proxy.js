@@ -1,6 +1,6 @@
 const http = require('http');
 
-const OLLAMA_BASE = 'http://localhost:11434';
+const OLLAMA_BASE = process.env.OLLAMA_HOST || 'http://localhost:11434';
 const MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:7b';
 const PORT = process.env.PROXY_PORT || 4000;
 
@@ -308,6 +308,11 @@ async function handleHealth(req, res) {
 }
 
 const server = http.createServer(async (req, res) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    console.log(`${req.method} ${req.url} ${res.statusCode} ${Date.now() - start}ms`);
+  });
+
   if (req.method === 'POST' && req.url === '/v1/messages') {
     await handleMessages(req, res);
   } else if (req.method === 'GET' && req.url === '/health') {
@@ -322,5 +327,6 @@ server.listen(PORT, () => {
   console.log(`\n  Claude-Ollama proxy ready`);
   console.log(`  Model : ${MODEL}`);
   console.log(`  Port  : ${PORT}`);
-  console.log(`  Ollama: ${OLLAMA_BASE}\n`);
+  console.log(`  Ollama: ${OLLAMA_BASE}`);
+  console.log(`  Logging: requests logged to stdout\n`);
 });

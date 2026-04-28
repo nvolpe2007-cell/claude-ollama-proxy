@@ -54,12 +54,13 @@ You should see:
 |---|---|---|
 | `OLLAMA_MODEL` | `qwen2.5:7b` | Ollama model to use for all requests |
 | `PROXY_PORT` | `4000` | Port the proxy listens on |
-| `OLLAMA_BASE` | `http://localhost:11434` | Base URL of your Ollama instance (hardcoded, edit proxy.js to change) |
+| `OLLAMA_HOST` | `http://localhost:11434` | Base URL of your Ollama instance |
 
-Example with a different model:
+Examples:
 
 ```bash
 OLLAMA_MODEL=llama3.1:8b node proxy.js
+OLLAMA_HOST=http://192.168.1.50:11434 node proxy.js   # remote Ollama instance
 ```
 
 ## Point Claude Code at the proxy
