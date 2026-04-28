@@ -1,4 +1,6 @@
 const http = require('http');
+const { URL } = require('url');
+const newsletter = require('./newsletter');
 
 const OLLAMA_BASE = process.env.OLLAMA_HOST || 'http://localhost:11434';
 const MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:7b';
@@ -313,10 +315,32 @@ const server = http.createServer(async (req, res) => {
     console.log(`${req.method} ${req.url} ${res.statusCode} ${Date.now() - start}ms`);
   });
 
-  if (req.method === 'POST' && req.url === '/v1/messages') {
+  const parsedUrl = new URL(req.url, `http://localhost`);
+  const path = parsedUrl.pathname;
+
+  if (req.method === 'POST' && path === '/v1/messages') {
     await handleMessages(req, res);
-  } else if (req.method === 'GET' && req.url === '/health') {
+  } else if (req.method === 'GET' && path === '/health') {
     await handleHealth(req, res);
+
+  // ── Newsletter public endpoints ─────────────────────────────────────────
+  } else if (req.method === 'POST' && path === '/api/newsletter/subscribe') {
+    const body = await readBody(req);
+    await newsletter.handleSubscribe(req, res, body);
+  } else if (req.method === 'GET' && path === '/api/newsletter/unsubscribe') {
+    await newsletter.handleUnsubscribe(req, res, parsedUrl);
+
+  // ── Newsletter admin endpoints (Bearer token required) ──────────────────
+  } else if (req.method === 'GET' && path === '/api/newsletter/admin/stats') {
+    await newsletter.handleAdminStats(req, res);
+  } else if (req.method === 'POST' && path === '/api/newsletter/admin/dispatch') {
+    const body = await readBody(req);
+    await newsletter.handleAdminDispatch(req, res, body);
+
+  // ── Newsletter admin UI ─────────────────────────────────────────────────
+  } else if (req.method === 'GET' && path === '/admin/newsletter') {
+    await newsletter.handleAdminPage(req, res, parsedUrl);
+
   } else {
     res.writeHead(404);
     res.end('{"error":"not found"}');
