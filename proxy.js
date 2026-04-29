@@ -115,6 +115,7 @@ async function handleMessages(req, res) {
   if (toolChoice !== undefined) openaiReq.tool_choice = toolChoice;
   if (anthropicReq.temperature !== undefined) openaiReq.temperature = anthropicReq.temperature;
   if (anthropicReq.top_p !== undefined) openaiReq.top_p = anthropicReq.top_p;
+  if (anthropicReq.stop_sequences?.length) openaiReq.stop = anthropicReq.stop_sequences;
 
   let ollamaRes;
   try {
@@ -165,7 +166,9 @@ async function handleMessages(req, res) {
       role: 'assistant',
       content,
       model: anthropicReq.model,
-      stop_reason: choice.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn',
+      stop_reason: choice.finish_reason === 'tool_calls' ? 'tool_use'
+               : choice.finish_reason === 'length'     ? 'max_tokens'
+               : 'end_turn',
       stop_sequence: null,
       usage: {
         input_tokens: data.usage?.prompt_tokens || 0,
@@ -279,7 +282,9 @@ async function handleMessages(req, res) {
 
         // Finish
         if (choice.finish_reason) {
-          const stopReason = choice.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn';
+          const stopReason = choice.finish_reason === 'tool_calls' ? 'tool_use'
+                          : choice.finish_reason === 'length'     ? 'max_tokens'
+                          : 'end_turn';
 
           if (textBlockOpen) {
             sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
@@ -324,8 +329,7 @@ async function handleHealth(req, res) {
     proxy: 'running',
     ollama: ollamaOk ? 'reachable' : 'unreachable',
     ollamaError: ollamaError || undefined,
-    defaultModel: MODEL,
-    modelSelection: 'per-request (omit claude-* prefix to override)',
+    model: MODEL,
     port: Number(PORT),
     timestamp: new Date().toISOString()
   }));
