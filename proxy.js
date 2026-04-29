@@ -82,8 +82,14 @@ async function handleMessages(req, res) {
 
   const streaming = anthropicReq.stream !== false;
 
+  // Use request model if it looks like an Ollama model name (not a claude-* alias).
+  // This lets callers switch models per-request without restarting the proxy.
+  const effectiveModel = (anthropicReq.model && !anthropicReq.model.startsWith('claude-'))
+    ? anthropicReq.model
+    : MODEL;
+
   const openaiReq = {
-    model: MODEL,
+    model: effectiveModel,
     messages: toOpenAIMessages(anthropicReq.messages, anthropicReq.system),
     stream: streaming,
     max_tokens: anthropicReq.max_tokens || 8192,
@@ -92,6 +98,7 @@ async function handleMessages(req, res) {
   const tools = toOpenAITools(anthropicReq.tools);
   if (tools) openaiReq.tools = tools;
   if (anthropicReq.temperature !== undefined) openaiReq.temperature = anthropicReq.temperature;
+  if (anthropicReq.top_p !== undefined) openaiReq.top_p = anthropicReq.top_p;
 
   let ollamaRes;
   try {
@@ -301,7 +308,8 @@ async function handleHealth(req, res) {
     proxy: 'running',
     ollama: ollamaOk ? 'reachable' : 'unreachable',
     ollamaError: ollamaError || undefined,
-    model: MODEL,
+    defaultModel: MODEL,
+    modelSelection: 'per-request (omit claude-* prefix to override)',
     port: Number(PORT),
     timestamp: new Date().toISOString()
   }));

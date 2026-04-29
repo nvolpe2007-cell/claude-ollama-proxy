@@ -125,8 +125,24 @@ Node 18+ supports `--watch` for automatic restarts on file change:
 npm run dev
 ```
 
+## Per-request model selection
+
+If you pass an Ollama model name (anything that doesn't start with `claude-`) as the `model` field in your request, the proxy will use it instead of `OLLAMA_MODEL`:
+
+```bash
+curl http://localhost:4000/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: ollama' \
+  -d '{
+    "model": "qwen2.5-coder:7b",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+Claude Code always sends a `claude-*` model name, so it will continue to use `OLLAMA_MODEL` automatically.
+
 ## Limitations
 
-- Model selection per-request is ignored; the proxy always uses `OLLAMA_MODEL`
-- Not all Anthropic API fields are forwarded (e.g. `top_p`, `top_k`)
+- `top_k` is not forwarded (Ollama accepts it via `options`, not the OpenAI-compat layer)
 - No authentication — intended for local use only
