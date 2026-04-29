@@ -60,6 +60,20 @@ function toOpenAITools(tools) {
   }));
 }
 
+// Anthropic tool_choice → OpenAI tool_choice
+function toOpenAIToolChoice(tc) {
+  if (!tc) return undefined;
+  switch (tc.type) {
+    case 'auto': return 'auto';
+    case 'none': return 'none';
+    // "any" = must call at least one tool → OpenAI "required"
+    case 'any':  return 'required';
+    // "tool" = force a specific function
+    case 'tool': return { type: 'function', function: { name: tc.name } };
+    default:     return undefined;
+  }
+}
+
 function sendSSE(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
@@ -97,6 +111,8 @@ async function handleMessages(req, res) {
 
   const tools = toOpenAITools(anthropicReq.tools);
   if (tools) openaiReq.tools = tools;
+  const toolChoice = toOpenAIToolChoice(anthropicReq.tool_choice);
+  if (toolChoice !== undefined) openaiReq.tool_choice = toolChoice;
   if (anthropicReq.temperature !== undefined) openaiReq.temperature = anthropicReq.temperature;
   if (anthropicReq.top_p !== undefined) openaiReq.top_p = anthropicReq.top_p;
 
