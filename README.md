@@ -85,6 +85,24 @@ $env:ANTHROPIC_API_KEY  = "ollama"
 claude
 ```
 
+## List available models
+
+```bash
+curl http://localhost:4000/v1/models
+```
+
+Returns the models currently loaded in Ollama in OpenAI-compatible format:
+
+```json
+{
+  "object": "list",
+  "data": [
+    { "id": "qwen2.5:7b",       "object": "model", "owned_by": "ollama" },
+    { "id": "qwen2.5-coder:7b", "object": "model", "owned_by": "ollama" }
+  ]
+}
+```
+
 ## Check the proxy is running
 
 ```bash

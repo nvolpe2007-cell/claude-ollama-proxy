@@ -318,6 +318,29 @@ async function handleMessages(req, res) {
   res.end();
 }
 
+async function handleModels(req, res) {
+  let data;
+  try {
+    const r = await fetch(`${OLLAMA_BASE}/api/tags`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error(`Ollama returned HTTP ${r.status}`);
+    data = await r.json();
+  } catch (e) {
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'ollama_unreachable', message: e.message } }));
+    return;
+  }
+
+  const models = (data.models || []).map(m => ({
+    id: m.name,
+    object: 'model',
+    created: m.modified_at ? Math.floor(new Date(m.modified_at).getTime() / 1000) : 0,
+    owned_by: 'ollama'
+  }));
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ object: 'list', data: models }));
+}
+
 async function handleHealth(req, res) {
   let ollamaOk = false;
   let ollamaError = null;
@@ -350,6 +373,8 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && req.url === '/v1/messages') {
     await handleMessages(req, res);
+  } else if (req.method === 'GET' && req.url === '/v1/models') {
+    await handleModels(req, res);
   } else if (req.method === 'GET' && req.url === '/health') {
     await handleHealth(req, res);
   } else {
@@ -365,3 +390,9 @@ server.listen(PORT, () => {
   console.log(`  Ollama: ${OLLAMA_BASE}`);
   console.log(`  Logging: requests logged to stdout\n`);
 });
+
+function shutdown() {
+  server.close(() => process.exit(0));
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
