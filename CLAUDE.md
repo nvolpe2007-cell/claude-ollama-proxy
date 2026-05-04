@@ -22,10 +22,19 @@ node proxy.js
 ```
 Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 
+## What's implemented
+- SSE streaming with full Anthropic event sequence
+- tool_use / tool_result round-trip (streaming and non-streaming)
+- Per-request model selection (pass any non-claude-* model name in the request)
+- GET /v1/models — lists models available in Ollama
+- GET /health — checks Ollama reachability, returns model + port
+- Graceful error handling when Ollama is offline (502 with hint)
+- Request logging (method, path, status, duration) to stdout
+- Keepalive SSE comments every 15 s to survive reverse-proxy timeouts
+- Graceful shutdown on SIGTERM / SIGINT
+- README.md with full setup instructions
+
 ## What to work on next
-1. Improve tool_use / tool_result round-trip support
-2. Add streaming response support
-3. Add model selection endpoint
-4. Write a README with setup instructions
-5. Add error handling for Ollama being offline
-6. Push to GitHub so it's accessible from other machines
+- Image content block support (convert Anthropic image blocks to OpenAI vision format)
+- Optional request auth (validate x-api-key so the proxy isn't fully open)
+- Docker / systemd service file for always-on deployment

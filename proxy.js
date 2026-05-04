@@ -203,6 +203,9 @@ async function handleMessages(req, res) {
   let inputTokens = 0;
   let outputTokens = 0;
 
+  // Prevent reverse-proxy read timeouts on slow models.
+  const keepAlive = setInterval(() => res.writableEnded || res.write(': keepalive\n\n'), 15_000);
+
   const reader = ollamaRes.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
@@ -305,7 +308,7 @@ async function handleMessages(req, res) {
           sendSSE(res, 'message_delta', {
             type: 'message_delta',
             delta: { stop_reason: stopReason, stop_sequence: null },
-            usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+            usage: { output_tokens: outputTokens }  // spec: input_tokens belongs in message_start
           });
           sendSSE(res, 'message_stop', { type: 'message_stop' });
         }
@@ -313,6 +316,11 @@ async function handleMessages(req, res) {
     }
   } catch (e) {
     console.error('Stream error:', e.message);
+    if (!res.writableEnded) {
+      sendSSE(res, 'error', { type: 'error', error: { type: 'stream_error', message: e.message } });
+    }
+  } finally {
+    clearInterval(keepAlive);
   }
 
   res.end();
