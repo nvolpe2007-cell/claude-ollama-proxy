@@ -27,9 +27,11 @@ function toOpenAIMessages(messages, system) {
     if (toolResults.length > 0) {
       // tool result messages become role:tool in OpenAI
       for (const tr of toolResults) {
-        const content = Array.isArray(tr.content)
+        if (!tr.tool_use_id) continue;
+        const rawContent = Array.isArray(tr.content)
           ? tr.content.map(c => c.text || '').join('')
           : (tr.content || '');
+        const content = tr.is_error ? `[ERROR] ${rawContent}` : rawContent;
         result.push({ role: 'tool', tool_call_id: tr.tool_use_id, content });
       }
       if (textParts.length > 0) {
@@ -107,6 +109,7 @@ async function handleMessages(req, res) {
     messages: toOpenAIMessages(anthropicReq.messages, anthropicReq.system),
     stream: streaming,
     max_tokens: anthropicReq.max_tokens || 8192,
+    ...(streaming && { stream_options: { include_usage: true } }),
   };
 
   const tools = toOpenAITools(anthropicReq.tools);
@@ -165,7 +168,7 @@ async function handleMessages(req, res) {
       type: 'message',
       role: 'assistant',
       content,
-      model: anthropicReq.model,
+      model: effectiveModel,
       stop_reason: choice.finish_reason === 'tool_calls' ? 'tool_use'
                : choice.finish_reason === 'length'     ? 'max_tokens'
                : 'end_turn',
@@ -190,13 +193,14 @@ async function handleMessages(req, res) {
     type: 'message_start',
     message: {
       id, type: 'message', role: 'assistant', content: [],
-      model: anthropicReq.model, stop_reason: null, stop_sequence: null,
+      model: effectiveModel, stop_reason: null, stop_sequence: null,
       usage: { input_tokens: 0, output_tokens: 0 }
     }
   });
 
   let textBlockOpen = false;
   const toolBlocks = {}; // openai tool index → { anthropicIndex, id, name, args }
+  let inputTokens = 0;
   let outputTokens = 0;
 
   const reader = ollamaRes.body.getReader();
@@ -220,7 +224,10 @@ async function handleMessages(req, res) {
         let chunk;
         try { chunk = JSON.parse(raw); } catch { continue; }
 
-        if (chunk.usage) outputTokens = chunk.usage.completion_tokens || 0;
+        if (chunk.usage) {
+          inputTokens  = chunk.usage.prompt_tokens     || inputTokens;
+          outputTokens = chunk.usage.completion_tokens || outputTokens;
+        }
 
         const choice = chunk.choices?.[0];
         if (!choice) continue;
@@ -298,7 +305,7 @@ async function handleMessages(req, res) {
           sendSSE(res, 'message_delta', {
             type: 'message_delta',
             delta: { stop_reason: stopReason, stop_sequence: null },
-            usage: { output_tokens: outputTokens }
+            usage: { input_tokens: inputTokens, output_tokens: outputTokens }
           });
           sendSSE(res, 'message_stop', { type: 'message_stop' });
         }
