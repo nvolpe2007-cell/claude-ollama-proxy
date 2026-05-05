@@ -15,6 +15,7 @@ Claude Code  ←  Anthropic response (streaming SSE or JSON)
 The proxy handles:
 - Full Anthropic `messages` format including multi-part content blocks
 - Tool use / tool results (`tool_use`, `tool_result`) ↔ OpenAI function calling
+- Image content blocks (base64 and URL sources) → OpenAI vision format
 - Both streaming (SSE) and non-streaming responses
 - Graceful errors when Ollama is offline
 
@@ -163,4 +164,5 @@ Claude Code always sends a `claude-*` model name, so it will continue to use `OL
 ## Limitations
 
 - `top_k` is not forwarded (Ollama accepts it via `options`, not the OpenAI-compat layer)
+- Image blocks require a vision-capable model (e.g. `llava`, `qwen2.5-vl`); text-only models will error
 - No authentication — intended for local use only

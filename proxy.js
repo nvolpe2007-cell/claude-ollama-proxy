@@ -39,7 +39,21 @@ function toOpenAIMessages(messages, system) {
       }
     } else {
       const text = textParts.map(b => b.text).join('');
-      const out = { role: msg.role, content: text || '' };
+      const imageParts = blocks.filter(b => b.type === 'image');
+
+      let content;
+      if (imageParts.length > 0) {
+        content = [];
+        if (text) content.push({ type: 'text', text });
+        for (const img of imageParts) {
+          const converted = imageBlockToOpenAI(img);
+          if (converted) content.push(converted);
+        }
+      } else {
+        content = text || '';
+      }
+
+      const out = { role: msg.role, content };
       if (toolUses.length > 0) {
         out.tool_calls = toolUses.map(tu => ({
           id: tu.id,
@@ -52,6 +66,18 @@ function toOpenAIMessages(messages, system) {
   }
 
   return result;
+}
+
+function imageBlockToOpenAI(block) {
+  const src = block.source;
+  if (!src) return null;
+  if (src.type === 'base64') {
+    return { type: 'image_url', image_url: { url: `data:${src.media_type};base64,${src.data}` } };
+  }
+  if (src.type === 'url') {
+    return { type: 'image_url', image_url: { url: src.url } };
+  }
+  return null;
 }
 
 function toOpenAITools(tools) {
