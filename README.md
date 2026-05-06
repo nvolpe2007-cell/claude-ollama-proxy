@@ -56,13 +56,41 @@ You should see:
 | `OLLAMA_MODEL` | `qwen2.5:7b` | Ollama model to use for all requests |
 | `PROXY_PORT` | `4000` | Port the proxy listens on |
 | `OLLAMA_HOST` | `http://localhost:11434` | Base URL of your Ollama instance |
+| `PROXY_API_KEY` | *(unset)* | If set, require this key on every API request |
 
 Examples:
 
 ```bash
 OLLAMA_MODEL=llama3.1:8b node proxy.js
 OLLAMA_HOST=http://192.168.1.50:11434 node proxy.js   # remote Ollama instance
+PROXY_API_KEY=mysecret node proxy.js                  # enable auth
 ```
+
+## Authentication
+
+By default the proxy is open to anyone who can reach port 4000. To restrict access, set `PROXY_API_KEY` to any secret string:
+
+```bash
+PROXY_API_KEY=mysecret node proxy.js
+```
+
+Callers must then pass the key in one of two ways:
+
+```bash
+# Option A — x-api-key header (what Claude Code uses by default)
+curl http://localhost:4000/v1/messages \
+  -H 'x-api-key: mysecret' \
+  ...
+
+# Option B — Authorization Bearer
+curl http://localhost:4000/v1/messages \
+  -H 'Authorization: Bearer mysecret' \
+  ...
+```
+
+When using Claude Code, set `ANTHROPIC_API_KEY=mysecret` and it will automatically send it as `x-api-key`.
+
+The `/health` endpoint is always unauthenticated so monitoring tools can reach it freely.
 
 ## Point Claude Code at the proxy
 
@@ -165,4 +193,4 @@ Claude Code always sends a `claude-*` model name, so it will continue to use `OL
 
 - `top_k` is not forwarded (Ollama accepts it via `options`, not the OpenAI-compat layer)
 - Image blocks require a vision-capable model (e.g. `llava`, `qwen2.5-vl`); text-only models will error
-- No authentication — intended for local use only
+- No TLS — use a reverse proxy (nginx, Caddy) if exposing beyond localhost

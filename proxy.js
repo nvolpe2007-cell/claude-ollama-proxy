@@ -1,8 +1,9 @@
 const http = require('http');
 
 const OLLAMA_BASE = process.env.OLLAMA_HOST || 'http://localhost:11434';
-const MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:7b';
-const PORT = process.env.PROXY_PORT || 4000;
+const MODEL      = process.env.OLLAMA_MODEL  || 'qwen2.5:7b';
+const PORT       = process.env.PROXY_PORT    || 4000;
+const PROXY_API_KEY = process.env.PROXY_API_KEY || null;
 
 // Anthropic messages/tools → OpenAI format
 function toOpenAIMessages(messages, system) {
@@ -108,6 +109,18 @@ function sendSSE(res, event, data) {
 
 function newMsgId() {
   return 'msg_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// Returns true if the request is authorised (or auth is disabled).
+// Writes a 401 and returns false if the key is wrong.
+function checkAuth(req, res) {
+  if (!PROXY_API_KEY) return true;
+  const fromHeader = req.headers['x-api-key']
+    || (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+  if (fromHeader === PROXY_API_KEY) return true;
+  res.writeHead(401, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'Invalid or missing API key' } }));
+  return false;
 }
 
 async function readBody(req) {
@@ -406,8 +419,10 @@ const server = http.createServer(async (req, res) => {
   });
 
   if (req.method === 'POST' && req.url === '/v1/messages') {
+    if (!checkAuth(req, res)) return;
     await handleMessages(req, res);
   } else if (req.method === 'GET' && req.url === '/v1/models') {
+    if (!checkAuth(req, res)) return;
     await handleModels(req, res);
   } else if (req.method === 'GET' && req.url === '/health') {
     await handleHealth(req, res);
@@ -422,7 +437,8 @@ server.listen(PORT, () => {
   console.log(`  Model : ${MODEL}`);
   console.log(`  Port  : ${PORT}`);
   console.log(`  Ollama: ${OLLAMA_BASE}`);
-  console.log(`  Logging: requests logged to stdout\n`);
+  console.log(`  Auth  : ${PROXY_API_KEY ? 'enabled (PROXY_API_KEY set)' : 'disabled (open access)'}`);
+  console.log(`  Logs  : requests logged to stdout\n`);
 });
 
 function shutdown() {

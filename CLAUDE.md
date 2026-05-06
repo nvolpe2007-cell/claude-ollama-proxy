@@ -12,8 +12,9 @@ A Node.js proxy that translates Anthropic API requests (Claude format) into Olla
 
 ## Config
 ```
-OLLAMA_MODEL=qwen2.5:7b   (default model)
-PROXY_PORT=4000            (default port)
+OLLAMA_MODEL=qwen2.5:7b        (default model)
+PROXY_PORT=4000                (default port)
+PROXY_API_KEY=<secret>         (optional; if set, enforces x-api-key / Bearer auth)
 ```
 
 ## How to run
@@ -33,8 +34,8 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - Request logging (method, path, status, duration) to stdout
 - Keepalive SSE comments every 15 s to survive reverse-proxy timeouts
 - Graceful shutdown on SIGTERM / SIGINT
+- Optional API key auth via PROXY_API_KEY (x-api-key or Authorization: Bearer)
 - README.md with full setup instructions
 
 ## What to work on next
-- Optional request auth (validate x-api-key so the proxy isn't fully open)
 - Docker / systemd service file for always-on deployment
