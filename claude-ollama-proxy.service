@@ -1,0 +1,21 @@
+[Unit]
+Description=Claude Ollama Proxy
+Documentation=https://github.com/nvolpe2007-cell/claude-ollama-proxy
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nobody
+WorkingDirectory=/opt/claude-ollama-proxy
+ExecStart=/usr/bin/node proxy.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=OLLAMA_HOST=http://localhost:11434
+Environment=OLLAMA_MODEL=qwen2.5:7b
+Environment=PROXY_PORT=4000
+
+[Install]
+WantedBy=multi-user.target

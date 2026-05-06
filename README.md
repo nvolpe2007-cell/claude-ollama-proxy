@@ -164,6 +164,71 @@ Smaller models that work well with Claude Code's tool-use patterns:
 | `llama3.1:8b` | `ollama pull llama3.1:8b` | Good general purpose |
 | `mistral:7b` | `ollama pull mistral:7b` | Fast, lower memory |
 
+## Docker
+
+Run Ollama and the proxy together with Docker Compose:
+
+```bash
+docker compose up -d
+```
+
+This starts:
+- **ollama** — exposes port `11434`, persists models in a named volume
+- **proxy** — exposes port `4000`, waits for Ollama to be healthy before starting
+
+Override the model or add an API key without editing the compose file:
+
+```bash
+OLLAMA_MODEL=llama3.1:8b PROXY_API_KEY=mysecret docker compose up -d
+```
+
+Pull a model into the running Ollama container:
+
+```bash
+docker compose exec ollama ollama pull qwen2.5:7b
+```
+
+If you already have Ollama running on the host (not in Docker), build and run only the proxy:
+
+```bash
+docker build -t claude-ollama-proxy .
+docker run -p 4000:4000 \
+  -e OLLAMA_HOST=http://host.docker.internal:11434 \
+  claude-ollama-proxy
+```
+
+## systemd service (always-on, Linux)
+
+Copy the repo, install the service, and start it:
+
+```bash
+sudo cp -r . /opt/claude-ollama-proxy
+sudo cp claude-ollama-proxy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now claude-ollama-proxy
+```
+
+To customise environment variables (model, port, API key) before enabling:
+
+```bash
+sudo systemctl edit claude-ollama-proxy
+```
+
+Add an `[Service]` override block, for example:
+
+```ini
+[Service]
+Environment=OLLAMA_MODEL=qwen2.5-coder:7b
+Environment=PROXY_API_KEY=mysecret
+```
+
+Check status and logs:
+
+```bash
+sudo systemctl status claude-ollama-proxy
+journalctl -u claude-ollama-proxy -f
+```
+
 ## Hot reload (development)
 
 Node 18+ supports `--watch` for automatic restarts on file change:

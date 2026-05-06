@@ -36,6 +36,10 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - Graceful shutdown on SIGTERM / SIGINT
 - Optional API key auth via PROXY_API_KEY (x-api-key or Authorization: Bearer)
 - README.md with full setup instructions
+- Dockerfile + docker-compose.yml (Ollama + proxy, health-check gated startup)
+- claude-ollama-proxy.service — systemd unit for always-on Linux deployment
 
 ## What to work on next
-- Docker / systemd service file for always-on deployment
+- top_k forwarding via Ollama's native /api/generate options field
+- TLS / HTTPS support (or document Caddy / nginx reverse-proxy setup)
+- Retry with exponential backoff on transient Ollama 5xx errors
