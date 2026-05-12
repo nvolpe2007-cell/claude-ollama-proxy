@@ -172,7 +172,9 @@ async function handleMessages(req, res) {
   const toolChoice = toOpenAIToolChoice(anthropicReq.tool_choice);
   if (toolChoice !== undefined) openaiReq.tool_choice = toolChoice;
   if (anthropicReq.temperature !== undefined) openaiReq.temperature = anthropicReq.temperature;
-  if (anthropicReq.top_p !== undefined) openaiReq.top_p = anthropicReq.top_p;
+  if (anthropicReq.top_p     !== undefined) openaiReq.top_p     = anthropicReq.top_p;
+  // top_k is an Anthropic parameter; pass through to Ollama's OpenAI-compat layer
+  if (anthropicReq.top_k     !== undefined) openaiReq.top_k     = anthropicReq.top_k;
   if (anthropicReq.stop_sequences?.length) openaiReq.stop = anthropicReq.stop_sequences;
 
   let ollamaRes;
@@ -257,6 +259,7 @@ async function handleMessages(req, res) {
   const toolBlocks = {}; // openai tool index → { anthropicIndex, id, name, args }
   let inputTokens = 0;
   let outputTokens = 0;
+  let stopReason = null; // set on finish_reason; message_delta deferred until after loop
 
   // Prevent reverse-proxy read timeouts on slow models.
   const keepAlive = setInterval(() => res.writableEnded || res.write(': keepalive\n\n'), 15_000);
@@ -345,11 +348,13 @@ async function handleMessages(req, res) {
           }
         }
 
-        // Finish
+        // Finish — close content blocks now but defer terminal events until after
+        // the loop so the trailing usage chunk (sent by Ollama after finish_reason)
+        // is processed first, giving us the correct outputTokens value.
         if (choice.finish_reason) {
-          const stopReason = choice.finish_reason === 'tool_calls' ? 'tool_use'
-                          : choice.finish_reason === 'length'     ? 'max_tokens'
-                          : 'end_turn';
+          stopReason = choice.finish_reason === 'tool_calls' ? 'tool_use'
+                     : choice.finish_reason === 'length'     ? 'max_tokens'
+                     : 'end_turn';
 
           if (textBlockOpen) {
             sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
@@ -359,15 +364,17 @@ async function handleMessages(req, res) {
               type: 'content_block_stop', index: tb.anthropicIndex
             });
           }
-
-          sendSSE(res, 'message_delta', {
-            type: 'message_delta',
-            delta: { stop_reason: stopReason, stop_sequence: null },
-            usage: { output_tokens: outputTokens }  // spec: input_tokens belongs in message_start
-          });
-          sendSSE(res, 'message_stop', { type: 'message_stop' });
         }
       }
+    }
+    // All chunks consumed — now emit terminal events with correct token counts.
+    if (stopReason && !res.writableEnded) {
+      sendSSE(res, 'message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: stopReason, stop_sequence: null },
+        usage: { output_tokens: outputTokens }
+      });
+      sendSSE(res, 'message_stop', { type: 'message_stop' });
     }
   } catch (e) {
     console.error('Stream error:', e.message);
