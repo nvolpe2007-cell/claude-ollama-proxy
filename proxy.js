@@ -129,6 +129,22 @@ async function readBody(req) {
   return body;
 }
 
+// Retry fetch on transient Ollama 5xx errors or network failures.
+// Does NOT retry 4xx (client errors) or once the streaming body has begun.
+async function fetchWithRetry(url, options, maxRetries = 3, baseDelay = 500) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.status < 500 || attempt >= maxRetries) return res;
+      console.warn(`Ollama ${res.status}, retrying (${attempt + 1}/${maxRetries})…`);
+    } catch (e) {
+      if (attempt >= maxRetries) throw e;
+      console.warn(`Ollama fetch error: ${e.message}, retrying (${attempt + 1}/${maxRetries})…`);
+    }
+    await new Promise(r => setTimeout(r, baseDelay * 2 ** attempt));
+  }
+}
+
 async function handleMessages(req, res) {
   const body = await readBody(req);
   let anthropicReq;
@@ -161,7 +177,7 @@ async function handleMessages(req, res) {
 
   let ollamaRes;
   try {
-    ollamaRes = await fetch(`${OLLAMA_BASE}/v1/chat/completions`, {
+    ollamaRes = await fetchWithRetry(`${OLLAMA_BASE}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(openaiReq),

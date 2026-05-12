@@ -38,8 +38,8 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - README.md with full setup instructions
 - Dockerfile + docker-compose.yml (Ollama + proxy, health-check gated startup)
 - claude-ollama-proxy.service — systemd unit for always-on Linux deployment
+- Retry with exponential backoff on transient Ollama 5xx errors (up to 3 retries: 500 ms, 1 s, 2 s)
 
 ## What to work on next
 - top_k forwarding via Ollama's native /api/generate options field
 - TLS / HTTPS support (or document Caddy / nginx reverse-proxy setup)
-- Retry with exponential backoff on transient Ollama 5xx errors
