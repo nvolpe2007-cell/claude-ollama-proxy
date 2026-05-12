@@ -254,8 +254,23 @@ curl http://localhost:4000/v1/messages \
 
 Claude Code always sends a `claude-*` model name, so it will continue to use `OLLAMA_MODEL` automatically.
 
+## Token counting
+
+```bash
+curl http://localhost:4000/v1/messages/count_tokens \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+Returns:
+
+```json
+{ "input_tokens": 5 }
+```
+
+The proxy calls Ollama's `/api/tokenize` endpoint for accuracy and falls back to a character-based estimate (`chars / 4`) if the model isn't loaded yet. Claude Code uses this endpoint for context-window management.
+
 ## Limitations
 
-- `top_k` is not forwarded (Ollama accepts it via `options`, not the OpenAI-compat layer)
 - Image blocks require a vision-capable model (e.g. `llava`, `qwen2.5-vl`); text-only models will error
 - No TLS — use a reverse proxy (nginx, Caddy) if exposing beyond localhost

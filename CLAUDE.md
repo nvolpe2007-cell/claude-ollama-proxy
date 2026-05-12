@@ -41,6 +41,7 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - Retry with exponential backoff on transient Ollama 5xx errors (up to 3 retries: 500 ms, 1 s, 2 s)
 - Correct streaming output_tokens: message_delta deferred until trailing usage chunk is consumed
 - top_k forwarding — passed through to Ollama's OpenAI-compat endpoint
+- POST /v1/messages/count_tokens — uses Ollama /api/tokenize for accuracy, falls back to chars/4
 
 ## What to work on next
 - TLS / HTTPS support (or document Caddy / nginx reverse-proxy setup)

@@ -411,6 +411,46 @@ async function handleModels(req, res) {
   res.end(JSON.stringify({ object: 'list', data: models }));
 }
 
+async function handleCountTokens(req, res) {
+  const body = await readBody(req);
+  let anthropicReq;
+  try { anthropicReq = JSON.parse(body); }
+  catch { res.writeHead(400); res.end('{"error":"bad json"}'); return; }
+
+  const effectiveModel = (anthropicReq.model && !anthropicReq.model.startsWith('claude-'))
+    ? anthropicReq.model
+    : MODEL;
+
+  // Flatten messages + system to a single string for tokenization.
+  // Tool schemas are appended as JSON since they consume context.
+  const messages = toOpenAIMessages(anthropicReq.messages || [], anthropicReq.system);
+  let prompt = messages.map(m => {
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.content)) return m.content.map(p => p.text || '').join('');
+    return '';
+  }).join('\n');
+  if (anthropicReq.tools?.length) prompt += '\n' + JSON.stringify(anthropicReq.tools);
+
+  // Try Ollama's native tokenize endpoint; fall back to char/4 estimate.
+  let inputTokens;
+  try {
+    const r = await fetch(`${OLLAMA_BASE}/api/tokenize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: effectiveModel, prompt }),
+      signal: AbortSignal.timeout(5000)
+    });
+    inputTokens = r.ok
+      ? (await r.json()).tokens?.length ?? Math.ceil(prompt.length / 4)
+      : Math.ceil(prompt.length / 4);
+  } catch {
+    inputTokens = Math.ceil(prompt.length / 4);
+  }
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ input_tokens: inputTokens }));
+}
+
 async function handleHealth(req, res) {
   let ollamaOk = false;
   let ollamaError = null;
@@ -444,6 +484,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url === '/v1/messages') {
     if (!checkAuth(req, res)) return;
     await handleMessages(req, res);
+  } else if (req.method === 'POST' && req.url === '/v1/messages/count_tokens') {
+    if (!checkAuth(req, res)) return;
+    await handleCountTokens(req, res);
   } else if (req.method === 'GET' && req.url === '/v1/models') {
     if (!checkAuth(req, res)) return;
     await handleModels(req, res);
