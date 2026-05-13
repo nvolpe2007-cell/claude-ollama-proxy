@@ -55,6 +55,7 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - URL routing strips query params (?foo=bar variants no longer 404)
 - Non-streaming path guards against empty Ollama choices array
 - MODEL_MAP env var — routes claude-* model names/prefixes to specific Ollama models; resolveModel() handles exact then prefix matching; startup log prints each mapping
+- Client abort propagation — AbortController tied to client socket close; cancels in-flight Ollama fetch when caller disconnects (e.g. Ctrl+C in Claude Code), freeing GPU resources immediately; AbortErrors silently discarded; fetchWithRetry never retries them
 
 ## What to work on next
 - TLS / HTTPS support (or document Caddy / nginx reverse-proxy setup)

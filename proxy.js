@@ -153,7 +153,7 @@ async function readBody(req) {
 }
 
 // Retry fetch on transient Ollama 5xx errors or network failures.
-// Does NOT retry 4xx (client errors) or once the streaming body has begun.
+// Does NOT retry 4xx (client errors), AbortErrors, or once the streaming body has begun.
 async function fetchWithRetry(url, options, maxRetries = 3, baseDelay = 500) {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -161,6 +161,7 @@ async function fetchWithRetry(url, options, maxRetries = 3, baseDelay = 500) {
       if (res.status < 500 || attempt >= maxRetries) return res;
       console.warn(`Ollama ${res.status}, retrying (${attempt + 1}/${maxRetries})…`);
     } catch (e) {
+      if (e.name === 'AbortError') throw e;  // never retry client-initiated aborts
       if (attempt >= maxRetries) throw e;
       console.warn(`Ollama fetch error: ${e.message}, retrying (${attempt + 1}/${maxRetries})…`);
     }
@@ -169,10 +170,18 @@ async function fetchWithRetry(url, options, maxRetries = 3, baseDelay = 500) {
 }
 
 async function handleMessages(req, res) {
+  // Abort Ollama request if the client disconnects — avoids wasting GPU compute.
+  const ac = new AbortController();
+  const onClientClose = () => { if (!res.writableEnded) ac.abort(); };
+  req.socket.once('close', onClientClose);
+
   const body = await readBody(req);
   let anthropicReq;
   try { anthropicReq = JSON.parse(body); }
-  catch { res.writeHead(400); res.end('{"error":"bad json"}'); return; }
+  catch {
+    req.socket.off('close', onClientClose);
+    res.writeHead(400); res.end('{"error":"bad json"}'); return;
+  }
 
   const streaming = anthropicReq.stream !== false;
 
@@ -204,10 +213,13 @@ async function handleMessages(req, res) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(openaiReq),
+      signal: ac.signal,
       // No hard timeout on the request itself — models can be slow.
       // Connection refused / DNS failures are caught below.
     });
   } catch (e) {
+    req.socket.off('close', onClientClose);
+    if (e.name === 'AbortError') { res.end(); return; }
     const isConnRefused = e.cause?.code === 'ECONNREFUSED' || e.message.includes('ECONNREFUSED');
     const hint = isConnRefused
       ? ' — is Ollama running? Try: ollama serve'
@@ -226,7 +238,15 @@ async function handleMessages(req, res) {
 
   // ── Non-streaming ─────────────────────────────────────────────────────────
   if (!streaming) {
-    const data = await ollamaRes.json();
+    let data;
+    try {
+      data = await ollamaRes.json();
+    } catch (e) {
+      req.socket.off('close', onClientClose);
+      if (e.name === 'AbortError') { res.end(); return; }
+      throw e;
+    }
+    req.socket.off('close', onClientClose);
     const choice = data.choices?.[0];
     if (!choice) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -403,11 +423,14 @@ async function handleMessages(req, res) {
       sendSSE(res, 'message_stop', { type: 'message_stop' });
     }
   } catch (e) {
-    console.error('Stream error:', e.message);
-    if (!res.writableEnded) {
-      sendSSE(res, 'error', { type: 'error', error: { type: 'stream_error', message: e.message } });
+    if (e.name !== 'AbortError') {
+      console.error('Stream error:', e.message);
+      if (!res.writableEnded) {
+        sendSSE(res, 'error', { type: 'error', error: { type: 'stream_error', message: e.message } });
+      }
     }
   } finally {
+    req.socket.off('close', onClientClose);
     clearInterval(keepAlive);
   }
 
