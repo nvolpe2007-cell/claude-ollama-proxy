@@ -15,7 +15,14 @@ A Node.js proxy that translates Anthropic API requests (Claude format) into Olla
 OLLAMA_MODEL=qwen2.5:7b        (default model)
 PROXY_PORT=4000                (default port)
 PROXY_API_KEY=<secret>         (optional; if set, enforces x-api-key / Bearer auth)
+MODEL_MAP=<json>               (optional; maps claude-* names/prefixes to Ollama models)
 ```
+
+### MODEL_MAP example
+```
+MODEL_MAP='{"claude-3-haiku":"qwen2.5:7b","claude-3-sonnet":"qwen2.5:14b","claude-3-opus":"qwen2.5:72b"}'
+```
+Exact match wins; if no exact match, any key that is a prefix of the requested model name is used (e.g. `"claude-3-haiku"` matches `claude-3-haiku-20240307`). Non-`claude-*` model names always pass through unchanged.
 
 ## How to run
 ```bash
@@ -47,6 +54,7 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - Process-level uncaughtException/unhandledRejection handlers keep server alive on stray async errors
 - URL routing strips query params (?foo=bar variants no longer 404)
 - Non-streaming path guards against empty Ollama choices array
+- MODEL_MAP env var — routes claude-* model names/prefixes to specific Ollama models; resolveModel() handles exact then prefix matching; startup log prints each mapping
 
 ## What to work on next
 - TLS / HTTPS support (or document Caddy / nginx reverse-proxy setup)

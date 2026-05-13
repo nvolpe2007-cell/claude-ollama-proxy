@@ -5,6 +5,29 @@ const MODEL      = process.env.OLLAMA_MODEL  || 'qwen2.5:7b';
 const PORT       = process.env.PROXY_PORT    || 4000;
 const PROXY_API_KEY = process.env.PROXY_API_KEY || null;
 
+// Optional JSON map: claude-* model name (or prefix) → Ollama model name.
+// Exact match wins; then prefix match (e.g. "claude-3-haiku" matches any claude-3-haiku-*).
+// Non-claude-* names in requests always pass through as-is regardless of this map.
+// Example: MODEL_MAP='{"claude-3-haiku":"qwen2.5:7b","claude-3-opus":"qwen2.5:72b"}'
+let MODEL_MAP = {};
+try {
+  if (process.env.MODEL_MAP) MODEL_MAP = JSON.parse(process.env.MODEL_MAP);
+} catch (e) {
+  console.warn('Warning: MODEL_MAP is not valid JSON, ignoring:', e.message);
+}
+
+function resolveModel(requestedModel) {
+  if (!requestedModel) return MODEL;
+  if (MODEL_MAP[requestedModel]) return MODEL_MAP[requestedModel];
+  if (requestedModel.startsWith('claude-')) {
+    for (const [key, target] of Object.entries(MODEL_MAP)) {
+      if (requestedModel.startsWith(key)) return target;
+    }
+    return MODEL;
+  }
+  return requestedModel;
+}
+
 // Anthropic messages/tools → OpenAI format
 function toOpenAIMessages(messages, system) {
   const result = [];
@@ -155,9 +178,7 @@ async function handleMessages(req, res) {
 
   // Use request model if it looks like an Ollama model name (not a claude-* alias).
   // This lets callers switch models per-request without restarting the proxy.
-  const effectiveModel = (anthropicReq.model && !anthropicReq.model.startsWith('claude-'))
-    ? anthropicReq.model
-    : MODEL;
+  const effectiveModel = resolveModel(anthropicReq.model);
 
   const openaiReq = {
     model: effectiveModel,
@@ -422,9 +443,7 @@ async function handleCountTokens(req, res) {
   try { anthropicReq = JSON.parse(body); }
   catch { res.writeHead(400); res.end('{"error":"bad json"}'); return; }
 
-  const effectiveModel = (anthropicReq.model && !anthropicReq.model.startsWith('claude-'))
-    ? anthropicReq.model
-    : MODEL;
+  const effectiveModel = resolveModel(anthropicReq.model);
 
   // Flatten messages + system to a single string for tokenization.
   // Tool schemas are appended as JSON since they consume context.
@@ -524,6 +543,10 @@ process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:
 server.listen(PORT, () => {
   console.log(`\n  Claude-Ollama proxy ready`);
   console.log(`  Model : ${MODEL}`);
+  if (Object.keys(MODEL_MAP).length > 0) {
+    for (const [k, v] of Object.entries(MODEL_MAP))
+      console.log(`  Map   : ${k} → ${v}`);
+  }
   console.log(`  Port  : ${PORT}`);
   console.log(`  Ollama: ${OLLAMA_BASE}`);
   console.log(`  Auth  : ${PROXY_API_KEY ? 'enabled (PROXY_API_KEY set)' : 'disabled (open access)'}`);
