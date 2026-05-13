@@ -42,6 +42,11 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - Correct streaming output_tokens: message_delta deferred until trailing usage chunk is consumed
 - top_k forwarding — passed through to Ollama's OpenAI-compat endpoint
 - POST /v1/messages/count_tokens — uses Ollama /api/tokenize for accuracy, falls back to chars/4
+- Streaming message_delta includes both input_tokens and output_tokens from trailing Ollama usage chunk
+- Router-level try/catch prevents handler throws from becoming unhandled promise rejections (crash)
+- Process-level uncaughtException/unhandledRejection handlers keep server alive on stray async errors
+- URL routing strips query params (?foo=bar variants no longer 404)
+- Non-streaming path guards against empty Ollama choices array
 
 ## What to work on next
 - TLS / HTTPS support (or document Caddy / nginx reverse-proxy setup)

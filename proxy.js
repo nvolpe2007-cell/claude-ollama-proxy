@@ -206,7 +206,12 @@ async function handleMessages(req, res) {
   // ── Non-streaming ─────────────────────────────────────────────────────────
   if (!streaming) {
     const data = await ollamaRes.json();
-    const choice = data.choices[0];
+    const choice = data.choices?.[0];
+    if (!choice) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'ollama_error', message: 'Empty choices in Ollama response' } }));
+      return;
+    }
     const msg = choice.message;
 
     const content = [];
@@ -372,7 +377,7 @@ async function handleMessages(req, res) {
       sendSSE(res, 'message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: outputTokens }
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens }
       });
       sendSSE(res, 'message_stop', { type: 'message_stop' });
     }
@@ -481,22 +486,40 @@ const server = http.createServer(async (req, res) => {
     console.log(`${req.method} ${req.url} ${res.statusCode} ${Date.now() - start}ms`);
   });
 
-  if (req.method === 'POST' && req.url === '/v1/messages') {
-    if (!checkAuth(req, res)) return;
-    await handleMessages(req, res);
-  } else if (req.method === 'POST' && req.url === '/v1/messages/count_tokens') {
-    if (!checkAuth(req, res)) return;
-    await handleCountTokens(req, res);
-  } else if (req.method === 'GET' && req.url === '/v1/models') {
-    if (!checkAuth(req, res)) return;
-    await handleModels(req, res);
-  } else if (req.method === 'GET' && req.url === '/health') {
-    await handleHealth(req, res);
-  } else {
-    res.writeHead(404);
-    res.end('{"error":"not found"}');
+  // Strip query string before routing so ?foo=bar variants still match.
+  const path = req.url.split('?')[0];
+
+  try {
+    if (req.method === 'POST' && path === '/v1/messages') {
+      if (!checkAuth(req, res)) return;
+      await handleMessages(req, res);
+    } else if (req.method === 'POST' && path === '/v1/messages/count_tokens') {
+      if (!checkAuth(req, res)) return;
+      await handleCountTokens(req, res);
+    } else if (req.method === 'GET' && path === '/v1/models') {
+      if (!checkAuth(req, res)) return;
+      await handleModels(req, res);
+    } else if (req.method === 'GET' && path === '/health') {
+      await handleHealth(req, res);
+    } else {
+      res.writeHead(404);
+      res.end('{"error":"not found"}');
+    }
+  } catch (e) {
+    console.error('Unhandled request error:', e);
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'internal_error', message: e.message } }));
+    } else if (!res.writableEnded) {
+      res.end();
+    }
   }
 });
+
+// Keep the process alive if a stray async error escapes a request handler.
+// Node 15+ crashes on unhandledRejection by default; log and continue instead.
+process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
+process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason));
 
 server.listen(PORT, () => {
   console.log(`\n  Claude-Ollama proxy ready`);
