@@ -57,6 +57,9 @@ You should see:
 | `PROXY_PORT` | `4000` | Port the proxy listens on |
 | `OLLAMA_HOST` | `http://localhost:11434` | Base URL of your Ollama instance |
 | `PROXY_API_KEY` | *(unset)* | If set, require this key on every API request |
+| `MODEL_MAP` | *(unset)* | JSON map of `claude-*` names/prefixes to Ollama models (see below) |
+| `PROXY_TLS_CERT` | *(unset)* | Path to PEM certificate file — enables HTTPS when set |
+| `PROXY_TLS_KEY` | *(unset)* | Path to PEM private key file — required when cert is set |
 
 Examples:
 
@@ -153,6 +156,33 @@ Returns `200 OK` when Ollama is reachable:
 
 Returns `503` with `"status": "degraded"` if Ollama is offline.
 
+## Model mapping (MODEL_MAP)
+
+Map `claude-*` model names to specific Ollama models so Claude Code's model selection works naturally:
+
+```bash
+MODEL_MAP='{"claude-3-haiku":"qwen2.5:7b","claude-3-sonnet":"qwen2.5:14b","claude-3-opus":"qwen2.5:72b"}' node proxy.js
+```
+
+Exact match wins; if no exact match, any key that is a **prefix** of the requested model name is used (e.g. `"claude-3-haiku"` matches `claude-3-haiku-20240307`). Non-`claude-*` model names always pass through unchanged.
+
+## TLS / HTTPS
+
+Point the proxy at your PEM files to enable HTTPS:
+
+```bash
+PROXY_TLS_CERT=/etc/ssl/proxy.crt PROXY_TLS_KEY=/etc/ssl/proxy.key node proxy.js
+```
+
+## Thinking models
+
+The proxy automatically extracts `<think>…</think>` blocks produced by reasoning models (DeepSeek-R1, Qwen3-thinking, etc.) and converts them to proper Anthropic `thinking` content blocks. Claude Code displays them as structured reasoning without any extra configuration.
+
+```bash
+ollama pull deepseek-r1:7b
+OLLAMA_MODEL=deepseek-r1:7b node proxy.js
+```
+
 ## Recommended models
 
 Smaller models that work well with Claude Code's tool-use patterns:
@@ -163,6 +193,8 @@ Smaller models that work well with Claude Code's tool-use patterns:
 | `qwen2.5-coder:7b` | `ollama pull qwen2.5-coder:7b` | Better for coding tasks |
 | `llama3.1:8b` | `ollama pull llama3.1:8b` | Good general purpose |
 | `mistral:7b` | `ollama pull mistral:7b` | Fast, lower memory |
+| `deepseek-r1:7b` | `ollama pull deepseek-r1:7b` | Thinking model; reasoning shown as structured blocks |
+| `qwen3:8b` | `ollama pull qwen3:8b` | Thinking model with strong coding ability |
 
 ## Docker
 
@@ -273,4 +305,4 @@ The proxy calls Ollama's `/api/tokenize` endpoint for accuracy and falls back to
 ## Limitations
 
 - Image blocks require a vision-capable model (e.g. `llava`, `qwen2.5-vl`); text-only models will error
-- No TLS — use a reverse proxy (nginx, Caddy) if exposing beyond localhost
+- `thinking` block signatures are synthetic placeholders — round-tripping thinking blocks across turns is not supported

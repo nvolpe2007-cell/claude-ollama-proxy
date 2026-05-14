@@ -138,6 +138,24 @@ function newMsgId() {
   return 'msg_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
+// Splits raw model text into alternating thinking/text parts by <think>…</think> tags.
+// Returns null when no <think> tag is present (fast path for non-thinking models).
+function extractThinkingParts(text) {
+  if (!text.includes('<think>')) return null;
+  const parts = [];
+  const re = /<think>([\s\S]*?)<\/think>/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    const before = text.slice(last, m.index).trim();
+    if (before) parts.push({ type: 'text', text: before });
+    parts.push({ type: 'thinking', thinking: m[1] });
+    last = re.lastIndex;
+  }
+  const after = text.slice(last).trim();
+  if (after) parts.push({ type: 'text', text: after });
+  return parts.length ? parts : null;
+}
+
 // Returns true if the request is authorised (or auth is disabled).
 // Writes a 401 and returns false if the key is wrong.
 function checkAuth(req, res) {
@@ -260,7 +278,22 @@ async function handleMessages(req, res) {
     const msg = choice.message;
 
     const content = [];
-    if (msg.content) content.push({ type: 'text', text: msg.content });
+    if (msg.content) {
+      const thinkParts = extractThinkingParts(msg.content);
+      if (thinkParts) {
+        for (const p of thinkParts) {
+          if (p.type === 'thinking') {
+            // signature is an opaque field required by the Anthropic spec for round-trips;
+            // we use a placeholder since Ollama has no cryptographic thinking signing.
+            content.push({ type: 'thinking', thinking: p.thinking, signature: 'ollama-proxy-extracted' });
+          } else {
+            content.push({ type: 'text', text: p.text });
+          }
+        }
+      } else {
+        content.push({ type: 'text', text: msg.content });
+      }
+    }
     if (msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         let input = {};
@@ -306,10 +339,88 @@ async function handleMessages(req, res) {
   });
 
   let textBlockOpen = false;
-  const toolBlocks = {}; // openai tool index → { anthropicIndex, id, name, args }
+  let textIndex = 0;           // anthropic block index of the text block (captured on first open)
+  const toolBlocks = {};       // openai tool index → { anthropicIndex, id, name, args }
   let inputTokens = 0;
   let outputTokens = 0;
-  let stopReason = null; // set on finish_reason; message_delta deferred until after loop
+  let stopReason = null;       // set on finish_reason; message_delta deferred until after loop
+
+  // State machine for routing <think>…</think> content to Anthropic thinking blocks.
+  // Models like DeepSeek-R1 and Qwen3-thinking prefix their response with a <think> block.
+  let thinkState = 'initial';  // 'initial' | 'thinking' | 'text'
+  let thinkBuf   = '';         // chars pending routing (straddle tag boundaries)
+  let thinkCount = 0;          // thinking blocks fully closed so far
+
+  function routeThinkChunk(flush) {
+    for (;;) {
+      if (!thinkBuf.length) break;
+
+      if (thinkState === 'initial') {
+        const tag = '<think>';
+        if (thinkBuf.startsWith(tag)) {
+          sendSSE(res, 'content_block_start', {
+            type: 'content_block_start', index: thinkCount,
+            content_block: { type: 'thinking', thinking: '' }
+          });
+          sendSSE(res, 'ping', { type: 'ping' });
+          thinkBuf = thinkBuf.slice(tag.length);
+          thinkState = 'thinking';
+          continue;
+        }
+        // Partial prefix of '<think>' — wait for more data unless flushing.
+        if (!flush && tag.startsWith(thinkBuf)) break;
+        // Not a think tag — treat remainder as plain text.
+        thinkState = 'text';
+        continue;
+      }
+
+      if (thinkState === 'thinking') {
+        const etag = '</think>';
+        const ei = thinkBuf.indexOf(etag);
+        if (ei !== -1) {
+          if (ei > 0) sendSSE(res, 'content_block_delta', {
+            type: 'content_block_delta', index: thinkCount,
+            delta: { type: 'thinking_delta', thinking: thinkBuf.slice(0, ei) }
+          });
+          sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkCount });
+          thinkCount++;
+          thinkBuf = thinkBuf.slice(ei + etag.length);
+          thinkState = 'initial';
+          continue;
+        }
+        // No closing tag yet. Hold back enough chars to detect a split '</think>'.
+        const lt = thinkBuf.lastIndexOf('<');
+        const safe = flush
+          ? thinkBuf.length
+          : (lt > 0 ? lt : Math.max(0, thinkBuf.length - etag.length));
+        if (safe > 0) {
+          sendSSE(res, 'content_block_delta', {
+            type: 'content_block_delta', index: thinkCount,
+            delta: { type: 'thinking_delta', thinking: thinkBuf.slice(0, safe) }
+          });
+          thinkBuf = thinkBuf.slice(safe);
+        }
+        break;
+      }
+
+      // thinkState === 'text'
+      if (!textBlockOpen) {
+        textIndex = thinkCount;  // thinking blocks, if any, occupy lower indices
+        sendSSE(res, 'content_block_start', {
+          type: 'content_block_start', index: textIndex,
+          content_block: { type: 'text', text: '' }
+        });
+        sendSSE(res, 'ping', { type: 'ping' });
+        textBlockOpen = true;
+      }
+      sendSSE(res, 'content_block_delta', {
+        type: 'content_block_delta', index: textIndex,
+        delta: { type: 'text_delta', text: thinkBuf }
+      });
+      thinkBuf = '';
+      break;
+    }
+  }
 
   // Prevent reverse-proxy read timeouts on slow models.
   const keepAlive = setInterval(() => res.writableEnded || res.write(': keepalive\n\n'), 15_000);
@@ -344,20 +455,10 @@ async function handleMessages(req, res) {
         if (!choice) continue;
         const delta = choice.delta;
 
-        // Text delta
+        // Text delta — route through <think> state machine
         if (delta.content) {
-          if (!textBlockOpen) {
-            sendSSE(res, 'content_block_start', {
-              type: 'content_block_start', index: 0,
-              content_block: { type: 'text', text: '' }
-            });
-            sendSSE(res, 'ping', { type: 'ping' });
-            textBlockOpen = true;
-          }
-          sendSSE(res, 'content_block_delta', {
-            type: 'content_block_delta', index: 0,
-            delta: { type: 'text_delta', text: delta.content }
-          });
+          thinkBuf += delta.content;
+          routeThinkChunk(false);
         }
 
         // Tool call deltas
@@ -365,7 +466,7 @@ async function handleMessages(req, res) {
           for (const tc of delta.tool_calls) {
             const oi = tc.index; // openai index
             if (!toolBlocks[oi]) {
-              const ai = (textBlockOpen ? 1 : 0) + oi; // anthropic block index
+              const ai = thinkCount + (textBlockOpen ? 1 : 0) + oi;
               toolBlocks[oi] = {
                 anthropicIndex: ai,
                 id: tc.id || `toolu_${oi}`,
@@ -406,8 +507,13 @@ async function handleMessages(req, res) {
                      : choice.finish_reason === 'length'     ? 'max_tokens'
                      : 'end_turn';
 
+          routeThinkChunk(true);
+          if (thinkState === 'thinking') {
+            sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkCount });
+            thinkCount++;
+          }
           if (textBlockOpen) {
-            sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+            sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textIndex });
           }
           for (const tb of Object.values(toolBlocks)) {
             sendSSE(res, 'content_block_stop', {
@@ -421,8 +527,13 @@ async function handleMessages(req, res) {
     // Guard against streams that end without an explicit finish_reason.
     if (!stopReason) {
       stopReason = 'end_turn';
+      routeThinkChunk(true);
+      if (thinkState === 'thinking') {
+        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkCount });
+        thinkCount++;
+      }
       if (textBlockOpen) {
-        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textIndex });
       }
       for (const tb of Object.values(toolBlocks)) {
         sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: tb.anthropicIndex });
