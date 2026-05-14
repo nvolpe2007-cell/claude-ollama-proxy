@@ -16,6 +16,8 @@ OLLAMA_MODEL=qwen2.5:7b        (default model)
 PROXY_PORT=4000                (default port)
 PROXY_API_KEY=<secret>         (optional; if set, enforces x-api-key / Bearer auth)
 MODEL_MAP=<json>               (optional; maps claude-* names/prefixes to Ollama models)
+PROXY_TLS_CERT=<path>          (optional; path to PEM cert file — enables HTTPS)
+PROXY_TLS_KEY=<path>           (optional; path to PEM key file — required when cert is set)
 ```
 
 ### MODEL_MAP example
@@ -56,6 +58,5 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - Non-streaming path guards against empty Ollama choices array
 - MODEL_MAP env var — routes claude-* model names/prefixes to specific Ollama models; resolveModel() handles exact then prefix matching; startup log prints each mapping
 - Client abort propagation — AbortController tied to client socket close; cancels in-flight Ollama fetch when caller disconnects (e.g. Ctrl+C in Claude Code), freeing GPU resources immediately; AbortErrors silently discarded; fetchWithRetry never retries them
-
-## What to work on next
-- TLS / HTTPS support (or document Caddy / nginx reverse-proxy setup)
+- TLS / HTTPS support — set PROXY_TLS_CERT + PROXY_TLS_KEY to enable; proxy creates an https.createServer with those PEM files; startup logs TLS status; exits with a clear error if files cannot be read
+- Streaming robustness: fallback for streams that end without an explicit finish_reason — defaults stop_reason to end_turn and closes any open content blocks before emitting message_delta/message_stop

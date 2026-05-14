@@ -1,9 +1,13 @@
-const http = require('http');
+const http  = require('http');
+const https = require('https');
+const fs    = require('fs');
 
-const OLLAMA_BASE = process.env.OLLAMA_HOST || 'http://localhost:11434';
-const MODEL      = process.env.OLLAMA_MODEL  || 'qwen2.5:7b';
-const PORT       = process.env.PROXY_PORT    || 4000;
-const PROXY_API_KEY = process.env.PROXY_API_KEY || null;
+const OLLAMA_BASE   = process.env.OLLAMA_HOST     || 'http://localhost:11434';
+const MODEL         = process.env.OLLAMA_MODEL    || 'qwen2.5:7b';
+const PORT          = process.env.PROXY_PORT      || 4000;
+const PROXY_API_KEY = process.env.PROXY_API_KEY   || null;
+const TLS_CERT      = process.env.PROXY_TLS_CERT  || null;
+const TLS_KEY       = process.env.PROXY_TLS_KEY   || null;
 
 // Optional JSON map: claude-* model name (or prefix) → Ollama model name.
 // Exact match wins; then prefix match (e.g. "claude-3-haiku" matches any claude-3-haiku-*).
@@ -236,7 +240,7 @@ async function handleMessages(req, res) {
     return;
   }
 
-  // ── Non-streaming ─────────────────────────────────────────────────────────
+  // ── Non-streaming ───────────────────────────────────────────────────────────────────────────
   if (!streaming) {
     let data;
     try {
@@ -284,7 +288,7 @@ async function handleMessages(req, res) {
     return;
   }
 
-  // ── Streaming ─────────────────────────────────────────────────────────────
+  // ── Streaming ───────────────────────────────────────────────────────────────────────────────
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -413,8 +417,18 @@ async function handleMessages(req, res) {
         }
       }
     }
-    // All chunks consumed — now emit terminal events with correct token counts.
-    if (stopReason && !res.writableEnded) {
+    // All chunks consumed — emit terminal events with correct token counts.
+    // Guard against streams that end without an explicit finish_reason.
+    if (!stopReason) {
+      stopReason = 'end_turn';
+      if (textBlockOpen) {
+        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+      }
+      for (const tb of Object.values(toolBlocks)) {
+        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: tb.anthropicIndex });
+      }
+    }
+    if (!res.writableEnded) {
       sendSSE(res, 'message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
@@ -522,7 +536,7 @@ async function handleHealth(req, res) {
   }));
 }
 
-const server = http.createServer(async (req, res) => {
+async function requestHandler(req, res) {
   const start = Date.now();
   res.on('finish', () => {
     console.log(`${req.method} ${req.url} ${res.statusCode} ${Date.now() - start}ms`);
@@ -556,7 +570,21 @@ const server = http.createServer(async (req, res) => {
       res.end();
     }
   }
-});
+}
+
+let server;
+if (TLS_CERT && TLS_KEY) {
+  let tlsOpts;
+  try {
+    tlsOpts = { cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) };
+  } catch (e) {
+    console.error(`Fatal: cannot read TLS cert/key: ${e.message}`);
+    process.exit(1);
+  }
+  server = https.createServer(tlsOpts, requestHandler);
+} else {
+  server = http.createServer(requestHandler);
+}
 
 // Keep the process alive if a stray async error escapes a request handler.
 // Node 15+ crashes on unhandledRejection by default; log and continue instead.
@@ -573,6 +601,7 @@ server.listen(PORT, () => {
   console.log(`  Port  : ${PORT}`);
   console.log(`  Ollama: ${OLLAMA_BASE}`);
   console.log(`  Auth  : ${PROXY_API_KEY ? 'enabled (PROXY_API_KEY set)' : 'disabled (open access)'}`);
+  console.log(`  TLS   : ${TLS_CERT ? `enabled (cert: ${TLS_CERT})` : 'disabled (HTTP)'}`);
   console.log(`  Logs  : requests logged to stdout\n`);
 });
 
