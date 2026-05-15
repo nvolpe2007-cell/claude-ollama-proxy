@@ -18,6 +18,7 @@ PROXY_API_KEY=<secret>         (optional; if set, enforces x-api-key / Bearer au
 MODEL_MAP=<json>               (optional; maps claude-* names/prefixes to Ollama models)
 PROXY_TLS_CERT=<path>          (optional; path to PEM cert file — enables HTTPS)
 PROXY_TLS_KEY=<path>           (optional; path to PEM key file — required when cert is set)
+CORS_ORIGIN=<origin>           (optional; Access-Control-Allow-Origin value; default '*')
 ```
 
 ### MODEL_MAP example
@@ -64,3 +65,6 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - Streaming thinking `signature_delta` — emits a `signature_delta` event before each `content_block_stop` for thinking blocks, completing the Anthropic extended-thinking streaming protocol so clients that validate thinking signatures don't reject the response
 - Prompt-caching compat fields — all usage objects (streaming `message_start`, `message_delta`, and non-streaming response) include `cache_creation_input_tokens: 0` and `cache_read_input_tokens: 0`; Claude Code sends `anthropic-beta: prompt-caching-2024-07-31` on every request and expects these fields
 - `document` content block support — Anthropic `document` blocks in user messages, system prompts, and tool results are converted to text for Ollama; text-source documents pass through directly; base64-encoded text documents are decoded; binary (PDF) and URL sources get an informative placeholder; block title is preserved as a header
+- CORS support — all responses include Access-Control-Allow-Origin/Methods/Headers; OPTIONS preflight requests return 204 immediately so browser-based callers work without a separate CORS proxy; CORS_ORIGIN env var restricts the allowed origin (default '*')
+- `seed` parameter forwarding — passed through to Ollama for reproducible outputs
+- `disable_parallel_tool_use` forwarding — maps Anthropic's disable_parallel_tool_use:true to OpenAI's parallel_tool_calls:false

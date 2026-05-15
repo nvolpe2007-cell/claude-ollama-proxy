@@ -60,6 +60,7 @@ You should see:
 | `MODEL_MAP` | *(unset)* | JSON map of `claude-*` names/prefixes to Ollama models (see below) |
 | `PROXY_TLS_CERT` | *(unset)* | Path to PEM certificate file — enables HTTPS when set |
 | `PROXY_TLS_KEY` | *(unset)* | Path to PEM private key file — required when cert is set |
+| `CORS_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`; set to a specific origin to restrict browser access |
 
 Examples:
 

@@ -8,6 +8,9 @@ const PORT          = process.env.PROXY_PORT      || 4000;
 const PROXY_API_KEY = process.env.PROXY_API_KEY   || null;
 const TLS_CERT      = process.env.PROXY_TLS_CERT  || null;
 const TLS_KEY       = process.env.PROXY_TLS_KEY   || null;
+// CORS_ORIGIN controls the Access-Control-Allow-Origin header.
+// Set to a specific origin (e.g. "https://my-app.example.com") or leave as "*" for open access.
+const CORS_ORIGIN   = process.env.CORS_ORIGIN     || '*';
 
 // Optional JSON map: claude-* model name (or prefix) → Ollama model name.
 // Exact match wins; then prefix match (e.g. "claude-3-haiku" matches any claude-3-haiku-*).
@@ -184,6 +187,16 @@ function extractThinkingParts(text) {
   return parts.length ? parts : null;
 }
 
+// Sets CORS headers on every response so browser-based callers work without a proxy.
+// Prefers a specific origin when CORS_ORIGIN is set; defaults to wildcard.
+function setCORSHeaders(res) {
+  res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers',
+    'Content-Type, x-api-key, Authorization, anthropic-version, anthropic-beta');
+  res.setHeader('Access-Control-Max-Age', '86400');
+}
+
 // Returns true if the request is authorised (or auth is disabled).
 // Writes a 401 and returns false if the key is wrong.
 function checkAuth(req, res) {
@@ -255,7 +268,10 @@ async function handleMessages(req, res) {
   if (anthropicReq.top_p     !== undefined) openaiReq.top_p     = anthropicReq.top_p;
   // top_k is an Anthropic parameter; pass through to Ollama's OpenAI-compat layer
   if (anthropicReq.top_k     !== undefined) openaiReq.top_k     = anthropicReq.top_k;
+  if (anthropicReq.seed      !== undefined) openaiReq.seed      = anthropicReq.seed;
   if (anthropicReq.stop_sequences?.length) openaiReq.stop = anthropicReq.stop_sequences;
+  // Anthropic's disable_parallel_tool_use maps to OpenAI's parallel_tool_calls: false
+  if (anthropicReq.disable_parallel_tool_use === true) openaiReq.parallel_tool_calls = false;
 
   let ollamaRes;
   try {
@@ -690,6 +706,16 @@ async function handleHealth(req, res) {
 }
 
 async function requestHandler(req, res) {
+  // CORS headers on every response — must happen before any writeHead call.
+  setCORSHeaders(res);
+
+  // Respond to browser preflight checks immediately, before auth or body parsing.
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   const start = Date.now();
   res.on('finish', () => {
     console.log(`${req.method} ${req.url} ${res.statusCode} ${Date.now() - start}ms`);
@@ -755,6 +781,7 @@ server.listen(PORT, () => {
   console.log(`  Ollama: ${OLLAMA_BASE}`);
   console.log(`  Auth  : ${PROXY_API_KEY ? 'enabled (PROXY_API_KEY set)' : 'disabled (open access)'}`);
   console.log(`  TLS   : ${TLS_CERT ? `enabled (cert: ${TLS_CERT})` : 'disabled (HTTP)'}`);
+  console.log(`  CORS  : Access-Control-Allow-Origin: ${CORS_ORIGIN}`);
   console.log(`  Logs  : requests logged to stdout\n`);
 });
 
