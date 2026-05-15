@@ -37,7 +37,7 @@ function toOpenAIMessages(messages, system) {
   const result = [];
 
   const systemText = Array.isArray(system)
-    ? system.map(b => b.text || '').join('\n')
+    ? system.map(b => b.type === 'document' ? documentBlockToText(b) : (b.text || '')).filter(Boolean).join('\n')
     : system;
   if (systemText) result.push({ role: 'system', content: systemText });
 
@@ -57,7 +57,10 @@ function toOpenAIMessages(messages, system) {
       for (const tr of toolResults) {
         if (!tr.tool_use_id) continue;
         const rawContent = Array.isArray(tr.content)
-          ? tr.content.map(c => c.text || '').join('')
+          ? tr.content.map(c => {
+              if (c.type === 'document') return documentBlockToText(c) || '';
+              return c.text || '';
+            }).join('')
           : (tr.content || '');
         const content = tr.is_error ? `[ERROR] ${rawContent}` : rawContent;
         result.push({ role: 'tool', tool_call_id: tr.tool_use_id, content });
@@ -66,8 +69,11 @@ function toOpenAIMessages(messages, system) {
         result.push({ role: msg.role, content: textParts.map(b => b.text).join('') });
       }
     } else {
-      const text = textParts.map(b => b.text).join('');
+      const rawText = textParts.map(b => b.text).join('');
       const imageParts = blocks.filter(b => b.type === 'image');
+      const docParts  = blocks.filter(b => b.type === 'document');
+      const docTexts  = docParts.map(documentBlockToText).filter(Boolean);
+      const text      = [rawText, ...docTexts].filter(Boolean).join('\n\n');
 
       let content;
       if (imageParts.length > 0) {
@@ -104,6 +110,28 @@ function imageBlockToOpenAI(block) {
   }
   if (src.type === 'url') {
     return { type: 'image_url', image_url: { url: src.url } };
+  }
+  return null;
+}
+
+// Converts an Anthropic `document` content block to a plain-text string for Ollama.
+// Text/plain documents are decoded from base64 if needed; PDFs and other binary types
+// get a placeholder note since Ollama has no native PDF parser.
+function documentBlockToText(block) {
+  const src = block.source;
+  if (!src) return null;
+  const header = block.title ? `[Document: ${block.title}]\n` : '';
+  if (src.type === 'text') {
+    return header + (src.data || '');
+  }
+  if (src.type === 'base64') {
+    if (src.media_type && src.media_type.startsWith('text/')) {
+      try { return header + Buffer.from(src.data, 'base64').toString('utf8'); } catch { return null; }
+    }
+    return header + `[Binary document (${src.media_type}) — not supported by this proxy]`;
+  }
+  if (src.type === 'url') {
+    return header + `[Document URL: ${src.url} — not fetched by this proxy]`;
   }
   return null;
 }
@@ -315,7 +343,9 @@ async function handleMessages(req, res) {
       stop_sequence: null,
       usage: {
         input_tokens: data.usage?.prompt_tokens || 0,
-        output_tokens: data.usage?.completion_tokens || 0
+        output_tokens: data.usage?.completion_tokens || 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0
       }
     }));
     return;
@@ -334,7 +364,7 @@ async function handleMessages(req, res) {
     message: {
       id, type: 'message', role: 'assistant', content: [],
       model: effectiveModel, stop_reason: null, stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 }
+      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     }
   });
 
@@ -381,6 +411,10 @@ async function handleMessages(req, res) {
           if (ei > 0) sendSSE(res, 'content_block_delta', {
             type: 'content_block_delta', index: thinkCount,
             delta: { type: 'thinking_delta', thinking: thinkBuf.slice(0, ei) }
+          });
+          sendSSE(res, 'content_block_delta', {
+            type: 'content_block_delta', index: thinkCount,
+            delta: { type: 'signature_delta', signature: 'ollama-proxy-extracted' }
           });
           sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkCount });
           thinkCount++;
@@ -509,6 +543,10 @@ async function handleMessages(req, res) {
 
           routeThinkChunk(true);
           if (thinkState === 'thinking') {
+            sendSSE(res, 'content_block_delta', {
+              type: 'content_block_delta', index: thinkCount,
+              delta: { type: 'signature_delta', signature: 'ollama-proxy-extracted' }
+            });
             sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkCount });
             thinkCount++;
           }
@@ -529,6 +567,10 @@ async function handleMessages(req, res) {
       stopReason = 'end_turn';
       routeThinkChunk(true);
       if (thinkState === 'thinking') {
+        sendSSE(res, 'content_block_delta', {
+          type: 'content_block_delta', index: thinkCount,
+          delta: { type: 'signature_delta', signature: 'ollama-proxy-extracted' }
+        });
         sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkCount });
         thinkCount++;
       }
@@ -543,7 +585,7 @@ async function handleMessages(req, res) {
       sendSSE(res, 'message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
       });
       sendSSE(res, 'message_stop', { type: 'message_stop' });
     }
