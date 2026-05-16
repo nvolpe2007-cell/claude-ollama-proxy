@@ -771,44 +771,61 @@ async function requestHandler(req, res) {
   }
 }
 
-let server;
-if (TLS_CERT && TLS_KEY) {
-  let tlsOpts;
-  try {
-    tlsOpts = { cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) };
-  } catch (e) {
-    console.error(`Fatal: cannot read TLS cert/key: ${e.message}`);
-    process.exit(1);
+if (require.main === module) {
+  let server;
+  if (TLS_CERT && TLS_KEY) {
+    let tlsOpts;
+    try {
+      tlsOpts = { cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) };
+    } catch (e) {
+      console.error(`Fatal: cannot read TLS cert/key: ${e.message}`);
+      process.exit(1);
+    }
+    server = https.createServer(tlsOpts, requestHandler);
+  } else {
+    server = http.createServer(requestHandler);
   }
-  server = https.createServer(tlsOpts, requestHandler);
-} else {
-  server = http.createServer(requestHandler);
+
+  // Keep the process alive if a stray async error escapes a request handler.
+  // Node 15+ crashes on unhandledRejection by default; log and continue instead.
+  process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
+  process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason));
+
+  server.listen(PORT, () => {
+    console.log(`\n  Claude-Ollama proxy ready`);
+    console.log(`  Model : ${MODEL}`);
+    if (Object.keys(MODEL_MAP).length > 0) {
+      for (const [k, v] of Object.entries(MODEL_MAP))
+        console.log(`  Map   : ${k} → ${v}`);
+    }
+    console.log(`  Port  : ${PORT}`);
+    console.log(`  Ollama: ${OLLAMA_BASE}`);
+    console.log(`  Auth  : ${PROXY_API_KEY ? 'enabled (PROXY_API_KEY set)' : 'disabled (open access)'}`);
+    console.log(`  TLS   : ${TLS_CERT ? `enabled (cert: ${TLS_CERT})` : 'disabled (HTTP)'}`);
+    console.log(`  CORS  : Access-Control-Allow-Origin: ${CORS_ORIGIN}`);
+    console.log(`  Ctx   : ${OLLAMA_NUM_CTX ? `num_ctx=${OLLAMA_NUM_CTX}` : 'model default (set OLLAMA_NUM_CTX to override)'}`);
+    if (OLLAMA_KEEP_ALIVE) console.log(`  Keep  : keep_alive=${OLLAMA_KEEP_ALIVE}`);
+    console.log(`  Logs  : requests logged to stdout\n`);
+  });
+
+  // closeIdleConnections drops idle keep-alive connections immediately so
+  // server.close() can actually reach its callback on SIGTERM.  Without this,
+  // any open keep-alive socket from Claude Code would prevent a clean exit.
+  function shutdown() {
+    server.closeIdleConnections();
+    server.close(() => process.exit(0));
+    setTimeout(() => server.closeAllConnections(), 10_000).unref();
+  }
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
 
-// Keep the process alive if a stray async error escapes a request handler.
-// Node 15+ crashes on unhandledRejection by default; log and continue instead.
-process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
-process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason));
-
-server.listen(PORT, () => {
-  console.log(`\n  Claude-Ollama proxy ready`);
-  console.log(`  Model : ${MODEL}`);
-  if (Object.keys(MODEL_MAP).length > 0) {
-    for (const [k, v] of Object.entries(MODEL_MAP))
-      console.log(`  Map   : ${k} → ${v}`);
-  }
-  console.log(`  Port  : ${PORT}`);
-  console.log(`  Ollama: ${OLLAMA_BASE}`);
-  console.log(`  Auth  : ${PROXY_API_KEY ? 'enabled (PROXY_API_KEY set)' : 'disabled (open access)'}`);
-  console.log(`  TLS   : ${TLS_CERT ? `enabled (cert: ${TLS_CERT})` : 'disabled (HTTP)'}`);
-  console.log(`  CORS  : Access-Control-Allow-Origin: ${CORS_ORIGIN}`);
-  console.log(`  Ctx   : ${OLLAMA_NUM_CTX ? `num_ctx=${OLLAMA_NUM_CTX}` : 'model default (set OLLAMA_NUM_CTX to override)'}`);
-  if (OLLAMA_KEEP_ALIVE) console.log(`  Keep  : keep_alive=${OLLAMA_KEEP_ALIVE}`);
-  console.log(`  Logs  : requests logged to stdout\n`);
-});
-
-function shutdown() {
-  server.close(() => process.exit(0));
-}
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+module.exports = {
+  resolveModel,
+  toOpenAIMessages,
+  toOpenAITools,
+  toOpenAIToolChoice,
+  extractThinkingParts,
+  documentBlockToText,
+  imageBlockToOpenAI,
+};
