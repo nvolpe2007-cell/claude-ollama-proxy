@@ -13,6 +13,7 @@ A Node.js proxy that translates Anthropic API requests (Claude format) into Olla
 ## Config
 ```
 OLLAMA_MODEL=qwen2.5:7b        (default model)
+OLLAMA_HOST=http://localhost:11434  (Ollama base URL; default localhost:11434)
 PROXY_PORT=4000                (default port)
 PROXY_API_KEY=<secret>         (optional; if set, enforces x-api-key / Bearer auth)
 MODEL_MAP=<json>               (optional; maps claude-* names/prefixes to Ollama models)
@@ -73,3 +74,5 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - `thinking` parameter forwarding — Anthropic's `thinking:{type:"enabled",budget_tokens:N}` maps to Ollama's `think:true` (Ollama 0.7+); supported models (Qwen3-thinking, DeepSeek-R1, etc.) natively emit `<think>` blocks which the proxy's existing state machine converts to Anthropic thinking content blocks
 - `OLLAMA_NUM_CTX` env var — sets `num_ctx` on every Ollama request to override the model's default context window (often only 2048 tokens, far too small for Claude Code sessions); set to 32768+ in production
 - `OLLAMA_KEEP_ALIVE` env var — sets `keep_alive` on every Ollama request to control how long the model stays loaded in GPU memory between requests; useful for tuning GPU utilisation vs. latency
+- `OLLAMA_HOST` env var — overrides the Ollama base URL (default `http://localhost:11434`); useful for remote Ollama instances or non-standard ports
+- Thinking block round-trip in conversation history — `thinking` content blocks in assistant messages are converted back to `<think>…</think>` tags when sending conversation history to Ollama, so multi-turn sessions with thinking models (DeepSeek-R1, Qwen3-thinking) preserve full chain-of-thought context across turns

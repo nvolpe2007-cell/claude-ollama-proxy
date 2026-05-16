@@ -79,11 +79,17 @@ function toOpenAIMessages(messages, system) {
         result.push({ role: msg.role, content: textParts.map(b => b.text).join('') });
       }
     } else {
-      const rawText = textParts.map(b => b.text).join('');
+      const rawText    = textParts.map(b => b.text).join('');
       const imageParts = blocks.filter(b => b.type === 'image');
-      const docParts  = blocks.filter(b => b.type === 'document');
-      const docTexts  = docParts.map(documentBlockToText).filter(Boolean);
-      const text      = [rawText, ...docTexts].filter(Boolean).join('\n\n');
+      const docParts   = blocks.filter(b => b.type === 'document');
+      const docTexts   = docParts.map(documentBlockToText).filter(Boolean);
+      // Re-wrap thinking blocks as <think> tags so Ollama sees prior reasoning in context.
+      // Without this, multi-turn conversations with thinking models (DeepSeek-R1, Qwen3-thinking)
+      // lose all previous chain-of-thought on every follow-up request.
+      const thinkParts = blocks.filter(b => b.type === 'thinking');
+      const thinkText  = thinkParts.map(b => `<think>${b.thinking || ''}</think>`).join('');
+      const bodyText   = [rawText, ...docTexts].filter(Boolean).join('\n\n');
+      const text       = [thinkText, bodyText].filter(Boolean).join('\n');
 
       let content;
       if (imageParts.length > 0) {
