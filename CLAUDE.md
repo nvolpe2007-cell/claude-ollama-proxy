@@ -19,6 +19,8 @@ MODEL_MAP=<json>               (optional; maps claude-* names/prefixes to Ollama
 PROXY_TLS_CERT=<path>          (optional; path to PEM cert file — enables HTTPS)
 PROXY_TLS_KEY=<path>           (optional; path to PEM key file — required when cert is set)
 CORS_ORIGIN=<origin>           (optional; Access-Control-Allow-Origin value; default '*')
+OLLAMA_NUM_CTX=<n>             (optional; context window size sent to Ollama on every request; model default if unset — often only 2048, set to 32768+ for real sessions)
+OLLAMA_KEEP_ALIVE=<duration>   (optional; how long Ollama holds the model in GPU memory between requests, e.g. "30m", "0" to unload immediately, "-1" to keep forever)
 ```
 
 ### MODEL_MAP example
@@ -68,3 +70,6 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - CORS support — all responses include Access-Control-Allow-Origin/Methods/Headers; OPTIONS preflight requests return 204 immediately so browser-based callers work without a separate CORS proxy; CORS_ORIGIN env var restricts the allowed origin (default '*')
 - `seed` parameter forwarding — passed through to Ollama for reproducible outputs
 - `disable_parallel_tool_use` forwarding — maps Anthropic's disable_parallel_tool_use:true to OpenAI's parallel_tool_calls:false
+- `thinking` parameter forwarding — Anthropic's `thinking:{type:"enabled",budget_tokens:N}` maps to Ollama's `think:true` (Ollama 0.7+); supported models (Qwen3-thinking, DeepSeek-R1, etc.) natively emit `<think>` blocks which the proxy's existing state machine converts to Anthropic thinking content blocks
+- `OLLAMA_NUM_CTX` env var — sets `num_ctx` on every Ollama request to override the model's default context window (often only 2048 tokens, far too small for Claude Code sessions); set to 32768+ in production
+- `OLLAMA_KEEP_ALIVE` env var — sets `keep_alive` on every Ollama request to control how long the model stays loaded in GPU memory between requests; useful for tuning GPU utilisation vs. latency

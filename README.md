@@ -61,6 +61,8 @@ You should see:
 | `PROXY_TLS_CERT` | *(unset)* | Path to PEM certificate file — enables HTTPS when set |
 | `PROXY_TLS_KEY` | *(unset)* | Path to PEM private key file — required when cert is set |
 | `CORS_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`; set to a specific origin to restrict browser access |
+| `OLLAMA_NUM_CTX` | *(model default)* | Context window size sent to Ollama. Model defaults are often only 2048 — set to `32768` or higher for real sessions |
+| `OLLAMA_KEEP_ALIVE` | *(Ollama default)* | How long the model stays loaded in GPU memory between requests (`"5m"`, `"0"` to unload immediately, `"-1"` to keep forever) |
 
 Examples:
 
@@ -178,6 +180,8 @@ PROXY_TLS_CERT=/etc/ssl/proxy.crt PROXY_TLS_KEY=/etc/ssl/proxy.key node proxy.js
 ## Thinking models
 
 The proxy automatically extracts `<think>…</think>` blocks produced by reasoning models (DeepSeek-R1, Qwen3-thinking, etc.) and converts them to proper Anthropic `thinking` content blocks. Claude Code displays them as structured reasoning without any extra configuration.
+
+When Claude Code enables extended thinking (sends `thinking: {type: "enabled", budget_tokens: N}`), the proxy forwards `think: true` to Ollama (Ollama 0.7+), which activates native thinking for supported models.
 
 ```bash
 ollama pull deepseek-r1:7b
@@ -303,7 +307,17 @@ Returns:
 
 The proxy calls Ollama's `/api/tokenize` endpoint for accuracy and falls back to a character-based estimate (`chars / 4`) if the model isn't loaded yet. Claude Code uses this endpoint for context-window management.
 
+## Context window
+
+Ollama model defaults are often only 2048 tokens — far too small for a real Claude Code session. Always set `OLLAMA_NUM_CTX` to something appropriate for your hardware:
+
+```bash
+OLLAMA_NUM_CTX=32768 node proxy.js    # 32k — good for most tasks
+OLLAMA_NUM_CTX=131072 node proxy.js   # 128k — for large codebases (needs more VRAM)
+```
+
 ## Limitations
 
 - Image blocks require a vision-capable model (e.g. `llava`, `qwen2.5-vl`); text-only models will error
 - `thinking` block signatures are synthetic placeholders — round-tripping thinking blocks across turns is not supported
+- `think: true` forwarding requires Ollama 0.7+ and a model that supports native thinking (DeepSeek-R1, Qwen3-thinking)

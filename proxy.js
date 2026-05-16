@@ -11,6 +11,13 @@ const TLS_KEY       = process.env.PROXY_TLS_KEY   || null;
 // CORS_ORIGIN controls the Access-Control-Allow-Origin header.
 // Set to a specific origin (e.g. "https://my-app.example.com") or leave as "*" for open access.
 const CORS_ORIGIN   = process.env.CORS_ORIGIN     || '*';
+// Ollama-specific tuning defaults applied to every request.
+// num_ctx controls the context window — Ollama model defaults (often 2048) are too small
+// for real Claude Code sessions; set this to at least 32768 in production.
+const OLLAMA_NUM_CTX    = process.env.OLLAMA_NUM_CTX    ? Number(process.env.OLLAMA_NUM_CTX)    : null;
+// keep_alive controls how long Ollama holds the model in GPU memory between requests.
+// Use "0" to unload immediately, "-1" to keep forever, "30m" for 30 minutes, etc.
+const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || null;
 
 // Optional JSON map: claude-* model name (or prefix) → Ollama model name.
 // Exact match wins; then prefix match (e.g. "claude-3-haiku" matches any claude-3-haiku-*).
@@ -272,6 +279,13 @@ async function handleMessages(req, res) {
   if (anthropicReq.stop_sequences?.length) openaiReq.stop = anthropicReq.stop_sequences;
   // Anthropic's disable_parallel_tool_use maps to OpenAI's parallel_tool_calls: false
   if (anthropicReq.disable_parallel_tool_use === true) openaiReq.parallel_tool_calls = false;
+  // Anthropic extended-thinking → Ollama's native think parameter.
+  // Ollama 0.7+ passes think:true to supported models (Qwen3-thinking, DeepSeek-R1, etc.)
+  // which makes them emit <think>…</think> blocks the proxy already handles.
+  if (anthropicReq.thinking?.type === 'enabled') openaiReq.think = true;
+  // Apply global Ollama tuning defaults (overrideable per-deployment via env vars).
+  if (OLLAMA_NUM_CTX)    openaiReq.num_ctx    = OLLAMA_NUM_CTX;
+  if (OLLAMA_KEEP_ALIVE) openaiReq.keep_alive = OLLAMA_KEEP_ALIVE;
 
   let ollamaRes;
   try {
@@ -782,6 +796,8 @@ server.listen(PORT, () => {
   console.log(`  Auth  : ${PROXY_API_KEY ? 'enabled (PROXY_API_KEY set)' : 'disabled (open access)'}`);
   console.log(`  TLS   : ${TLS_CERT ? `enabled (cert: ${TLS_CERT})` : 'disabled (HTTP)'}`);
   console.log(`  CORS  : Access-Control-Allow-Origin: ${CORS_ORIGIN}`);
+  console.log(`  Ctx   : ${OLLAMA_NUM_CTX ? `num_ctx=${OLLAMA_NUM_CTX}` : 'model default (set OLLAMA_NUM_CTX to override)'}`);
+  if (OLLAMA_KEEP_ALIVE) console.log(`  Keep  : keep_alive=${OLLAMA_KEEP_ALIVE}`);
   console.log(`  Logs  : requests logged to stdout\n`);
 });
 
