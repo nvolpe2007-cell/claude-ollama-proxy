@@ -30,6 +30,38 @@ try {
   console.warn('Warning: MODEL_MAP is not valid JSON, ignoring:', e.message);
 }
 
+// ── In-memory request metrics ────────────────────────────────────────────────
+const _metrics = {
+  startTime:    Date.now(),
+  requests:     {},   // 'METHOD /path' → count
+  statusCodes:  {},   // '200' → count
+  latencies:    [],   // last 1000 durations (ms) for percentile calculations
+  tokensIn:     0,
+  tokensOut:    0,
+  activeStreams: 0,
+  errors:       0,
+};
+
+function recordRequest(method, path, status, ms) {
+  const k = `${method} ${path}`;
+  _metrics.requests[k] = (_metrics.requests[k] || 0) + 1;
+  const s = String(status);
+  _metrics.statusCodes[s] = (_metrics.statusCodes[s] || 0) + 1;
+  if (status >= 500) _metrics.errors++;
+  if (_metrics.latencies.length >= 1000) _metrics.latencies.shift();
+  _metrics.latencies.push(ms);
+}
+
+function recordTokens(input, output) {
+  _metrics.tokensIn  += input;
+  _metrics.tokensOut += output;
+}
+
+function pctile(sorted, p) {
+  if (!sorted.length) return 0;
+  return sorted[Math.ceil(p / 100 * sorted.length) - 1];
+}
+
 function resolveModel(requestedModel) {
   if (!requestedModel) return MODEL;
   if (MODEL_MAP[requestedModel]) return MODEL_MAP[requestedModel];
@@ -366,6 +398,7 @@ async function handleMessages(req, res) {
       }
     }
 
+    recordTokens(data.usage?.prompt_tokens || 0, data.usage?.completion_tokens || 0);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       id: newMsgId(),
@@ -393,6 +426,7 @@ async function handleMessages(req, res) {
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive'
   });
+  _metrics.activeStreams++;
 
   const id = newMsgId();
   sendSSE(res, 'message_start', {
@@ -635,8 +669,10 @@ async function handleMessages(req, res) {
   } finally {
     req.socket.off('close', onClientClose);
     clearInterval(keepAlive);
+    _metrics.activeStreams--;
   }
 
+  recordTokens(inputTokens, outputTokens);
   res.end();
 }
 
@@ -725,6 +761,23 @@ async function handleHealth(req, res) {
   }));
 }
 
+async function handleMetrics(req, res) {
+  const sorted = [..._metrics.latencies].sort((a, b) => a - b);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    uptime_seconds:      Math.floor((Date.now() - _metrics.startTime) / 1000),
+    requests_total:      _metrics.requests,
+    status_codes:        _metrics.statusCodes,
+    latency_p50_ms:      pctile(sorted, 50),
+    latency_p95_ms:      pctile(sorted, 95),
+    latency_p99_ms:      pctile(sorted, 99),
+    tokens_input_total:  _metrics.tokensIn,
+    tokens_output_total: _metrics.tokensOut,
+    active_streams:      _metrics.activeStreams,
+    errors_total:        _metrics.errors,
+  }, null, 2));
+}
+
 async function requestHandler(req, res) {
   // CORS headers on every response — must happen before any writeHead call.
   setCORSHeaders(res);
@@ -737,12 +790,13 @@ async function requestHandler(req, res) {
   }
 
   const start = Date.now();
-  res.on('finish', () => {
-    console.log(`${req.method} ${req.url} ${res.statusCode} ${Date.now() - start}ms`);
-  });
-
   // Strip query string before routing so ?foo=bar variants still match.
   const path = req.url.split('?')[0];
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    console.log(`${req.method} ${req.url} ${res.statusCode} ${ms}ms`);
+    recordRequest(req.method, path, res.statusCode, ms);
+  });
 
   try {
     if (req.method === 'POST' && path === '/v1/messages') {
@@ -756,6 +810,8 @@ async function requestHandler(req, res) {
       await handleModels(req, res);
     } else if (req.method === 'GET' && path === '/health') {
       await handleHealth(req, res);
+    } else if (req.method === 'GET' && path === '/metrics') {
+      await handleMetrics(req, res);
     } else {
       res.writeHead(404);
       res.end('{"error":"not found"}');
