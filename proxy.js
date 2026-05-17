@@ -18,6 +18,9 @@ const OLLAMA_NUM_CTX    = process.env.OLLAMA_NUM_CTX    ? Number(process.env.OLL
 // keep_alive controls how long Ollama holds the model in GPU memory between requests.
 // Use "0" to unload immediately, "-1" to keep forever, "30m" for 30 minutes, etc.
 const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || null;
+// Hard per-request timeout (ms). If set, the proxy aborts the Ollama request and returns
+// a 504 / SSE error after this many milliseconds. Unset by default (no timeout).
+const PROXY_TIMEOUT     = process.env.PROXY_TIMEOUT     ? Number(process.env.PROXY_TIMEOUT)     : null;
 
 // Optional JSON map: claude-* model name (or prefix) → Ollama model name.
 // Exact match wins; then prefix match (e.g. "claude-3-haiku" matches any claude-3-haiku-*).
@@ -280,7 +283,21 @@ async function fetchWithRetry(url, options, maxRetries = 3, baseDelay = 500) {
 async function handleMessages(req, res) {
   // Abort Ollama request if the client disconnects — avoids wasting GPU compute.
   const ac = new AbortController();
-  const onClientClose = () => { if (!res.writableEnded) ac.abort(); };
+
+  // Optional hard timeout: abort Ollama fetch and surface an error when PROXY_TIMEOUT is set.
+  // Uses a separate flag so the response path can distinguish timeout from client-disconnect.
+  let timedOut = false;
+  let _timeoutId = null;
+  const clearTO = () => { if (_timeoutId) { clearTimeout(_timeoutId); _timeoutId = null; } };
+  if (PROXY_TIMEOUT) {
+    _timeoutId = setTimeout(() => {
+      timedOut = true;
+      if (!res.writableEnded) ac.abort();
+      console.warn(`Request timeout after ${PROXY_TIMEOUT}ms — aborting Ollama request`);
+    }, PROXY_TIMEOUT);
+  }
+
+  const onClientClose = () => { if (!res.writableEnded) { clearTO(); ac.abort(); } };
   req.socket.once('close', onClientClose);
 
   const body = await readBody(req);
@@ -337,7 +354,18 @@ async function handleMessages(req, res) {
     });
   } catch (e) {
     req.socket.off('close', onClientClose);
-    if (e.name === 'AbortError') { res.end(); return; }
+    clearTO();
+    if (e.name === 'AbortError') {
+      if (timedOut) {
+        if (!res.headersSent) res.writeHead(504, { 'Content-Type': 'application/json' });
+        if (!res.writableEnded) res.end(JSON.stringify({
+          error: { type: 'request_timeout', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms` }
+        }));
+      } else {
+        res.end();
+      }
+      return;
+    }
     const isConnRefused = e.cause?.code === 'ECONNREFUSED' || e.message.includes('ECONNREFUSED');
     const hint = isConnRefused
       ? ' — is Ollama running? Try: ollama serve'
@@ -361,10 +389,22 @@ async function handleMessages(req, res) {
       data = await ollamaRes.json();
     } catch (e) {
       req.socket.off('close', onClientClose);
-      if (e.name === 'AbortError') { res.end(); return; }
+      clearTO();
+      if (e.name === 'AbortError') {
+        if (timedOut) {
+          if (!res.headersSent) res.writeHead(504, { 'Content-Type': 'application/json' });
+          if (!res.writableEnded) res.end(JSON.stringify({
+            error: { type: 'request_timeout', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms` }
+          }));
+        } else {
+          res.end();
+        }
+        return;
+      }
       throw e;
     }
     req.socket.off('close', onClientClose);
+    clearTO();
     const choice = data.choices?.[0];
     if (!choice) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -660,7 +700,15 @@ async function handleMessages(req, res) {
       sendSSE(res, 'message_stop', { type: 'message_stop' });
     }
   } catch (e) {
-    if (e.name !== 'AbortError') {
+    if (e.name === 'AbortError') {
+      if (timedOut && !res.writableEnded) {
+        sendSSE(res, 'error', {
+          type: 'error',
+          error: { type: 'request_timeout', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms` }
+        });
+      }
+      // Client-disconnect AbortErrors are silently discarded.
+    } else {
       console.error('Stream error:', e.message);
       if (!res.writableEnded) {
         sendSSE(res, 'error', { type: 'error', error: { type: 'stream_error', message: e.message } });
@@ -668,6 +716,7 @@ async function handleMessages(req, res) {
     }
   } finally {
     req.socket.off('close', onClientClose);
+    clearTO();
     clearInterval(keepAlive);
     _metrics.activeStreams--;
   }
@@ -861,6 +910,7 @@ if (require.main === module) {
     console.log(`  CORS  : Access-Control-Allow-Origin: ${CORS_ORIGIN}`);
     console.log(`  Ctx   : ${OLLAMA_NUM_CTX ? `num_ctx=${OLLAMA_NUM_CTX}` : 'model default (set OLLAMA_NUM_CTX to override)'}`);
     if (OLLAMA_KEEP_ALIVE) console.log(`  Keep  : keep_alive=${OLLAMA_KEEP_ALIVE}`);
+    console.log(`  Timeout: ${PROXY_TIMEOUT ? `${PROXY_TIMEOUT}ms per request` : 'none (set PROXY_TIMEOUT to limit)'}`);
     console.log(`  Logs  : requests logged to stdout\n`);
   });
 

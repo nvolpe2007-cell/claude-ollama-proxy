@@ -63,6 +63,7 @@ You should see:
 | `CORS_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`; set to a specific origin to restrict browser access |
 | `OLLAMA_NUM_CTX` | *(model default)* | Context window size sent to Ollama. Model defaults are often only 2048 — set to `32768` or higher for real sessions |
 | `OLLAMA_KEEP_ALIVE` | *(Ollama default)* | How long the model stays loaded in GPU memory between requests (`"5m"`, `"0"` to unload immediately, `"-1"` to keep forever) |
+| `PROXY_TIMEOUT` | *(none)* | Hard per-request timeout in milliseconds. If Ollama does not respond within this window the proxy aborts and returns a `504` error (non-streaming) or an SSE error event (streaming). Useful when running behind a strict reverse-proxy timeout or to detect stuck model generation. |
 
 Examples:
 
