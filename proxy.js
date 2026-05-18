@@ -934,4 +934,5 @@ module.exports = {
   extractThinkingParts,
   documentBlockToText,
   imageBlockToOpenAI,
+  requestHandler,
 };

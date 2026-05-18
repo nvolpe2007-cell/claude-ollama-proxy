@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node proxy.js",
     "dev": "node --watch proxy.js",
-    "test": "node --test test.js"
+    "test": "node --test test.js",
+    "test:integration": "node --test test-integration.js",
+    "test:all": "node --test test.js && node --test test-integration.js"
   },
   "engines": {
     "node": ">=18.2.0"
