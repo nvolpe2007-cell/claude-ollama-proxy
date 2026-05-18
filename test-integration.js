@@ -84,6 +84,34 @@ const mockOllama = http.createServer(async (req, res) => {
       res.writeHead(503); res.end('{}'); return;
     }
 
+    if (mockBehavior === 'streaming-tool-call') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      // First chunk: role announcement with no content
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}\n\n');
+      // Tool call header: id + name arrive together in Ollama's first tool chunk
+      res.write('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_xyz","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}\n\n');
+      // Arguments streamed incrementally across two chunks to test partial-json assembly
+      res.write('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\":"}}]},"finish_reason":null}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"London\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n');
+      res.write('data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":15}}\n\n');
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+
+    if (mockBehavior === 'streaming-think') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n');
+      // Split the opening tag + content across a chunk boundary to exercise the state-machine buffer
+      res.write('data: {"choices":[{"index":0,"delta":{"content":"<think>rea"},"finish_reason":null}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{"content":"soning</think>"},"finish_reason":null}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\n');
+      res.write('data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20}}\n\n');
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+
     if (body.stream) {
       res.writeHead(200, { 'Content-Type': 'text/event-stream' });
       res.write('data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n');
@@ -471,5 +499,114 @@ describe('Request logging (via metrics)', () => {
     const b = json(r);
     assert.ok(b.requests_total['GET /health'] > 0,
       'GET /health should appear in requests_total');
+  });
+});
+
+// ── Tests: POST /v1/messages — streaming tool calls ───────────────────────────
+
+describe('POST /v1/messages (streaming) — tool calls', () => {
+  test('streams tool_use block with correct Anthropic SSE events', async () => {
+    mockBehavior = 'streaming-tool-call';
+    const r = await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'What is the weather in London?' }],
+      tools: [{
+        name: 'get_weather',
+        description: 'Get current weather',
+        input_schema: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] }
+      }],
+      max_tokens: 100,
+      stream: true
+    });
+    assert.equal(r.status, 200);
+    assert.ok(r.headers['content-type']?.includes('text/event-stream'));
+
+    const events = parseSse(r.body);
+    const types  = events.map(e => e.event);
+
+    // Required envelope events
+    for (const t of ['message_start', 'content_block_start', 'content_block_stop', 'message_delta', 'message_stop']) {
+      assert.ok(types.includes(t), `missing event: ${t}`);
+    }
+
+    // content_block_start should describe a tool_use block with name and id
+    const toolStart = events.find(e =>
+      e.event === 'content_block_start' && e.data.content_block?.type === 'tool_use'
+    );
+    assert.ok(toolStart, 'should have tool_use content_block_start');
+    assert.equal(toolStart.data.content_block.name, 'get_weather');
+    assert.ok(toolStart.data.content_block.id, 'tool_use block should have an id');
+
+    // Arguments streamed as input_json_delta events — join and parse to verify correctness
+    const jsonDeltas = events.filter(e =>
+      e.event === 'content_block_delta' && e.data.delta?.type === 'input_json_delta'
+    );
+    assert.ok(jsonDeltas.length > 0, 'should have input_json_delta events');
+    const fullArgs = jsonDeltas.map(e => e.data.delta.partial_json).join('');
+    assert.deepEqual(JSON.parse(fullArgs), { city: 'London' });
+
+    // stop_reason must be tool_use for tool-calling responses
+    const delta = events.find(e => e.event === 'message_delta');
+    assert.equal(delta.data.delta.stop_reason, 'tool_use');
+
+    // message_stop must be the final event
+    assert.equal(types[types.length - 1], 'message_stop');
+  });
+});
+
+// ── Tests: POST /v1/messages — streaming thinking blocks ─────────────────────
+
+describe('POST /v1/messages (streaming) — thinking blocks', () => {
+  test('routes <think> tag content to thinking block then text block', async () => {
+    mockBehavior = 'streaming-think';
+    const r = await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'Think carefully' }],
+      max_tokens: 100,
+      stream: true
+    });
+    assert.equal(r.status, 200);
+    assert.ok(r.headers['content-type']?.includes('text/event-stream'));
+
+    const events = parseSse(r.body);
+
+    // Thinking block must open before text block
+    const thinkStart = events.find(e =>
+      e.event === 'content_block_start' && e.data.content_block?.type === 'thinking'
+    );
+    assert.ok(thinkStart, 'should have thinking content_block_start');
+
+    // thinking_delta events should reconstruct the full thinking text
+    const thinkDeltas = events.filter(e =>
+      e.event === 'content_block_delta' && e.data.delta?.type === 'thinking_delta'
+    );
+    assert.ok(thinkDeltas.length > 0, 'should have thinking_delta events');
+    assert.equal(thinkDeltas.map(e => e.data.delta.thinking).join(''), 'reasoning');
+
+    // signature_delta must appear before the thinking block closes (Anthropic protocol)
+    const sigDelta = events.find(e =>
+      e.event === 'content_block_delta' && e.data.delta?.type === 'signature_delta'
+    );
+    assert.ok(sigDelta, 'should have signature_delta before thinking block stop');
+    assert.ok(sigDelta.data.delta.signature, 'signature_delta must carry a non-empty signature');
+
+    // Text block for the non-thinking part of the response
+    const textStart = events.find(e =>
+      e.event === 'content_block_start' && e.data.content_block?.type === 'text'
+    );
+    assert.ok(textStart, 'should have text content_block_start after thinking block');
+
+    const textDeltas = events.filter(e =>
+      e.event === 'content_block_delta' && e.data.delta?.type === 'text_delta'
+    );
+    assert.equal(textDeltas.map(e => e.data.delta.text).join(''), 'answer');
+
+    // thinking block index must be lower than text block index
+    assert.ok(thinkStart.data.index < textStart.data.index,
+      'thinking block must precede text block in index ordering');
+
+    // Correct stop_reason for a normal completion
+    const msgDelta = events.find(e => e.event === 'message_delta');
+    assert.equal(msgDelta.data.delta.stop_reason, 'end_turn');
   });
 });
