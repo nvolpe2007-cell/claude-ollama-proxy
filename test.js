@@ -10,6 +10,8 @@ const {
   extractThinkingParts,
   documentBlockToText,
   imageBlockToOpenAI,
+  getOllamaHost,
+  OLLAMA_HOSTS,
 } = require('./proxy');
 
 // ── resolveModel ──────────────────────────────────────────────────────────────
@@ -418,5 +420,28 @@ describe('toOpenAIMessages', () => {
     assert.equal(result[0].role, 'system');
     assert.equal(result[1].role, 'user');
     assert.equal(result[2].role, 'assistant');
+  });
+});
+
+// ── getOllamaHost / OLLAMA_HOSTS ──────────────────────────────────────────────
+
+describe('getOllamaHost', () => {
+  test('OLLAMA_HOSTS is a non-empty array of strings', () => {
+    assert.ok(Array.isArray(OLLAMA_HOSTS));
+    assert.ok(OLLAMA_HOSTS.length >= 1);
+    for (const h of OLLAMA_HOSTS) assert.equal(typeof h, 'string');
+  });
+
+  test('returns a URL-like string starting with http', () => {
+    const host = getOllamaHost();
+    assert.ok(host.startsWith('http'), `expected http URL, got: ${host}`);
+  });
+
+  test('always returns one of the configured hosts', () => {
+    // Call several times and verify every result is in the OLLAMA_HOSTS list.
+    for (let i = 0; i < OLLAMA_HOSTS.length * 3; i++) {
+      const h = getOllamaHost();
+      assert.ok(OLLAMA_HOSTS.includes(h), `unexpected host returned: ${h}`);
+    }
   });
 });

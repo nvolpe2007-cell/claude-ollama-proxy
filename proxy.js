@@ -2,7 +2,20 @@ const http  = require('http');
 const https = require('https');
 const fs    = require('fs');
 
-const OLLAMA_BASE   = process.env.OLLAMA_HOST     || 'http://localhost:11434';
+// Multi-host: OLLAMA_HOST may be a comma-separated list of Ollama base URLs.
+// Requests are distributed round-robin across all listed hosts so you can
+// spread load across multiple GPUs or Ollama instances.
+const OLLAMA_HOSTS = (process.env.OLLAMA_HOST || 'http://localhost:11434')
+  .split(',').map(h => h.trim()).filter(Boolean);
+
+// Round-robin index. Node.js is single-threaded so no lock is needed.
+let _hostIdx = 0;
+function getOllamaHost() {
+  const host = OLLAMA_HOSTS[_hostIdx];
+  _hostIdx = (_hostIdx + 1) % OLLAMA_HOSTS.length;
+  return host;
+}
+
 const MODEL         = process.env.OLLAMA_MODEL    || 'qwen2.5:7b';
 const PORT          = process.env.PROXY_PORT      || 4000;
 const PROXY_API_KEY = process.env.PROXY_API_KEY   || null;
@@ -281,6 +294,8 @@ async function fetchWithRetry(url, options, maxRetries = 3, baseDelay = 500) {
 }
 
 async function handleMessages(req, res) {
+  const ollamaBase = getOllamaHost();
+
   // Abort Ollama request if the client disconnects — avoids wasting GPU compute.
   const ac = new AbortController();
 
@@ -344,7 +359,7 @@ async function handleMessages(req, res) {
 
   let ollamaRes;
   try {
-    ollamaRes = await fetchWithRetry(`${OLLAMA_BASE}/v1/chat/completions`, {
+    ollamaRes = await fetchWithRetry(`${ollamaBase}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(openaiReq),
@@ -726,9 +741,10 @@ async function handleMessages(req, res) {
 }
 
 async function handleModels(req, res) {
+  const ollamaBase = getOllamaHost();
   let data;
   try {
-    const r = await fetch(`${OLLAMA_BASE}/api/tags`, { signal: AbortSignal.timeout(5000) });
+    const r = await fetch(`${ollamaBase}/api/tags`, { signal: AbortSignal.timeout(5000) });
     if (!r.ok) throw new Error(`Ollama returned HTTP ${r.status}`);
     data = await r.json();
   } catch (e) {
@@ -755,6 +771,7 @@ async function handleCountTokens(req, res) {
   catch { res.writeHead(400); res.end('{"error":"bad json"}'); return; }
 
   const effectiveModel = resolveModel(anthropicReq.model);
+  const ollamaBase = getOllamaHost();
 
   // Flatten messages + system to a single string for tokenization.
   // Tool schemas are appended as JSON since they consume context.
@@ -769,7 +786,7 @@ async function handleCountTokens(req, res) {
   // Try Ollama's native tokenize endpoint; fall back to char/4 estimate.
   let inputTokens;
   try {
-    const r = await fetch(`${OLLAMA_BASE}/api/tokenize`, {
+    const r = await fetch(`${ollamaBase}/api/tokenize`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: effectiveModel, prompt }),
@@ -787,23 +804,26 @@ async function handleCountTokens(req, res) {
 }
 
 async function handleHealth(req, res) {
-  let ollamaOk = false;
-  let ollamaError = null;
-  try {
-    const check = await fetch(`${OLLAMA_BASE}/api/tags`, { signal: AbortSignal.timeout(3000) });
-    ollamaOk = check.ok;
-    if (!check.ok) ollamaError = `HTTP ${check.status}`;
-  } catch (e) {
-    ollamaError = e.message;
-  }
+  const hostResults = await Promise.all(OLLAMA_HOSTS.map(async url => {
+    try {
+      const check = await fetch(`${url}/api/tags`, { signal: AbortSignal.timeout(3000) });
+      return { url, status: check.ok ? 'ok' : 'unreachable', error: check.ok ? undefined : `HTTP ${check.status}` };
+    } catch (e) {
+      return { url, status: 'unreachable', error: e.message };
+    }
+  }));
+  const anyOk = hostResults.some(h => h.status === 'ok');
+  const allOk = hostResults.every(h => h.status === 'ok');
+  // Backward-compat fields derived from the first host (single-host deployments unchanged).
+  const first = hostResults[0];
 
-  const status = ollamaOk ? 200 : 503;
-  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.writeHead(anyOk ? 200 : 503, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    status: ollamaOk ? 'ok' : 'degraded',
+    status: allOk ? 'ok' : 'degraded',
     proxy: 'running',
-    ollama: ollamaOk ? 'reachable' : 'unreachable',
-    ollamaError: ollamaError || undefined,
+    hosts: hostResults,
+    ollama: first.status === 'ok' ? 'reachable' : 'unreachable',
+    ollamaError: first.error || undefined,
     model: MODEL,
     port: Number(PORT),
     timestamp: new Date().toISOString()
@@ -904,7 +924,12 @@ if (require.main === module) {
         console.log(`  Map   : ${k} → ${v}`);
     }
     console.log(`  Port  : ${PORT}`);
-    console.log(`  Ollama: ${OLLAMA_BASE}`);
+    if (OLLAMA_HOSTS.length === 1) {
+      console.log(`  Ollama: ${OLLAMA_HOSTS[0]}`);
+    } else {
+      console.log(`  Ollama: round-robin across ${OLLAMA_HOSTS.length} hosts:`);
+      for (const h of OLLAMA_HOSTS) console.log(`    - ${h}`);
+    }
     console.log(`  Auth  : ${PROXY_API_KEY ? 'enabled (PROXY_API_KEY set)' : 'disabled (open access)'}`);
     console.log(`  TLS   : ${TLS_CERT ? `enabled (cert: ${TLS_CERT})` : 'disabled (HTTP)'}`);
     console.log(`  CORS  : Access-Control-Allow-Origin: ${CORS_ORIGIN}`);
@@ -934,5 +959,7 @@ module.exports = {
   extractThinkingParts,
   documentBlockToText,
   imageBlockToOpenAI,
+  getOllamaHost,
+  OLLAMA_HOSTS,
   requestHandler,
 };
