@@ -34,6 +34,9 @@ const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || null;
 // Hard per-request timeout (ms). If set, the proxy aborts the Ollama request and returns
 // a 504 / SSE error after this many milliseconds. Unset by default (no timeout).
 const PROXY_TIMEOUT     = process.env.PROXY_TIMEOUT     ? Number(process.env.PROXY_TIMEOUT)     : null;
+// Default max_tokens when the client does not specify one. 8192 is a safe default for most
+// Ollama models; set higher (e.g. 32768) for models with large output budgets.
+const PROXY_MAX_TOKENS  = process.env.PROXY_MAX_TOKENS  ? Number(process.env.PROXY_MAX_TOKENS)  : 8192;
 
 // Optional JSON map: claude-* model name (or prefix) → Ollama model name.
 // Exact match wins; then prefix match (e.g. "claude-3-haiku" matches any claude-3-haiku-*).
@@ -320,10 +323,22 @@ async function handleMessages(req, res) {
   try { anthropicReq = JSON.parse(body); }
   catch {
     req.socket.off('close', onClientClose);
-    res.writeHead(400); res.end('{"error":"bad json"}'); return;
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Request body is not valid JSON' } }));
+    return;
   }
 
-  const streaming = anthropicReq.stream !== false;
+  if (!Array.isArray(anthropicReq.messages)) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`messages` is required and must be an array' } }));
+    return;
+  }
+
+  // Anthropic API spec: stream defaults to false when not specified.
+  const streaming = anthropicReq.stream === true;
 
   // Use request model if it looks like an Ollama model name (not a claude-* alias).
   // This lets callers switch models per-request without restarting the proxy.
@@ -333,7 +348,7 @@ async function handleMessages(req, res) {
     model: effectiveModel,
     messages: toOpenAIMessages(anthropicReq.messages, anthropicReq.system),
     stream: streaming,
-    max_tokens: anthropicReq.max_tokens || 8192,
+    max_tokens: anthropicReq.max_tokens || PROXY_MAX_TOKENS,
     ...(streaming && { stream_options: { include_usage: true } }),
   };
 
@@ -764,6 +779,35 @@ async function handleModels(req, res) {
   res.end(JSON.stringify({ object: 'list', data: models }));
 }
 
+async function handleModelById(req, res, modelId) {
+  const ollamaBase = getOllamaHost();
+  let data;
+  try {
+    const r = await fetch(`${ollamaBase}/api/tags`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error(`Ollama returned HTTP ${r.status}`);
+    data = await r.json();
+  } catch (e) {
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'ollama_unreachable', message: e.message } }));
+    return;
+  }
+
+  const model = (data.models || []).find(m => m.name === modelId);
+  if (!model) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Model '${modelId}' not found in Ollama` } }));
+    return;
+  }
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    id: model.name,
+    object: 'model',
+    created: model.modified_at ? Math.floor(new Date(model.modified_at).getTime() / 1000) : 0,
+    owned_by: 'ollama'
+  }));
+}
+
 async function handleCountTokens(req, res) {
   const body = await readBody(req);
   let anthropicReq;
@@ -877,6 +921,9 @@ async function requestHandler(req, res) {
     } else if (req.method === 'GET' && path === '/v1/models') {
       if (!checkAuth(req, res)) return;
       await handleModels(req, res);
+    } else if (req.method === 'GET' && path.startsWith('/v1/models/')) {
+      if (!checkAuth(req, res)) return;
+      await handleModelById(req, res, decodeURIComponent(path.slice('/v1/models/'.length)));
     } else if (req.method === 'GET' && path === '/health') {
       await handleHealth(req, res);
     } else if (req.method === 'GET' && path === '/metrics') {
@@ -936,6 +983,7 @@ if (require.main === module) {
     console.log(`  Ctx   : ${OLLAMA_NUM_CTX ? `num_ctx=${OLLAMA_NUM_CTX}` : 'model default (set OLLAMA_NUM_CTX to override)'}`);
     if (OLLAMA_KEEP_ALIVE) console.log(`  Keep  : keep_alive=${OLLAMA_KEEP_ALIVE}`);
     console.log(`  Timeout: ${PROXY_TIMEOUT ? `${PROXY_TIMEOUT}ms per request` : 'none (set PROXY_TIMEOUT to limit)'}`);
+    console.log(`  MaxTok: default max_tokens=${PROXY_MAX_TOKENS} (set PROXY_MAX_TOKENS to change)`);
     console.log(`  Logs  : requests logged to stdout\n`);
   });
 

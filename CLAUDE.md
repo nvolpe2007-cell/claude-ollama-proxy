@@ -23,6 +23,7 @@ CORS_ORIGIN=<origin>           (optional; Access-Control-Allow-Origin value; def
 OLLAMA_NUM_CTX=<n>             (optional; context window size sent to Ollama on every request; model default if unset — often only 2048, set to 32768+ for real sessions)
 OLLAMA_KEEP_ALIVE=<duration>   (optional; how long Ollama holds the model in GPU memory between requests, e.g. "30m", "0" to unload immediately, "-1" to keep forever)
 PROXY_TIMEOUT=<ms>             (optional; hard per-request timeout in milliseconds; proxy aborts and returns 504 / SSE error if Ollama takes longer; default is no timeout)
+PROXY_MAX_TOKENS=<n>           (optional; default max_tokens when the client omits it; default 8192)
 ```
 
 ### MODEL_MAP example
@@ -79,3 +80,6 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - Thinking block round-trip in conversation history — `thinking` content blocks in assistant messages are converted back to `<think>…</think>` tags when sending conversation history to Ollama, so multi-turn sessions with thinking models (DeepSeek-R1, Qwen3-thinking) preserve full chain-of-thought context across turns
 - GET /metrics — in-memory request metrics endpoint: uptime, per-route request counts, HTTP status code breakdown, p50/p95/p99 latency percentiles (rolling 1000-sample window), cumulative input/output token totals, and current active streaming connection count; no auth required (operational data only)
 - `PROXY_TIMEOUT` env var — optional hard per-request timeout (ms); if Ollama does not complete within this window the proxy aborts the in-flight fetch and returns a 504 JSON error (non-streaming) or an SSE error event (streaming); timeout fires via AbortController reusing the existing client-abort signal so GPU resources are released immediately; timedOut flag distinguishes timeout from client disconnect so the response path can send the correct error instead of silently closing; default is no timeout
+- `PROXY_MAX_TOKENS` env var — configurable default max_tokens applied when the client omits the field (default 8192); useful for models with larger output budgets or strict token limits
+- GET /v1/models/:modelId — looks up a single model by ID from Ollama's model list; returns the same object shape as GET /v1/models entries; 404 if the model isn't in Ollama; 502 if Ollama is unreachable; colon-separated names (e.g. `qwen2.5:7b`) are URL-decoded automatically
+- Input validation — POST /v1/messages now validates that `messages` is present and is an array, returning a 400 `invalid_request_error` (with a descriptive message) instead of crashing into a 500; `stream` field now correctly defaults to `false` per the Anthropic API spec when not specified by the client

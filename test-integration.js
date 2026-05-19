@@ -475,6 +475,80 @@ describe('Auth enforcement', () => {
   });
 });
 
+// ── Tests: GET /v1/models/:modelId ───────────────────────────────────────────
+
+describe('GET /v1/models/:modelId', () => {
+  test('200 with model object for an existing model', async () => {
+    const r = await request('GET', '/v1/models/qwen2.5:7b');
+    assert.equal(r.status, 200);
+    const b = json(r);
+    assert.equal(b.id, 'qwen2.5:7b');
+    assert.equal(b.object, 'model');
+    assert.equal(b.owned_by, 'ollama');
+    assert.ok(typeof b.created === 'number');
+  });
+
+  test('404 for a model not in Ollama', async () => {
+    const r = await request('GET', '/v1/models/no-such-model:latest');
+    assert.equal(r.status, 404);
+    const b = json(r);
+    assert.equal(b.error.type, 'not_found_error');
+  });
+
+  test('502 when Ollama is unreachable', async () => {
+    mockBehavior = 'ollama-error';
+    const r = await request('GET', '/v1/models/qwen2.5:7b');
+    assert.equal(r.status, 502);
+  });
+});
+
+// ── Tests: input validation ───────────────────────────────────────────────────
+
+describe('POST /v1/messages — input validation', () => {
+  test('400 when messages field is missing', async () => {
+    const r = await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      max_tokens: 100,
+      stream: false
+      // no messages field
+    });
+    assert.equal(r.status, 400);
+    const b = json(r);
+    assert.equal(b.error.type, 'invalid_request_error');
+    assert.ok(b.error.message.includes('messages'));
+  });
+
+  test('400 when messages is not an array', async () => {
+    const r = await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: 'not an array',
+      max_tokens: 100,
+      stream: false
+    });
+    assert.equal(r.status, 400);
+    const b = json(r);
+    assert.equal(b.error.type, 'invalid_request_error');
+  });
+});
+
+// ── Tests: stream defaults to false ──────────────────────────────────────────
+
+describe('POST /v1/messages — stream default', () => {
+  test('omitting stream returns non-streaming JSON response', async () => {
+    const r = await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'Hi' }],
+      max_tokens: 100
+      // stream not set — should default to false per Anthropic spec
+    });
+    assert.equal(r.status, 200);
+    assert.ok(r.headers['content-type']?.includes('application/json'),
+      'expected JSON response when stream is omitted');
+    const b = json(r);
+    assert.equal(b.type, 'message');
+  });
+});
+
 // ── Tests: 404 and unknown routes ─────────────────────────────────────────────
 
 describe('Unknown routes', () => {
