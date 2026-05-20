@@ -549,6 +549,33 @@ describe('POST /v1/messages — stream default', () => {
   });
 });
 
+// ── Tests: request-id response header ────────────────────────────────────────
+
+describe('Response headers — request-id', () => {
+  test('every response carries a unique request-id header', async () => {
+    const ids = new Set();
+    for (const [method, path] of [['GET', '/health'], ['GET', '/v1/models'], ['GET', '/metrics']]) {
+      const r = await request(method, path, null);
+      assert.ok(r.headers['request-id'], `missing request-id on ${method} ${path}`);
+      assert.ok(r.headers['request-id'].startsWith('req_'),
+        `request-id should start with req_, got: ${r.headers['request-id']}`);
+      ids.add(r.headers['request-id']);
+    }
+    assert.equal(ids.size, 3, 'each request should have a distinct request-id');
+  });
+
+  test('POST /v1/messages response carries request-id', async () => {
+    const r = await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'Hi' }],
+      max_tokens: 10,
+      stream: false,
+    });
+    assert.ok(r.headers['request-id'], 'missing request-id on POST /v1/messages');
+    assert.ok(r.headers['request-id'].startsWith('req_'));
+  });
+});
+
 // ── Tests: 404 and unknown routes ─────────────────────────────────────────────
 
 describe('Unknown routes', () => {

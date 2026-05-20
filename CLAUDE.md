@@ -24,6 +24,7 @@ OLLAMA_NUM_CTX=<n>             (optional; context window size sent to Ollama on 
 OLLAMA_KEEP_ALIVE=<duration>   (optional; how long Ollama holds the model in GPU memory between requests, e.g. "30m", "0" to unload immediately, "-1" to keep forever)
 PROXY_TIMEOUT=<ms>             (optional; hard per-request timeout in milliseconds; proxy aborts and returns 504 / SSE error if Ollama takes longer; default is no timeout)
 PROXY_MAX_TOKENS=<n>           (optional; default max_tokens when the client omits it; default 8192)
+PROXY_MAX_BODY_SIZE=<bytes>    (optional; reject requests whose Content-Length exceeds this value with 413; default no limit; example: 10485760 for 10 MB)
 ```
 
 ### MODEL_MAP example
@@ -83,3 +84,5 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - `PROXY_MAX_TOKENS` env var — configurable default max_tokens applied when the client omits the field (default 8192); useful for models with larger output budgets or strict token limits
 - GET /v1/models/:modelId — looks up a single model by ID from Ollama's model list; returns the same object shape as GET /v1/models entries; 404 if the model isn't in Ollama; 502 if Ollama is unreachable; colon-separated names (e.g. `qwen2.5:7b`) are URL-decoded automatically
 - Input validation — POST /v1/messages now validates that `messages` is present and is an array, returning a 400 `invalid_request_error` (with a descriptive message) instead of crashing into a 500; `stream` field now correctly defaults to `false` per the Anthropic API spec when not specified by the client
+- `request-id` response header — every response carries a unique `req_`-prefixed identifier that matches Anthropic's API header naming; useful for correlating proxy logs with client-side errors
+- `PROXY_MAX_BODY_SIZE` env var — optional hard limit on request body size (bytes); if the client's Content-Length header exceeds the limit the proxy immediately returns 413 `request_too_large` without reading the body, protecting against runaway base64-image payloads; default is no limit

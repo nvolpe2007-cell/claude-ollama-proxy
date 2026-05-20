@@ -37,6 +37,18 @@ const PROXY_TIMEOUT     = process.env.PROXY_TIMEOUT     ? Number(process.env.PRO
 // Default max_tokens when the client does not specify one. 8192 is a safe default for most
 // Ollama models; set higher (e.g. 32768) for models with large output budgets.
 const PROXY_MAX_TOKENS  = process.env.PROXY_MAX_TOKENS  ? Number(process.env.PROXY_MAX_TOKENS)  : 8192;
+// Optional hard body-size limit (bytes). Requests exceeding this via Content-Length are
+// rejected with 413 before the body is read, protecting against runaway base64-image payloads.
+// Default is no limit. Example: PROXY_MAX_BODY_SIZE=10485760 for 10 MB.
+const PROXY_MAX_BODY_SIZE = (() => {
+  if (!process.env.PROXY_MAX_BODY_SIZE) return null;
+  const n = Number(process.env.PROXY_MAX_BODY_SIZE);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.warn('Warning: PROXY_MAX_BODY_SIZE is not a valid positive number, ignoring');
+    return null;
+  }
+  return n;
+})();
 
 // Optional JSON map: claude-* model name (or prefix) → Ollama model name.
 // Exact match wins; then prefix match (e.g. "claude-3-haiku" matches any claude-3-haiku-*).
@@ -274,6 +286,14 @@ function checkAuth(req, res) {
 }
 
 async function readBody(req) {
+  if (PROXY_MAX_BODY_SIZE) {
+    const cl = Number(req.headers['content-length'] || 0);
+    if (cl > PROXY_MAX_BODY_SIZE) {
+      const err = new Error(`Request body ${cl} B exceeds limit of ${PROXY_MAX_BODY_SIZE} B (PROXY_MAX_BODY_SIZE)`);
+      err.code = 'PAYLOAD_TOO_LARGE';
+      throw err;
+    }
+  }
   let body = '';
   for await (const chunk of req) body += chunk;
   return body;
@@ -894,6 +914,8 @@ async function handleMetrics(req, res) {
 async function requestHandler(req, res) {
   // CORS headers on every response — must happen before any writeHead call.
   setCORSHeaders(res);
+  // Unique per-request ID surfaces in logs and lets callers correlate proxy-side errors.
+  res.setHeader('request-id', `req_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`);
 
   // Respond to browser preflight checks immediately, before auth or body parsing.
   if (req.method === 'OPTIONS') {
@@ -935,8 +957,13 @@ async function requestHandler(req, res) {
   } catch (e) {
     console.error('Unhandled request error:', e);
     if (!res.headersSent) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { type: 'internal_error', message: e.message } }));
+      if (e.code === 'PAYLOAD_TOO_LARGE') {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { type: 'request_too_large', message: e.message } }));
+      } else {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { type: 'internal_error', message: e.message } }));
+      }
     } else if (!res.writableEnded) {
       res.end();
     }
@@ -984,6 +1011,7 @@ if (require.main === module) {
     if (OLLAMA_KEEP_ALIVE) console.log(`  Keep  : keep_alive=${OLLAMA_KEEP_ALIVE}`);
     console.log(`  Timeout: ${PROXY_TIMEOUT ? `${PROXY_TIMEOUT}ms per request` : 'none (set PROXY_TIMEOUT to limit)'}`);
     console.log(`  MaxTok: default max_tokens=${PROXY_MAX_TOKENS} (set PROXY_MAX_TOKENS to change)`);
+    console.log(`  MaxBody: ${PROXY_MAX_BODY_SIZE ? `${PROXY_MAX_BODY_SIZE} B per request` : 'unlimited (set PROXY_MAX_BODY_SIZE to limit)'}`);
     console.log(`  Logs  : requests logged to stdout\n`);
   });
 
