@@ -944,6 +944,69 @@ async function handleMetrics(req, res) {
   }, null, 2));
 }
 
+// Prometheus text exposition format (https://prometheus.io/docs/instrumenting/exposition_formats/)
+// Scraped by Prometheus at GET /metrics/prometheus; compatible with Grafana Loki.
+async function handleMetricsPrometheus(req, res) {
+  const sorted = [..._metrics.latencies].sort((a, b) => a - b);
+  const uptime  = Math.floor((Date.now() - _metrics.startTime) / 1000);
+  const latSum  = _metrics.latencies.reduce((a, b) => a + b, 0);
+
+  // Escape label values per the Prometheus exposition format spec.
+  function lv(s) { return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n'); }
+
+  const out = [];
+
+  out.push('# HELP proxy_uptime_seconds Seconds since proxy process started');
+  out.push('# TYPE proxy_uptime_seconds gauge');
+  out.push(`proxy_uptime_seconds ${uptime}`);
+  out.push('');
+
+  out.push('# HELP proxy_requests_total Total requests handled, partitioned by HTTP method and route path');
+  out.push('# TYPE proxy_requests_total counter');
+  for (const [key, count] of Object.entries(_metrics.requests)) {
+    const sp     = key.indexOf(' ');
+    const method = key.slice(0, sp);
+    const path   = key.slice(sp + 1);
+    out.push(`proxy_requests_total{method="${lv(method)}",path="${lv(path)}"} ${count}`);
+  }
+  out.push('');
+
+  out.push('# HELP proxy_http_responses_total Total HTTP responses, partitioned by status code');
+  out.push('# TYPE proxy_http_responses_total counter');
+  for (const [code, count] of Object.entries(_metrics.statusCodes)) {
+    out.push(`proxy_http_responses_total{code="${lv(code)}"} ${count}`);
+  }
+  out.push('');
+
+  out.push('# HELP proxy_request_duration_ms Request latency summary over rolling 1000-sample window');
+  out.push('# TYPE proxy_request_duration_ms summary');
+  out.push(`proxy_request_duration_ms{quantile="0.5"} ${pctile(sorted, 50)}`);
+  out.push(`proxy_request_duration_ms{quantile="0.95"} ${pctile(sorted, 95)}`);
+  out.push(`proxy_request_duration_ms{quantile="0.99"} ${pctile(sorted, 99)}`);
+  out.push(`proxy_request_duration_ms_sum ${latSum}`);
+  out.push(`proxy_request_duration_ms_count ${_metrics.latencies.length}`);
+  out.push('');
+
+  out.push('# HELP proxy_tokens_total Cumulative LLM tokens, partitioned by direction');
+  out.push('# TYPE proxy_tokens_total counter');
+  out.push(`proxy_tokens_total{direction="input"} ${_metrics.tokensIn}`);
+  out.push(`proxy_tokens_total{direction="output"} ${_metrics.tokensOut}`);
+  out.push('');
+
+  out.push('# HELP proxy_active_streams Current number of open SSE streaming connections');
+  out.push('# TYPE proxy_active_streams gauge');
+  out.push(`proxy_active_streams ${_metrics.activeStreams}`);
+  out.push('');
+
+  out.push('# HELP proxy_errors_total Total 5xx responses (server-side errors)');
+  out.push('# TYPE proxy_errors_total counter');
+  out.push(`proxy_errors_total ${_metrics.errors}`);
+  out.push('');
+
+  res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+  res.end(out.join('\n') + '\n');
+}
+
 async function requestHandler(req, res) {
   // CORS headers on every response — must happen before any writeHead call.
   setCORSHeaders(res);
@@ -985,6 +1048,8 @@ async function requestHandler(req, res) {
       await handleHealth(req, res);
     } else if (req.method === 'GET' && path === '/metrics') {
       await handleMetrics(req, res);
+    } else if (req.method === 'GET' && path === '/metrics/prometheus') {
+      await handleMetricsPrometheus(req, res);
     } else {
       res.writeHead(404);
       res.end('{"error":"not found"}');
@@ -1074,4 +1139,5 @@ module.exports = {
   getOllamaHost,
   OLLAMA_HOSTS,
   requestHandler,
+  handleMetricsPrometheus,
 };

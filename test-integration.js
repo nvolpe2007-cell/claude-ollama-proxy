@@ -576,6 +576,67 @@ describe('Response headers — request-id', () => {
   });
 });
 
+// ── Tests: GET /metrics/prometheus ───────────────────────────────────────────
+
+describe('GET /metrics/prometheus', () => {
+  test('returns 200 with Prometheus text content-type', async () => {
+    const r = await request('GET', '/metrics/prometheus');
+    assert.equal(r.status, 200);
+    assert.ok(r.headers['content-type']?.includes('text/plain'), `unexpected content-type: ${r.headers['content-type']}`);
+    assert.ok(r.headers['content-type']?.includes('version=0.0.4'));
+  });
+
+  test('response contains required HELP and TYPE lines for core metrics', () => {
+    return request('GET', '/metrics/prometheus').then(r => {
+      const body = r.body;
+      for (const name of ['proxy_uptime_seconds', 'proxy_requests_total', 'proxy_http_responses_total',
+                          'proxy_request_duration_ms', 'proxy_tokens_total', 'proxy_active_streams', 'proxy_errors_total']) {
+        assert.ok(body.includes(`# HELP ${name}`), `missing HELP for ${name}`);
+        assert.ok(body.includes(`# TYPE ${name}`), `missing TYPE for ${name}`);
+      }
+    });
+  });
+
+  test('uptime is a non-negative integer', async () => {
+    const r = await request('GET', '/metrics/prometheus');
+    const match = r.body.match(/^proxy_uptime_seconds (\d+)/m);
+    assert.ok(match, 'proxy_uptime_seconds line not found');
+    assert.ok(Number(match[1]) >= 0);
+  });
+
+  test('summary metrics include quantile 0.5, 0.95, 0.99, _sum, and _count lines', async () => {
+    const r = await request('GET', '/metrics/prometheus');
+    assert.ok(r.body.includes('proxy_request_duration_ms{quantile="0.5"}'));
+    assert.ok(r.body.includes('proxy_request_duration_ms{quantile="0.95"}'));
+    assert.ok(r.body.includes('proxy_request_duration_ms{quantile="0.99"}'));
+    assert.ok(r.body.includes('proxy_request_duration_ms_sum '));
+    assert.ok(r.body.includes('proxy_request_duration_ms_count '));
+  });
+
+  test('token counters use direction label', async () => {
+    const r = await request('GET', '/metrics/prometheus');
+    assert.ok(r.body.includes('proxy_tokens_total{direction="input"}'));
+    assert.ok(r.body.includes('proxy_tokens_total{direction="output"}'));
+  });
+
+  test('request counts appear in output after making requests', async () => {
+    await request('GET', '/health');
+    const r = await request('GET', '/metrics/prometheus');
+    assert.ok(r.body.includes('proxy_requests_total{method="GET",path="/health"}'));
+  });
+
+  test('each line is either blank, a comment, or a valid metric line', async () => {
+    const r = await request('GET', '/metrics/prometheus');
+    for (const line of r.body.split('\n')) {
+      if (!line) continue;
+      assert.ok(
+        line.startsWith('#') || /^[a-z_]+({[^}]*})? /.test(line),
+        `unexpected line format: ${line}`
+      );
+    }
+  });
+});
+
 // ── Tests: 404 and unknown routes ─────────────────────────────────────────────
 
 describe('Unknown routes', () => {
