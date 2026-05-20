@@ -25,6 +25,7 @@ OLLAMA_KEEP_ALIVE=<duration>   (optional; how long Ollama holds the model in GPU
 PROXY_TIMEOUT=<ms>             (optional; hard per-request timeout in milliseconds; proxy aborts and returns 504 / SSE error if Ollama takes longer; default is no timeout)
 PROXY_MAX_TOKENS=<n>           (optional; default max_tokens when the client omits it; default 8192)
 PROXY_MAX_BODY_SIZE=<bytes>    (optional; reject requests whose Content-Length exceeds this value with 413; default no limit; example: 10485760 for 10 MB)
+LOG_FORMAT=<text|json>         (optional; 'text' emits human-readable lines (default); 'json' emits one JSON object per request for log aggregation tools — Grafana Loki, Datadog, CloudWatch, etc.)
 ```
 
 ### MODEL_MAP example
@@ -47,7 +48,7 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - GET /v1/models — lists models available in Ollama
 - GET /health — checks Ollama reachability, returns model + port
 - Graceful error handling when Ollama is offline (502 with hint)
-- Request logging (method, path, status, duration) to stdout
+- Request logging (method, path, status, duration, tokens_in, tokens_out, model) to stdout; LOG_FORMAT=json emits machine-parseable JSON for log aggregation (Grafana Loki, Datadog, CloudWatch, etc.)
 - Keepalive SSE comments every 15 s to survive reverse-proxy timeouts
 - Graceful shutdown on SIGTERM / SIGINT
 - Optional API key auth via PROXY_API_KEY (x-api-key or Authorization: Bearer)

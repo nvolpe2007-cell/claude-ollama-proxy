@@ -24,6 +24,10 @@ const TLS_KEY       = process.env.PROXY_TLS_KEY   || null;
 // CORS_ORIGIN controls the Access-Control-Allow-Origin header.
 // Set to a specific origin (e.g. "https://my-app.example.com") or leave as "*" for open access.
 const CORS_ORIGIN   = process.env.CORS_ORIGIN     || '*';
+// LOG_FORMAT controls request log output. 'text' (default) emits a human-readable line;
+// 'json' emits a single-line JSON object per request, useful for log aggregation tools
+// (Grafana Loki, Datadog, CloudWatch, etc.).
+const LOG_FORMAT    = process.env.LOG_FORMAT       || 'text';
 // Ollama-specific tuning defaults applied to every request.
 // num_ctx controls the context window — Ollama model defaults (often 2048) are too small
 // for real Claude Code sessions; set this to at least 32768 in production.
@@ -86,6 +90,31 @@ function recordRequest(method, path, status, ms) {
 function recordTokens(input, output) {
   _metrics.tokensIn  += input;
   _metrics.tokensOut += output;
+}
+
+// Emits one log line per completed request. Meta carries optional token counts and model name
+// populated by handleMessages; other routes leave it null.
+// fmt defaults to the module-level LOG_FORMAT constant; tests may pass 'text'/'json' explicitly.
+function logRequest(req, res, path, ms, meta, fmt = LOG_FORMAT) {
+  if (fmt === 'json') {
+    const entry = {
+      ts:         new Date().toISOString(),
+      method:     req.method,
+      path,
+      status:     res.statusCode,
+      ms,
+      request_id: res.getHeader('request-id') || undefined,
+    };
+    if (meta?.model)             entry.model      = meta.model;
+    if (meta?.tokensIn  != null) entry.tokens_in  = meta.tokensIn;
+    if (meta?.tokensOut != null) entry.tokens_out = meta.tokensOut;
+    console.log(JSON.stringify(entry));
+  } else {
+    const toks = meta?.tokensIn != null
+      ? ` in=${meta.tokensIn} out=${meta.tokensOut}` + (meta.model ? ` model=${meta.model}` : '')
+      : '';
+    console.log(`${req.method} ${req.url} ${res.statusCode} ${ms}ms${toks}`);
+  }
 }
 
 function pctile(sorted, p) {
@@ -488,7 +517,10 @@ async function handleMessages(req, res) {
       }
     }
 
-    recordTokens(data.usage?.prompt_tokens || 0, data.usage?.completion_tokens || 0);
+    const promptTok = data.usage?.prompt_tokens || 0;
+    const completionTok = data.usage?.completion_tokens || 0;
+    recordTokens(promptTok, completionTok);
+    res._logMeta = { model: effectiveModel, tokensIn: promptTok, tokensOut: completionTok };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       id: newMsgId(),
@@ -772,6 +804,7 @@ async function handleMessages(req, res) {
   }
 
   recordTokens(inputTokens, outputTokens);
+  res._logMeta = { model: effectiveModel, tokensIn: inputTokens, tokensOut: outputTokens };
   res.end();
 }
 
@@ -927,9 +960,11 @@ async function requestHandler(req, res) {
   const start = Date.now();
   // Strip query string before routing so ?foo=bar variants still match.
   const path = req.url.split('?')[0];
+  // handleMessages sets this before res ends so the finish handler can log token counts.
+  res._logMeta = null;
   res.on('finish', () => {
     const ms = Date.now() - start;
-    console.log(`${req.method} ${req.url} ${res.statusCode} ${ms}ms`);
+    logRequest(req, res, path, ms, res._logMeta);
     recordRequest(req.method, path, res.statusCode, ms);
   });
 
@@ -1012,7 +1047,7 @@ if (require.main === module) {
     console.log(`  Timeout: ${PROXY_TIMEOUT ? `${PROXY_TIMEOUT}ms per request` : 'none (set PROXY_TIMEOUT to limit)'}`);
     console.log(`  MaxTok: default max_tokens=${PROXY_MAX_TOKENS} (set PROXY_MAX_TOKENS to change)`);
     console.log(`  MaxBody: ${PROXY_MAX_BODY_SIZE ? `${PROXY_MAX_BODY_SIZE} B per request` : 'unlimited (set PROXY_MAX_BODY_SIZE to limit)'}`);
-    console.log(`  Logs  : requests logged to stdout\n`);
+    console.log(`  Logs  : format=${LOG_FORMAT} (set LOG_FORMAT=json for structured logging)\n`);
   });
 
   // closeIdleConnections drops idle keep-alive connections immediately so
@@ -1035,6 +1070,7 @@ module.exports = {
   extractThinkingParts,
   documentBlockToText,
   imageBlockToOpenAI,
+  logRequest,
   getOllamaHost,
   OLLAMA_HOSTS,
   requestHandler,

@@ -10,6 +10,7 @@ const {
   extractThinkingParts,
   documentBlockToText,
   imageBlockToOpenAI,
+  logRequest,
   getOllamaHost,
   OLLAMA_HOSTS,
 } = require('./proxy');
@@ -420,6 +421,82 @@ describe('toOpenAIMessages', () => {
     assert.equal(result[0].role, 'system');
     assert.equal(result[1].role, 'user');
     assert.equal(result[2].role, 'assistant');
+  });
+});
+
+// ── logRequest ────────────────────────────────────────────────────────────────
+
+describe('logRequest', () => {
+  // Minimal req/res mocks that satisfy logRequest's access patterns.
+  function mockReqRes({ method = 'POST', url = '/v1/messages', statusCode = 200, requestId = 'req_test123' } = {}) {
+    const req = { method, url };
+    const res = { statusCode, getHeader: (h) => h === 'request-id' ? requestId : undefined };
+    return { req, res };
+  }
+
+  function captureLog(fn) {
+    const lines = [];
+    const orig = console.log;
+    console.log = (...args) => lines.push(args.join(' '));
+    try { fn(); } finally { console.log = orig; }
+    return lines;
+  }
+
+  test('text format: includes method, url, status, and ms', () => {
+    const { req, res } = mockReqRes();
+    const lines = captureLog(() => logRequest(req, res, '/v1/messages', 123, null, 'text'));
+    assert.equal(lines.length, 1);
+    assert.ok(lines[0].includes('POST'), `missing method in: ${lines[0]}`);
+    assert.ok(lines[0].includes('200'), `missing status in: ${lines[0]}`);
+    assert.ok(lines[0].includes('123ms'), `missing duration in: ${lines[0]}`);
+  });
+
+  test('text format: includes token counts and model when meta is provided', () => {
+    const { req, res } = mockReqRes();
+    const meta = { model: 'qwen2.5:7b', tokensIn: 500, tokensOut: 200 };
+    const lines = captureLog(() => logRequest(req, res, '/v1/messages', 99, meta, 'text'));
+    assert.ok(lines[0].includes('in=500'), `missing tokens_in in: ${lines[0]}`);
+    assert.ok(lines[0].includes('out=200'), `missing tokens_out in: ${lines[0]}`);
+    assert.ok(lines[0].includes('model=qwen2.5:7b'), `missing model in: ${lines[0]}`);
+  });
+
+  test('text format: no token suffix when meta is null', () => {
+    const { req, res } = mockReqRes({ method: 'GET', url: '/health', statusCode: 200 });
+    const lines = captureLog(() => logRequest(req, res, '/health', 5, null, 'text'));
+    assert.ok(!lines[0].includes('in='), `unexpected token info in: ${lines[0]}`);
+  });
+
+  test('json format: emits valid JSON with required fields', () => {
+    const { req, res } = mockReqRes({ statusCode: 200, requestId: 'req_abc' });
+    const lines = captureLog(() => logRequest(req, res, '/v1/messages', 77, null, 'json'));
+    assert.equal(lines.length, 1);
+    let parsed;
+    assert.doesNotThrow(() => { parsed = JSON.parse(lines[0]); }, 'log line must be valid JSON');
+    assert.equal(parsed.method, 'POST');
+    assert.equal(parsed.status, 200);
+    assert.equal(parsed.ms, 77);
+    assert.equal(parsed.path, '/v1/messages');
+    assert.equal(parsed.request_id, 'req_abc');
+    assert.ok(typeof parsed.ts === 'string', 'ts must be an ISO string');
+  });
+
+  test('json format: includes model and token counts from meta', () => {
+    const { req, res } = mockReqRes();
+    const meta = { model: 'qwen2.5:14b', tokensIn: 1000, tokensOut: 400 };
+    const lines = captureLog(() => logRequest(req, res, '/v1/messages', 300, meta, 'json'));
+    const parsed = JSON.parse(lines[0]);
+    assert.equal(parsed.model, 'qwen2.5:14b');
+    assert.equal(parsed.tokens_in, 1000);
+    assert.equal(parsed.tokens_out, 400);
+  });
+
+  test('json format: omits model/token fields when meta is null', () => {
+    const { req, res } = mockReqRes({ method: 'GET', url: '/health' });
+    const lines = captureLog(() => logRequest(req, res, '/health', 3, null, 'json'));
+    const parsed = JSON.parse(lines[0]);
+    assert.ok(!('model' in parsed), 'model should be absent');
+    assert.ok(!('tokens_in' in parsed), 'tokens_in should be absent');
+    assert.ok(!('tokens_out' in parsed), 'tokens_out should be absent');
   });
 });
 

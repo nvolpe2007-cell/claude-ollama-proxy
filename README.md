@@ -64,6 +64,7 @@ You should see:
 | `OLLAMA_NUM_CTX` | *(model default)* | Context window size sent to Ollama. Model defaults are often only 2048 — set to `32768` or higher for real sessions |
 | `OLLAMA_KEEP_ALIVE` | *(Ollama default)* | How long the model stays loaded in GPU memory between requests (`"5m"`, `"0"` to unload immediately, `"-1"` to keep forever) |
 | `PROXY_TIMEOUT` | *(none)* | Hard per-request timeout in milliseconds. If Ollama does not respond within this window the proxy aborts and returns a `504` error (non-streaming) or an SSE error event (streaming). Useful when running behind a strict reverse-proxy timeout or to detect stuck model generation. |
+| `LOG_FORMAT` | `text` | Log format for request lines. `text` (default) writes human-readable lines; `json` writes a single JSON object per request — useful for log aggregation tools like Grafana Loki, Datadog, or AWS CloudWatch. Each JSON entry includes `ts`, `method`, `path`, `status`, `ms`, `request_id`, and (for `/v1/messages`) `model`, `tokens_in`, `tokens_out`. |
 
 Examples:
 
