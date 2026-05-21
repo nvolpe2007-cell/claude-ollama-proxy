@@ -76,6 +76,7 @@ const _metrics = {
   tokensOut:    0,
   activeStreams: 0,
   errors:       0,
+  modelsUsed:   {},   // 'model-name' → { requests, tokensIn, tokensOut }
 };
 
 function recordRequest(method, path, status, ms) {
@@ -88,9 +89,16 @@ function recordRequest(method, path, status, ms) {
   _metrics.latencies.push(ms);
 }
 
-function recordTokens(input, output) {
+function recordTokens(input, output, model) {
   _metrics.tokensIn  += input;
   _metrics.tokensOut += output;
+  if (model) {
+    if (!_metrics.modelsUsed[model])
+      _metrics.modelsUsed[model] = { requests: 0, tokensIn: 0, tokensOut: 0 };
+    _metrics.modelsUsed[model].requests  += 1;
+    _metrics.modelsUsed[model].tokensIn  += input;
+    _metrics.modelsUsed[model].tokensOut += output;
+  }
 }
 
 // Emits one log line per completed request. Meta carries optional token counts and model name
@@ -522,7 +530,7 @@ async function handleMessages(req, res) {
 
     const promptTok = data.usage?.prompt_tokens || 0;
     const completionTok = data.usage?.completion_tokens || 0;
-    recordTokens(promptTok, completionTok);
+    recordTokens(promptTok, completionTok, effectiveModel);
     res._logMeta = { model: effectiveModel, tokensIn: promptTok, tokensOut: completionTok };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -806,7 +814,7 @@ async function handleMessages(req, res) {
     _metrics.activeStreams--;
   }
 
-  recordTokens(inputTokens, outputTokens);
+  recordTokens(inputTokens, outputTokens, effectiveModel);
   res._logMeta = { model: effectiveModel, tokensIn: inputTokens, tokensOut: outputTokens };
   res.end();
 }
@@ -934,6 +942,10 @@ async function handleMetrics(req, res) {
   const sorted = [..._metrics.latencies].sort((a, b) => a - b);
   const latSum = sorted.reduce((a, b) => a + b, 0);
   const latAvg = sorted.length ? Math.round((latSum / sorted.length) * 100) / 100 : 0;
+  const modelsUsage = {};
+  for (const [model, m] of Object.entries(_metrics.modelsUsed)) {
+    modelsUsage[model] = { requests: m.requests, tokens_in: m.tokensIn, tokens_out: m.tokensOut };
+  }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     uptime_seconds:      Math.floor((Date.now() - _metrics.startTime) / 1000),
@@ -949,6 +961,7 @@ async function handleMetrics(req, res) {
     tokens_output_total: _metrics.tokensOut,
     active_streams:      _metrics.activeStreams,
     errors_total:        _metrics.errors,
+    models_usage:        modelsUsage,
   }, null, 2));
 }
 
@@ -1004,6 +1017,21 @@ async function handleMetricsPrometheus(req, res) {
   out.push('# HELP proxy_active_streams Current number of open SSE streaming connections');
   out.push('# TYPE proxy_active_streams gauge');
   out.push(`proxy_active_streams ${_metrics.activeStreams}`);
+  out.push('');
+
+  out.push('# HELP proxy_model_requests_total Total completed LLM requests per model');
+  out.push('# TYPE proxy_model_requests_total counter');
+  for (const [model, m] of Object.entries(_metrics.modelsUsed)) {
+    out.push(`proxy_model_requests_total{model="${lv(model)}"} ${m.requests}`);
+  }
+  out.push('');
+
+  out.push('# HELP proxy_model_tokens_total Cumulative LLM tokens per model partitioned by direction');
+  out.push('# TYPE proxy_model_tokens_total counter');
+  for (const [model, m] of Object.entries(_metrics.modelsUsed)) {
+    out.push(`proxy_model_tokens_total{model="${lv(model)}",direction="input"} ${m.tokensIn}`);
+    out.push(`proxy_model_tokens_total{model="${lv(model)}",direction="output"} ${m.tokensOut}`);
+  }
   out.push('');
 
   out.push('# HELP proxy_errors_total Total 5xx responses (server-side errors)');

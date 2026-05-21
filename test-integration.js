@@ -256,14 +256,35 @@ describe('GET /metrics', () => {
       'uptime_seconds', 'requests_total', 'status_codes',
       'latency_p50_ms', 'latency_p95_ms', 'latency_p99_ms',
       'tokens_input_total', 'tokens_output_total',
-      'active_streams', 'errors_total'
+      'active_streams', 'errors_total', 'models_usage'
     ];
     for (const k of required) {
       assert.ok(k in b, `missing field: ${k}`);
     }
     assert.ok(typeof b.uptime_seconds === 'number');
     assert.ok(typeof b.requests_total === 'object');
+    assert.ok(typeof b.models_usage === 'object');
     assert.ok(b.active_streams === 0);
+  });
+
+  test('models_usage tracks requests and tokens after a message request', async () => {
+    // Make a non-streaming request and verify models_usage is populated.
+    await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'ping' }],
+      max_tokens: 10,
+      stream: false
+    });
+    const r = await request('GET', '/metrics');
+    const b = json(r);
+    assert.ok(typeof b.models_usage === 'object', 'models_usage should be an object');
+    // At least one model should be recorded.
+    const models = Object.keys(b.models_usage);
+    assert.ok(models.length >= 1, 'at least one model should appear in models_usage');
+    const entry = b.models_usage[models[0]];
+    assert.ok(typeof entry.requests === 'number' && entry.requests >= 1, 'requests should be >= 1');
+    assert.ok(typeof entry.tokens_in === 'number', 'tokens_in should be a number');
+    assert.ok(typeof entry.tokens_out === 'number', 'tokens_out should be a number');
   });
 });
 
@@ -590,11 +611,24 @@ describe('GET /metrics/prometheus', () => {
     return request('GET', '/metrics/prometheus').then(r => {
       const body = r.body;
       for (const name of ['proxy_uptime_seconds', 'proxy_requests_total', 'proxy_http_responses_total',
-                          'proxy_request_duration_ms', 'proxy_tokens_total', 'proxy_active_streams', 'proxy_errors_total']) {
+                          'proxy_request_duration_ms', 'proxy_tokens_total', 'proxy_active_streams',
+                          'proxy_errors_total', 'proxy_model_requests_total', 'proxy_model_tokens_total']) {
         assert.ok(body.includes(`# HELP ${name}`), `missing HELP for ${name}`);
         assert.ok(body.includes(`# TYPE ${name}`), `missing TYPE for ${name}`);
       }
     });
+  });
+
+  test('per-model counters appear after a message request', async () => {
+    await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'ping' }],
+      max_tokens: 10,
+      stream: false
+    });
+    const r = await request('GET', '/metrics/prometheus');
+    assert.ok(r.body.includes('proxy_model_requests_total{model='), 'model request counter missing');
+    assert.ok(r.body.includes('proxy_model_tokens_total{model=') && r.body.includes('direction="input"'), 'model token counter missing');
   });
 
   test('uptime is a non-negative integer', async () => {
