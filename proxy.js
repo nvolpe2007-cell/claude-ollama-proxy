@@ -44,6 +44,7 @@ const PROXY_MAX_TOKENS  = process.env.PROXY_MAX_TOKENS  ? Number(process.env.PRO
 // Optional hard body-size limit (bytes). Requests exceeding this via Content-Length are
 // rejected with 413 before the body is read, protecting against runaway base64-image payloads.
 // Default is no limit. Example: PROXY_MAX_BODY_SIZE=10485760 for 10 MB.
+const PROXY_WARMUP       = process.env.PROXY_WARMUP === 'true';
 const PROXY_MAX_BODY_SIZE = (() => {
   if (!process.env.PROXY_MAX_BODY_SIZE) return null;
   const n = Number(process.env.PROXY_MAX_BODY_SIZE);
@@ -341,7 +342,9 @@ async function fetchWithRetry(url, options, maxRetries = 3, baseDelay = 500) {
       if (attempt >= maxRetries) throw e;
       console.warn(`Ollama fetch error: ${e.message}, retrying (${attempt + 1}/${maxRetries})…`);
     }
-    await new Promise(r => setTimeout(r, baseDelay * 2 ** attempt));
+    // Jitter (±25%) prevents thundering herd when multiple retries fire concurrently.
+    const jitter = 0.75 + Math.random() * 0.5;
+    await new Promise(r => setTimeout(r, baseDelay * 2 ** attempt * jitter));
   }
 }
 
@@ -929,6 +932,8 @@ async function handleHealth(req, res) {
 
 async function handleMetrics(req, res) {
   const sorted = [..._metrics.latencies].sort((a, b) => a - b);
+  const latSum = sorted.reduce((a, b) => a + b, 0);
+  const latAvg = sorted.length ? Math.round((latSum / sorted.length) * 100) / 100 : 0;
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     uptime_seconds:      Math.floor((Date.now() - _metrics.startTime) / 1000),
@@ -937,6 +942,9 @@ async function handleMetrics(req, res) {
     latency_p50_ms:      pctile(sorted, 50),
     latency_p95_ms:      pctile(sorted, 95),
     latency_p99_ms:      pctile(sorted, 99),
+    latency_min_ms:      sorted.length ? sorted[0] : 0,
+    latency_max_ms:      sorted.length ? sorted[sorted.length - 1] : 0,
+    latency_avg_ms:      latAvg,
     tokens_input_total:  _metrics.tokensIn,
     tokens_output_total: _metrics.tokensOut,
     active_streams:      _metrics.activeStreams,
@@ -1112,7 +1120,40 @@ if (require.main === module) {
     console.log(`  Timeout: ${PROXY_TIMEOUT ? `${PROXY_TIMEOUT}ms per request` : 'none (set PROXY_TIMEOUT to limit)'}`);
     console.log(`  MaxTok: default max_tokens=${PROXY_MAX_TOKENS} (set PROXY_MAX_TOKENS to change)`);
     console.log(`  MaxBody: ${PROXY_MAX_BODY_SIZE ? `${PROXY_MAX_BODY_SIZE} B per request` : 'unlimited (set PROXY_MAX_BODY_SIZE to limit)'}`);
-    console.log(`  Logs  : format=${LOG_FORMAT} (set LOG_FORMAT=json for structured logging)\n`);
+    console.log(`  Logs  : format=${LOG_FORMAT} (set LOG_FORMAT=json for structured logging)`);
+    console.log(`  Warmup: ${PROXY_WARMUP ? 'enabled — pre-loading model on startup' : 'disabled (set PROXY_WARMUP=true to pre-load model)'}\n`);
+
+    if (PROXY_WARMUP) {
+      // Fire warmup asynchronously so the server is already accepting connections while we load.
+      // Uses setImmediate to yield back to the event loop first.
+      setImmediate(async () => {
+        const ollamaBase = OLLAMA_HOSTS[0];
+        console.log(`  Warmup: sending preflight to ${ollamaBase} to load ${MODEL} into GPU memory…`);
+        try {
+          const r = await fetch(`${ollamaBase}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: MODEL,
+              messages: [{ role: 'user', content: '.' }],
+              max_tokens: 1,
+              stream: false,
+              ...(OLLAMA_KEEP_ALIVE && { keep_alive: OLLAMA_KEEP_ALIVE }),
+            }),
+            // Allow up to 3 minutes — large models can take time on first load.
+            signal: AbortSignal.timeout(180_000),
+          });
+          if (r.ok) {
+            console.log('  Warmup: model ready — GPU memory loaded\n');
+          } else {
+            const text = await r.text().catch(() => '');
+            console.warn(`  Warmup: Ollama returned HTTP ${r.status} — first real request will retry: ${text.slice(0, 120)}\n`);
+          }
+        } catch (e) {
+          console.warn(`  Warmup: failed (${e.message}) — first request will load model on demand\n`);
+        }
+      });
+    }
   });
 
   // closeIdleConnections drops idle keep-alive connections immediately so

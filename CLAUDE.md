@@ -26,6 +26,7 @@ PROXY_TIMEOUT=<ms>             (optional; hard per-request timeout in millisecon
 PROXY_MAX_TOKENS=<n>           (optional; default max_tokens when the client omits it; default 8192)
 PROXY_MAX_BODY_SIZE=<bytes>    (optional; reject requests whose Content-Length exceeds this value with 413; default no limit; example: 10485760 for 10 MB)
 LOG_FORMAT=<text|json>         (optional; 'text' emits human-readable lines (default); 'json' emits one JSON object per request for log aggregation tools — Grafana Loki, Datadog, CloudWatch, etc.)
+PROXY_WARMUP=true              (optional; when 'true', sends a minimal preflight request to Ollama after startup to pre-load the model into GPU memory, eliminating cold-start latency on the first real request; default false)
 ```
 
 ### MODEL_MAP example
@@ -88,3 +89,6 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - `request-id` response header — every response carries a unique `req_`-prefixed identifier that matches Anthropic's API header naming; useful for correlating proxy logs with client-side errors
 - `PROXY_MAX_BODY_SIZE` env var — optional hard limit on request body size (bytes); if the client's Content-Length header exceeds the limit the proxy immediately returns 413 `request_too_large` without reading the body, protecting against runaway base64-image payloads; default is no limit
 - GET /metrics/prometheus — Prometheus text exposition format (version 0.0.4) of the same metrics as GET /metrics; exposes `proxy_uptime_seconds`, `proxy_requests_total{method,path}`, `proxy_http_responses_total{code}`, `proxy_request_duration_ms` summary (p50/p95/p99 + _sum + _count), `proxy_tokens_total{direction}`, `proxy_active_streams`, and `proxy_errors_total`; scraped directly by Prometheus without any exporter; Content-Type `text/plain; version=0.0.4; charset=utf-8`
+- `PROXY_WARMUP` env var — when set to `true`, fires a minimal preflight request to Ollama immediately after the server starts listening; this pre-loads the configured model into GPU memory so the first real Claude Code request incurs no cold-start latency; uses a 3-minute timeout (large models can take time on first load); warmup failures are logged as warnings and do not prevent the proxy from serving traffic
+- Retry jitter — exponential backoff delays now include ±25% random jitter to prevent thundering herd when multiple concurrent requests all retry at the same moment (especially relevant in multi-host round-robin deployments)
+- Extended latency metrics — GET /metrics now includes `latency_min_ms`, `latency_max_ms`, and `latency_avg_ms` alongside the existing p50/p95/p99 percentiles for a more complete picture of request latency distribution
