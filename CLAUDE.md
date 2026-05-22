@@ -27,6 +27,8 @@ PROXY_MAX_TOKENS=<n>           (optional; default max_tokens when the client omi
 PROXY_MAX_BODY_SIZE=<bytes>    (optional; reject requests whose Content-Length exceeds this value with 413; default no limit; example: 10485760 for 10 MB)
 LOG_FORMAT=<text|json>         (optional; 'text' emits human-readable lines (default); 'json' emits one JSON object per request for log aggregation tools — Grafana Loki, Datadog, CloudWatch, etc.)
 PROXY_WARMUP=true              (optional; when 'true', sends a minimal preflight request to Ollama after startup to pre-load the model into GPU memory, eliminating cold-start latency on the first real request; default false)
+RATE_LIMIT_RPM=<n>            (optional; global request rate limit in requests/minute across all callers; applies to POST /v1/messages and POST /v1/messages/count_tokens; returns 429 with retry-after header; default no limit)
+RATE_LIMIT_PER_IP_RPM=<n>     (optional; per-client-IP rate limit in requests/minute; uses x-forwarded-for when behind a reverse proxy; both limits can be active simultaneously; default no limit)
 ```
 
 ### MODEL_MAP example
@@ -93,3 +95,4 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - Retry jitter — exponential backoff delays now include ±25% random jitter to prevent thundering herd when multiple concurrent requests all retry at the same moment (especially relevant in multi-host round-robin deployments)
 - Extended latency metrics — GET /metrics now includes `latency_min_ms`, `latency_max_ms`, and `latency_avg_ms` alongside the existing p50/p95/p99 percentiles for a more complete picture of request latency distribution
 - Per-model usage metrics — GET /metrics includes `models_usage` object breaking down request counts, input tokens, and output tokens by Ollama model name; GET /metrics/prometheus exposes `proxy_model_requests_total{model}` and `proxy_model_tokens_total{model,direction}` counters; especially useful with MODEL_MAP deployments to compare usage across models
+- Rate limiting — `RATE_LIMIT_RPM` (global) and `RATE_LIMIT_PER_IP_RPM` (per caller IP) fixed-window request caps applied to POST /v1/messages and POST /v1/messages/count_tokens; exceeded limit returns 429 `rate_limit_error` with `retry-after` header; every rate-limited response also carries `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, and `x-ratelimit-reset-requests` headers matching Anthropic's own API header naming; per-IP extraction respects `x-forwarded-for` for reverse-proxy deployments; both limits may be active simultaneously; disabled by default

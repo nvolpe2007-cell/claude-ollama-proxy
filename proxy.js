@@ -55,6 +55,14 @@ const PROXY_MAX_BODY_SIZE = (() => {
   return n;
 })();
 
+// Optional request rate limits. Both apply only to POST /v1/messages and
+// POST /v1/messages/count_tokens. Unset (disabled) by default.
+// RATE_LIMIT_RPM        — global cap across all callers (requests / minute).
+// RATE_LIMIT_PER_IP_RPM — per-client-IP cap (requests / minute); uses
+//                         x-forwarded-for when behind a reverse proxy.
+const RATE_LIMIT_RPM        = process.env.RATE_LIMIT_RPM        ? Number(process.env.RATE_LIMIT_RPM)        : null;
+const RATE_LIMIT_PER_IP_RPM = process.env.RATE_LIMIT_PER_IP_RPM ? Number(process.env.RATE_LIMIT_PER_IP_RPM) : null;
+
 // Optional JSON map: claude-* model name (or prefix) → Ollama model name.
 // Exact match wins; then prefix match (e.g. "claude-3-haiku" matches any claude-3-haiku-*).
 // Non-claude-* names in requests always pass through as-is regardless of this map.
@@ -335,6 +343,50 @@ async function readBody(req) {
   let body = '';
   for await (const chunk of req) body += chunk;
   return body;
+}
+
+// ── Rate limiting ────────────────────────────────────────────────────────────
+// Fixed-window counters keyed by 'global' or a client IP string.
+// Each window is exactly 60 seconds wide. A new window starts on first request
+// after the previous one expires, which is cheap and good enough for burst protection.
+const _rateLimitWindows = new Map(); // key → { count, windowStart }
+
+// Returns the client IP, respecting x-forwarded-for for reverse-proxy deployments.
+function getClientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return xff.split(',')[0].trim();
+  return req.socket.remoteAddress || 'unknown';
+}
+
+// Checks the given key against the limit. Attaches x-ratelimit-* headers to res.
+// Returns true if the request is within limits; writes a 429 and returns false if not.
+function checkRateLimit(key, limit, req, res) {
+  const now = Date.now();
+  let w = _rateLimitWindows.get(key);
+  if (!w || now - w.windowStart >= 60_000) {
+    w = { count: 0, windowStart: now };
+    _rateLimitWindows.set(key, w);
+  }
+  w.count++;
+  const remaining  = Math.max(0, limit - w.count);
+  const resetEpoch = Math.ceil((w.windowStart + 60_000) / 1000);
+  res.setHeader('x-ratelimit-limit-requests',     String(limit));
+  res.setHeader('x-ratelimit-remaining-requests', String(remaining));
+  res.setHeader('x-ratelimit-reset-requests',     String(resetEpoch));
+  if (w.count > limit) {
+    const retryAfter = Math.max(1, Math.ceil((w.windowStart + 60_000 - now) / 1000));
+    res.setHeader('retry-after', String(retryAfter));
+    if (!res.headersSent) res.writeHead(429, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'rate_limit_error',
+        message: `Rate limit exceeded (${limit} req/min). Retry after ${retryAfter}s.`,
+      },
+    }));
+    return false;
+  }
+  return true;
 }
 
 // Retry fetch on transient Ollama 5xx errors or network failures.
@@ -1070,9 +1122,13 @@ async function requestHandler(req, res) {
   try {
     if (req.method === 'POST' && path === '/v1/messages') {
       if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
       await handleMessages(req, res);
     } else if (req.method === 'POST' && path === '/v1/messages/count_tokens') {
       if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
       await handleCountTokens(req, res);
     } else if (req.method === 'GET' && path === '/v1/models') {
       if (!checkAuth(req, res)) return;
@@ -1149,7 +1205,10 @@ if (require.main === module) {
     console.log(`  MaxTok: default max_tokens=${PROXY_MAX_TOKENS} (set PROXY_MAX_TOKENS to change)`);
     console.log(`  MaxBody: ${PROXY_MAX_BODY_SIZE ? `${PROXY_MAX_BODY_SIZE} B per request` : 'unlimited (set PROXY_MAX_BODY_SIZE to limit)'}`);
     console.log(`  Logs  : format=${LOG_FORMAT} (set LOG_FORMAT=json for structured logging)`);
-    console.log(`  Warmup: ${PROXY_WARMUP ? 'enabled — pre-loading model on startup' : 'disabled (set PROXY_WARMUP=true to pre-load model)'}\n`);
+    console.log(`  Warmup: ${PROXY_WARMUP ? 'enabled — pre-loading model on startup' : 'disabled (set PROXY_WARMUP=true to pre-load model)'}`);
+    const rlGlobal = RATE_LIMIT_RPM        ? `global ${RATE_LIMIT_RPM} req/min`    : 'no global limit';
+    const rlIp     = RATE_LIMIT_PER_IP_RPM ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min` : 'no per-IP limit';
+    console.log(`  RateLimit: ${rlGlobal}; ${rlIp} (set RATE_LIMIT_RPM / RATE_LIMIT_PER_IP_RPM)\n`);
 
     if (PROXY_WARMUP) {
       // Fire warmup asynchronously so the server is already accepting connections while we load.
@@ -1209,4 +1268,8 @@ module.exports = {
   OLLAMA_HOSTS,
   requestHandler,
   handleMetricsPrometheus,
+  // Rate-limit internals exported for unit testing only.
+  checkRateLimit,
+  getClientIp,
+  _rateLimitWindows,
 };

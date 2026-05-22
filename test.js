@@ -13,6 +13,9 @@ const {
   logRequest,
   getOllamaHost,
   OLLAMA_HOSTS,
+  checkRateLimit,
+  getClientIp,
+  _rateLimitWindows,
 } = require('./proxy');
 
 // ── resolveModel ──────────────────────────────────────────────────────────────
@@ -520,5 +523,109 @@ describe('getOllamaHost', () => {
       const h = getOllamaHost();
       assert.ok(OLLAMA_HOSTS.includes(h), `unexpected host returned: ${h}`);
     }
+  });
+});
+
+// ── checkRateLimit ────────────────────────────────────────────────────────────
+
+describe('checkRateLimit', () => {
+  // Build a minimal mock res that captures setHeader and writeHead/end calls.
+  function mockRes() {
+    const headers = {};
+    return {
+      headers,
+      headersSent: false,
+      writableEnded: false,
+      statusCode: null,
+      body: null,
+      setHeader(k, v) { headers[k.toLowerCase()] = v; },
+      writeHead(code) { this.statusCode = code; this.headersSent = true; },
+      end(b) { this.body = b; this.writableEnded = true; },
+    };
+  }
+  function mockReq() { return { headers: {}, socket: { remoteAddress: '127.0.0.1' } }; }
+
+  // Ensure a fresh window key per test by using unique keys.
+  let keyCounter = 0;
+  function freshKey() { return `test-key-${++keyCounter}`; }
+
+  test('returns true and sets x-ratelimit headers when under limit', () => {
+    const req = mockReq();
+    const res = mockRes();
+    const ok = checkRateLimit(freshKey(), 10, req, res);
+    assert.ok(ok, 'should return true when under limit');
+    assert.equal(res.headers['x-ratelimit-limit-requests'], '10');
+    assert.equal(res.headers['x-ratelimit-remaining-requests'], '9');
+    assert.ok(res.headers['x-ratelimit-reset-requests'], 'reset header should be set');
+    assert.equal(res.statusCode, null, 'should not write a status code when allowed');
+  });
+
+  test('returns false and writes 429 when over limit', () => {
+    const req = mockReq();
+    const key = freshKey();
+    // Exhaust the limit of 2 with two allowed requests.
+    checkRateLimit(key, 2, req, mockRes());
+    checkRateLimit(key, 2, req, mockRes());
+    // Third request should be rejected.
+    const res = mockRes();
+    const ok = checkRateLimit(key, 2, req, res);
+    assert.ok(!ok, 'should return false when over limit');
+    assert.equal(res.statusCode, 429);
+    assert.ok(res.body, 'should write a response body');
+    const body = JSON.parse(res.body);
+    assert.equal(body.error.type, 'rate_limit_error');
+    assert.ok(body.error.message.includes('req/min'), 'message should mention rate');
+    assert.ok(res.headers['retry-after'], 'should set retry-after header');
+  });
+
+  test('remaining decrements on each call', () => {
+    const req = mockReq();
+    const key = freshKey();
+    const limit = 5;
+    for (let i = 0; i < limit; i++) {
+      const res = mockRes();
+      checkRateLimit(key, limit, req, res);
+      assert.equal(res.headers['x-ratelimit-remaining-requests'], String(limit - i - 1));
+    }
+  });
+
+  test('window resets after 60 seconds (simulated via _rateLimitWindows)', () => {
+    const req = mockReq();
+    const key = freshKey();
+    // Exhaust the limit.
+    checkRateLimit(key, 1, req, mockRes());
+    const res1 = mockRes();
+    assert.ok(!checkRateLimit(key, 1, req, res1), 'should be rate-limited');
+    // Wind back the window start to simulate expiry.
+    const w = _rateLimitWindows.get(key);
+    w.windowStart -= 61_000;
+    // Next request should start a fresh window and succeed.
+    const res2 = mockRes();
+    assert.ok(checkRateLimit(key, 1, req, res2), 'should succeed after window reset');
+    assert.equal(res2.headers['x-ratelimit-remaining-requests'], '0');
+  });
+});
+
+// ── getClientIp ───────────────────────────────────────────────────────────────
+
+describe('getClientIp', () => {
+  test('returns socket remoteAddress when no x-forwarded-for', () => {
+    const req = { headers: {}, socket: { remoteAddress: '10.0.0.1' } };
+    assert.equal(getClientIp(req), '10.0.0.1');
+  });
+
+  test('returns first IP from x-forwarded-for header', () => {
+    const req = { headers: { 'x-forwarded-for': '203.0.113.5, 10.0.0.2, 10.0.0.3' }, socket: { remoteAddress: '10.0.0.2' } };
+    assert.equal(getClientIp(req), '203.0.113.5');
+  });
+
+  test('trims whitespace from x-forwarded-for', () => {
+    const req = { headers: { 'x-forwarded-for': '  192.168.1.1  ' }, socket: { remoteAddress: '10.0.0.1' } };
+    assert.equal(getClientIp(req), '192.168.1.1');
+  });
+
+  test('falls back to "unknown" when socket has no remoteAddress', () => {
+    const req = { headers: {}, socket: {} };
+    assert.equal(getClientIp(req), 'unknown');
   });
 });
