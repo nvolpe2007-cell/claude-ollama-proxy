@@ -41,6 +41,11 @@ const PROXY_TIMEOUT     = process.env.PROXY_TIMEOUT     ? Number(process.env.PRO
 // Default max_tokens when the client does not specify one. 8192 is a safe default for most
 // Ollama models; set higher (e.g. 32768) for models with large output budgets.
 const PROXY_MAX_TOKENS  = process.env.PROXY_MAX_TOKENS  ? Number(process.env.PROXY_MAX_TOKENS)  : 8192;
+// Optional system prompt injected before every request's system field.
+// Useful for enforcing consistent model behavior across all callers without modifying clients.
+// When the client also supplies a system prompt, the proxy's prompt is prepended (separated by
+// two newlines). For array-form system prompts the proxy text becomes the first content block.
+const PROXY_SYSTEM_PROMPT = process.env.PROXY_SYSTEM_PROMPT || null;
 // Optional hard body-size limit (bytes). Requests exceeding this via Content-Length are
 // rejected with 413 before the body is read, protecting against runaway base64-image payloads.
 // Default is no limit. Example: PROXY_MAX_BODY_SIZE=10485760 for 10 MB.
@@ -149,6 +154,17 @@ function resolveModel(requestedModel) {
     return MODEL;
   }
   return requestedModel;
+}
+
+// Merges PROXY_SYSTEM_PROMPT with the request's system field.
+// Handles string, array-of-blocks, and absent system prompts.
+// When PROXY_SYSTEM_PROMPT is unset, returns the original system value unchanged.
+function injectSystemPrompt(system) {
+  if (!PROXY_SYSTEM_PROMPT) return system;
+  if (!system) return PROXY_SYSTEM_PROMPT;
+  if (typeof system === 'string') return `${PROXY_SYSTEM_PROMPT}\n\n${system}`;
+  // Array of Anthropic content blocks — prepend a text block.
+  return [{ type: 'text', text: PROXY_SYSTEM_PROMPT }, ...system];
 }
 
 // Anthropic messages/tools → OpenAI format
@@ -458,7 +474,7 @@ async function handleMessages(req, res) {
 
   const openaiReq = {
     model: effectiveModel,
-    messages: toOpenAIMessages(anthropicReq.messages, anthropicReq.system),
+    messages: toOpenAIMessages(anthropicReq.messages, injectSystemPrompt(anthropicReq.system)),
     stream: streaming,
     max_tokens: anthropicReq.max_tokens || PROXY_MAX_TOKENS,
     ...(streaming && { stream_options: { include_usage: true } }),
@@ -935,7 +951,7 @@ async function handleCountTokens(req, res) {
 
   // Flatten messages + system to a single string for tokenization.
   // Tool schemas are appended as JSON since they consume context.
-  const messages = toOpenAIMessages(anthropicReq.messages || [], anthropicReq.system);
+  const messages = toOpenAIMessages(anthropicReq.messages || [], injectSystemPrompt(anthropicReq.system));
   let prompt = messages.map(m => {
     if (typeof m.content === 'string') return m.content;
     if (Array.isArray(m.content)) return m.content.map(p => p.text || '').join('');
@@ -1204,6 +1220,7 @@ if (require.main === module) {
     console.log(`  Timeout: ${PROXY_TIMEOUT ? `${PROXY_TIMEOUT}ms per request` : 'none (set PROXY_TIMEOUT to limit)'}`);
     console.log(`  MaxTok: default max_tokens=${PROXY_MAX_TOKENS} (set PROXY_MAX_TOKENS to change)`);
     console.log(`  MaxBody: ${PROXY_MAX_BODY_SIZE ? `${PROXY_MAX_BODY_SIZE} B per request` : 'unlimited (set PROXY_MAX_BODY_SIZE to limit)'}`);
+    if (PROXY_SYSTEM_PROMPT) console.log(`  SysPrompt: ${PROXY_SYSTEM_PROMPT.slice(0, 80)}${PROXY_SYSTEM_PROMPT.length > 80 ? '…' : ''}`);
     console.log(`  Logs  : format=${LOG_FORMAT} (set LOG_FORMAT=json for structured logging)`);
     console.log(`  Warmup: ${PROXY_WARMUP ? 'enabled — pre-loading model on startup' : 'disabled (set PROXY_WARMUP=true to pre-load model)'}`);
     const rlGlobal = RATE_LIMIT_RPM        ? `global ${RATE_LIMIT_RPM} req/min`    : 'no global limit';
@@ -1263,6 +1280,7 @@ module.exports = {
   extractThinkingParts,
   documentBlockToText,
   imageBlockToOpenAI,
+  injectSystemPrompt,
   logRequest,
   getOllamaHost,
   OLLAMA_HOSTS,

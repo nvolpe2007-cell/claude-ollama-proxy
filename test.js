@@ -10,6 +10,7 @@ const {
   extractThinkingParts,
   documentBlockToText,
   imageBlockToOpenAI,
+  injectSystemPrompt,
   logRequest,
   getOllamaHost,
   OLLAMA_HOSTS,
@@ -39,6 +40,31 @@ describe('resolveModel', () => {
     assert.equal(resolveModel('claude-3-haiku'), DEFAULT);
     assert.equal(resolveModel('claude-3-opus-20240229'), DEFAULT);
     assert.equal(resolveModel('claude-sonnet-4-6'), DEFAULT);
+  });
+});
+
+// ── injectSystemPrompt ────────────────────────────────────────────────────────
+// Note: injectSystemPrompt reads the module-level PROXY_SYSTEM_PROMPT constant.
+// When that env var is not set (test environment), the function is a no-op.
+
+describe('injectSystemPrompt', () => {
+  test('returns system unchanged when PROXY_SYSTEM_PROMPT is not set', () => {
+    // In the test environment PROXY_SYSTEM_PROMPT is unset, so this is a no-op.
+    assert.equal(injectSystemPrompt('hello'), 'hello');
+    assert.equal(injectSystemPrompt(null), null);
+    assert.equal(injectSystemPrompt(undefined), undefined);
+    assert.deepEqual(injectSystemPrompt([{ type: 'text', text: 'hi' }]),
+      [{ type: 'text', text: 'hi' }]);
+  });
+
+  test('pure function signature: string + no env → passthrough', () => {
+    const result = injectSystemPrompt('be concise');
+    assert.equal(result, 'be concise');
+  });
+
+  test('pure function signature: array + no env → passthrough', () => {
+    const blocks = [{ type: 'text', text: 'be concise' }];
+    assert.deepEqual(injectSystemPrompt(blocks), blocks);
   });
 });
 
