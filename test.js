@@ -379,6 +379,54 @@ describe('toOpenAIMessages', () => {
     assert.equal(result[0].content, 'raw string result');
   });
 
+  test('tool_result with image content appends follow-up user message', () => {
+    const messages = [{
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: 'toolu_003',
+        content: [
+          { type: 'text', text: 'screenshot captured' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc123' } },
+        ],
+      }],
+    }];
+    const result = toOpenAIMessages(messages, null);
+    assert.equal(result.length, 2);
+    assert.equal(result[0].role, 'tool');
+    assert.equal(result[0].content, 'screenshot captured');
+    assert.equal(result[1].role, 'user');
+    assert.ok(Array.isArray(result[1].content));
+    assert.equal(result[1].content.length, 1);
+    assert.equal(result[1].content[0].type, 'image_url');
+    assert.equal(result[1].content[0].image_url.url, 'data:image/png;base64,abc123');
+  });
+
+  test('tool_result images and trailing text blocks merge into one user message', () => {
+    const messages = [{
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'toolu_004',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'xyz' } },
+          ],
+        },
+        { type: 'text', text: 'what do you see?' },
+      ],
+    }];
+    const result = toOpenAIMessages(messages, null);
+    assert.equal(result.length, 2);
+    assert.equal(result[0].role, 'tool');
+    assert.equal(result[1].role, 'user');
+    assert.ok(Array.isArray(result[1].content));
+    assert.equal(result[1].content.length, 2);
+    assert.equal(result[1].content[0].type, 'text');
+    assert.equal(result[1].content[0].text, 'what do you see?');
+    assert.equal(result[1].content[1].type, 'image_url');
+  });
+
   test('converts tool_use blocks to tool_calls on assistant message', () => {
     const messages = [{
       role: 'assistant',

@@ -189,19 +189,41 @@ function toOpenAIMessages(messages, system) {
 
     if (toolResults.length > 0) {
       // tool result messages become role:tool in OpenAI
+      // OpenAI tool messages only support string content, so images are collected separately
+      // and appended as a follow-up user message so vision-capable models can still see them.
+      const pendingImages = [];
       for (const tr of toolResults) {
         if (!tr.tool_use_id) continue;
         const rawContent = Array.isArray(tr.content)
           ? tr.content.map(c => {
               if (c.type === 'document') return documentBlockToText(c) || '';
+              if (c.type === 'image') return '';
               return c.text || '';
             }).join('')
           : (tr.content || '');
         const content = tr.is_error ? `[ERROR] ${rawContent}` : rawContent;
         result.push({ role: 'tool', tool_call_id: tr.tool_use_id, content });
+        if (Array.isArray(tr.content)) {
+          for (const c of tr.content) {
+            if (c.type === 'image') {
+              const img = imageBlockToOpenAI(c);
+              if (img) pendingImages.push(img);
+            }
+          }
+        }
       }
-      if (textParts.length > 0) {
-        result.push({ role: msg.role, content: textParts.map(b => b.text).join('') });
+      // Merge any trailing text parts and tool-result images into one user message.
+      const followUpParts = [
+        ...(textParts.length > 0 ? [{ type: 'text', text: textParts.map(b => b.text).join('') }] : []),
+        ...pendingImages,
+      ];
+      if (followUpParts.length > 0) {
+        result.push({
+          role: 'user',
+          content: followUpParts.length === 1 && followUpParts[0].type === 'text'
+            ? followUpParts[0].text
+            : followUpParts,
+        });
       }
     } else {
       const rawText    = textParts.map(b => b.text).join('');
