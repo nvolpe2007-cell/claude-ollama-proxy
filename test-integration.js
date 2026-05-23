@@ -669,6 +669,17 @@ describe('GET /metrics/prometheus', () => {
       );
     }
   });
+
+  test('latency min/max/avg gauge metrics are present', async () => {
+    // Make a request first so the latency window is non-empty.
+    await request('GET', '/health');
+    const r = await request('GET', '/metrics/prometheus');
+    for (const name of ['proxy_request_latency_min_ms', 'proxy_request_latency_max_ms', 'proxy_request_latency_avg_ms']) {
+      assert.ok(r.body.includes(`# HELP ${name}`), `missing HELP for ${name}`);
+      assert.ok(r.body.includes(`# TYPE ${name} gauge`), `missing TYPE gauge for ${name}`);
+      assert.ok(r.body.match(new RegExp(`^${name} [0-9]`, 'm')), `missing value line for ${name}`);
+    }
+  });
 });
 
 // ── Tests: 404 and unknown routes ─────────────────────────────────────────────

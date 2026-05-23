@@ -357,7 +357,18 @@ async function readBody(req) {
     }
   }
   let body = '';
-  for await (const chunk of req) body += chunk;
+  let bytesRead = 0;
+  for await (const chunk of req) {
+    if (PROXY_MAX_BODY_SIZE) {
+      bytesRead += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+      if (bytesRead > PROXY_MAX_BODY_SIZE) {
+        const err = new Error(`Request body exceeds limit of ${PROXY_MAX_BODY_SIZE} B (PROXY_MAX_BODY_SIZE)`);
+        err.code = 'PAYLOAD_TOO_LARGE';
+        throw err;
+      }
+    }
+    body += chunk;
+  }
   return body;
 }
 
@@ -1105,6 +1116,22 @@ async function handleMetricsPrometheus(req, res) {
   out.push('# HELP proxy_errors_total Total 5xx responses (server-side errors)');
   out.push('# TYPE proxy_errors_total counter');
   out.push(`proxy_errors_total ${_metrics.errors}`);
+  out.push('');
+
+  const latAvg = sorted.length ? Math.round((latSum / sorted.length) * 100) / 100 : 0;
+  out.push('# HELP proxy_request_latency_min_ms Minimum observed request latency over rolling sample window');
+  out.push('# TYPE proxy_request_latency_min_ms gauge');
+  out.push(`proxy_request_latency_min_ms ${sorted.length ? sorted[0] : 0}`);
+  out.push('');
+
+  out.push('# HELP proxy_request_latency_max_ms Maximum observed request latency over rolling sample window');
+  out.push('# TYPE proxy_request_latency_max_ms gauge');
+  out.push(`proxy_request_latency_max_ms ${sorted.length ? sorted[sorted.length - 1] : 0}`);
+  out.push('');
+
+  out.push('# HELP proxy_request_latency_avg_ms Mean request latency over rolling sample window');
+  out.push('# TYPE proxy_request_latency_avg_ms gauge');
+  out.push(`proxy_request_latency_avg_ms ${latAvg}`);
   out.push('');
 
   res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
