@@ -50,7 +50,7 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - tool_use / tool_result round-trip (streaming and non-streaming)
 - Image content block support (base64 and URL sources → OpenAI vision format)
 - Per-request model selection (pass any non-claude-* model name in the request)
-- GET /v1/models — lists models available in Ollama
+- GET /v1/models — lists models available in Ollama; when MODEL_MAP is configured, also exposes the mapped Claude alias names (e.g. `claude-3-haiku`) so model-picker clients (Cursor, Continue, OpenWebUI) can discover and select them without knowing the underlying Ollama model name; aliases that clash with a real Ollama model ID are suppressed to avoid duplicates
 - GET /health — checks Ollama reachability, returns model + port
 - Graceful error handling when Ollama is offline (502 with hint)
 - Request logging (method, path, status, duration, tokens_in, tokens_out, model) to stdout; LOG_FORMAT=json emits machine-parseable JSON for log aggregation (Grafana Loki, Datadog, CloudWatch, etc.)

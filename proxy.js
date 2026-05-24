@@ -933,15 +933,32 @@ async function handleModels(req, res) {
     return;
   }
 
-  const models = (data.models || []).map(m => ({
+  const ollamaModels = (data.models || []).map(m => ({
     id: m.name,
     object: 'model',
     created: m.modified_at ? Math.floor(new Date(m.modified_at).getTime() / 1000) : 0,
     owned_by: 'ollama'
   }));
 
+  // When MODEL_MAP is configured, also expose the Claude alias names so model-picker
+  // clients (Cursor, Continue, OpenWebUI) can discover and select them. Aliases that
+  // clash with an actual Ollama model ID are skipped to avoid duplicates.
+  const ollamaIds = new Set(ollamaModels.map(m => m.id));
+  const createdByTarget = {};
+  for (const m of data.models || []) {
+    createdByTarget[m.name] = m.modified_at ? Math.floor(new Date(m.modified_at).getTime() / 1000) : 0;
+  }
+  const aliasModels = Object.entries(MODEL_MAP)
+    .filter(([alias]) => !ollamaIds.has(alias))
+    .map(([alias, target]) => ({
+      id: alias,
+      object: 'model',
+      created: createdByTarget[target] || 0,
+      owned_by: 'ollama',
+    }));
+
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ object: 'list', data: models }));
+  res.end(JSON.stringify({ object: 'list', data: [...ollamaModels, ...aliasModels] }));
 }
 
 async function handleModelById(req, res, modelId) {
