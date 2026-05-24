@@ -1,14 +1,15 @@
 # claude-ollama-proxy — MTSM Nick
 
 ## What this is
-A Node.js proxy that translates Anthropic API requests (Claude format) into Ollama/OpenAI format, so you can use Claude Code and other Anthropic tools against a local Ollama model.
+A Node.js proxy that translates Anthropic API requests (Claude format) into Ollama/OpenAI format, so you can use Claude Code and other Anthropic tools against a local Ollama model. Also accepts OpenAI-format requests directly, making it a drop-in proxy for OpenAI-compatible clients (Cursor, Continue, LiteLLM, etc.).
 
 ## How it works
 - Listens on port 4000 by default
-- Accepts Anthropic `messages` API format (including tools/tool_use)
-- Converts to OpenAI chat format that Ollama understands
+- Accepts Anthropic `messages` API format (including tools/tool_use) — `POST /v1/messages`
+- Also accepts OpenAI chat format directly — `POST /v1/chat/completions` (no translation, piped through)
+- Converts Anthropic requests to OpenAI chat format that Ollama understands
 - Forwards to Ollama at localhost:11434
-- Translates responses back to Anthropic format
+- Translates responses back to Anthropic format (OpenAI-format requests are piped verbatim)
 
 ## Config
 ```
@@ -99,3 +100,4 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - Rate limiting — `RATE_LIMIT_RPM` (global) and `RATE_LIMIT_PER_IP_RPM` (per caller IP) fixed-window request caps applied to POST /v1/messages and POST /v1/messages/count_tokens; exceeded limit returns 429 `rate_limit_error` with `retry-after` header; every rate-limited response also carries `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, and `x-ratelimit-reset-requests` headers matching Anthropic's own API header naming; per-IP extraction respects `x-forwarded-for` for reverse-proxy deployments; both limits may be active simultaneously; disabled by default
 - `PROXY_SYSTEM_PROMPT` env var — optional operator-defined system prompt prepended to every request; merged before the client's own system field so the client's instructions still take effect; handles string, array-of-blocks, and absent system prompts; propagated to both POST /v1/messages and POST /v1/messages/count_tokens so token estimates reflect the injected text; startup log prints a truncated preview when set
 - `tool_result` image content support — `image` blocks inside `tool_result` messages (e.g., screenshots from computer-use tools) are extracted and appended as a follow-up `user` message with OpenAI multipart image_url format, since OpenAI `role:tool` messages only support string content; text and image follow-up parts are merged into a single user message; vision-capable Ollama models (LLaVA, Qwen2-VL, etc.) can therefore see tool-returned images in multi-turn sessions
+- `POST /v1/chat/completions` OpenAI-format passthrough — accepts native OpenAI chat format and pipes it directly to Ollama with no translation; applies full proxy infrastructure (auth, rate-limiting, retry, timeout, client-abort, keepalive SSE comments, request logging, and per-model metrics); `stream:true` is supported and SSE is piped verbatim line-by-line; MODEL_MAP and `OLLAMA_NUM_CTX`/`OLLAMA_KEEP_ALIVE` tuning are applied; makes the proxy a drop-in for any OpenAI-compatible client (Cursor, Continue, LiteLLM, etc.) alongside its existing Anthropic-format support

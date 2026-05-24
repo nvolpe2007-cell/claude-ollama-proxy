@@ -1160,6 +1160,183 @@ async function handleMetricsPrometheus(req, res) {
   res.end(out.join('\n') + '\n');
 }
 
+// Accepts OpenAI-format POST /v1/chat/completions requests and forwards them to Ollama,
+// applying auth, rate-limiting, timeout, retry, abort, and metrics — same as the Anthropic path.
+// Useful for OpenAI-compatible clients (Cursor, Continue, LiteLLM, etc.) without format translation.
+async function handleOpenAIChat(req, res) {
+  const ollamaBase = getOllamaHost();
+  const ac = new AbortController();
+
+  let timedOut = false;
+  let _timeoutId = null;
+  const clearTO = () => { if (_timeoutId) { clearTimeout(_timeoutId); _timeoutId = null; } };
+  if (PROXY_TIMEOUT) {
+    _timeoutId = setTimeout(() => {
+      timedOut = true;
+      if (!res.writableEnded) ac.abort();
+      console.warn(`Request timeout after ${PROXY_TIMEOUT}ms — aborting Ollama request`);
+    }, PROXY_TIMEOUT);
+  }
+
+  const onClientClose = () => { if (!res.writableEnded) { clearTO(); ac.abort(); } };
+  req.socket.once('close', onClientClose);
+
+  const body = await readBody(req);
+  let openaiReq;
+  try { openaiReq = JSON.parse(body); }
+  catch {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Request body is not valid JSON' } }));
+    return;
+  }
+
+  if (!Array.isArray(openaiReq.messages)) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`messages` is required and must be an array' } }));
+    return;
+  }
+
+  const effectiveModel = resolveModel(openaiReq.model);
+  openaiReq.model = effectiveModel;
+  if (!openaiReq.max_tokens)  openaiReq.max_tokens  = PROXY_MAX_TOKENS;
+  if (OLLAMA_NUM_CTX)         openaiReq.num_ctx      = OLLAMA_NUM_CTX;
+  if (OLLAMA_KEEP_ALIVE)      openaiReq.keep_alive   = OLLAMA_KEEP_ALIVE;
+  const streaming = openaiReq.stream === true;
+  if (streaming) openaiReq.stream_options = { include_usage: true };
+
+  let ollamaRes;
+  try {
+    ollamaRes = await fetchWithRetry(`${ollamaBase}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(openaiReq),
+      signal: ac.signal,
+    });
+  } catch (e) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    if (e.name === 'AbortError') {
+      if (timedOut) {
+        if (!res.headersSent) res.writeHead(504, { 'Content-Type': 'application/json' });
+        if (!res.writableEnded) res.end(JSON.stringify({
+          error: { type: 'timeout_error', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms`, code: 'timeout' }
+        }));
+      } else {
+        res.end();
+      }
+      return;
+    }
+    const isConnRefused = e.cause?.code === 'ECONNREFUSED' || e.message.includes('ECONNREFUSED');
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'connection_error', message: e.message + (isConnRefused ? ' — is Ollama running? Try: ollama serve' : '') } }));
+    return;
+  }
+
+  if (!ollamaRes.ok) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    const err = await ollamaRes.text();
+    res.writeHead(ollamaRes.status, { 'Content-Type': 'application/json' });
+    res.end(err);
+    return;
+  }
+
+  // Non-streaming: proxy the JSON response directly.
+  if (!streaming) {
+    let data;
+    try { data = await ollamaRes.json(); }
+    catch (e) {
+      req.socket.off('close', onClientClose);
+      clearTO();
+      if (e.name === 'AbortError') {
+        if (timedOut) {
+          if (!res.headersSent) res.writeHead(504, { 'Content-Type': 'application/json' });
+          if (!res.writableEnded) res.end(JSON.stringify({ error: { type: 'timeout_error', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms` } }));
+        } else {
+          res.end();
+        }
+        return;
+      }
+      throw e;
+    }
+    req.socket.off('close', onClientClose);
+    clearTO();
+    const promptTok     = data.usage?.prompt_tokens     || 0;
+    const completionTok = data.usage?.completion_tokens || 0;
+    recordTokens(promptTok, completionTok, effectiveModel);
+    res._logMeta = { model: effectiveModel, tokensIn: promptTok, tokensOut: completionTok };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(data));
+    return;
+  }
+
+  // Streaming: pipe SSE lines through verbatim, intercepting the usage chunk for metrics.
+  // Splitting on '\n' and re-emitting 'line\n' correctly preserves SSE '\n\n' event separators
+  // because blank separator lines become '\n' tokens that write as the required double-newline.
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+  _metrics.activeStreams++;
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  const keepAlive = setInterval(() => res.writableEnded || res.write(': keepalive\n\n'), 15_000);
+  const reader = ollamaRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop(); // hold incomplete trailing line
+
+      for (const line of lines) {
+        if (line.startsWith('data: ') && line.slice(6).trim() !== '[DONE]') {
+          try {
+            const parsed = JSON.parse(line.slice(6).trim());
+            if (parsed.usage) {
+              inputTokens  = parsed.usage.prompt_tokens     || inputTokens;
+              outputTokens = parsed.usage.completion_tokens || outputTokens;
+            }
+          } catch {}
+        }
+        res.write(line + '\n');
+      }
+    }
+    if (buf) res.write(buf); // flush any trailing partial line
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      if (timedOut && !res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ error: { type: 'timeout_error', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms` } })}\n\n`);
+      }
+    } else {
+      console.error('OpenAI stream error:', e.message);
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ error: { type: 'stream_error', message: e.message } })}\n\n`);
+      }
+    }
+  } finally {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    clearInterval(keepAlive);
+    _metrics.activeStreams--;
+  }
+
+  recordTokens(inputTokens, outputTokens, effectiveModel);
+  res._logMeta = { model: effectiveModel, tokensIn: inputTokens, tokensOut: outputTokens };
+  res.end();
+}
+
 async function requestHandler(req, res) {
   // CORS headers on every response — must happen before any writeHead call.
   setCORSHeaders(res);
@@ -1190,6 +1367,11 @@ async function requestHandler(req, res) {
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
       await handleMessages(req, res);
+    } else if (req.method === 'POST' && path === '/v1/chat/completions') {
+      if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      await handleOpenAIChat(req, res);
     } else if (req.method === 'POST' && path === '/v1/messages/count_tokens') {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
@@ -1334,6 +1516,7 @@ module.exports = {
   getOllamaHost,
   OLLAMA_HOSTS,
   requestHandler,
+  handleOpenAIChat,
   handleMetricsPrometheus,
   // Rate-limit internals exported for unit testing only.
   checkRateLimit,
