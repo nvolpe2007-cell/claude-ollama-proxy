@@ -1225,6 +1225,22 @@ async function handleOpenAIChat(req, res) {
   const streaming = openaiReq.stream === true;
   if (streaming) openaiReq.stream_options = { include_usage: true };
 
+  // Inject PROXY_SYSTEM_PROMPT so operator-level instructions apply to all callers,
+  // not just the Anthropic path. Prepended before any existing system message.
+  if (PROXY_SYSTEM_PROMPT) {
+    const sysIdx = openaiReq.messages.findIndex(m => m.role === 'system');
+    if (sysIdx >= 0) {
+      const orig = typeof openaiReq.messages[sysIdx].content === 'string'
+        ? openaiReq.messages[sysIdx].content : '';
+      openaiReq.messages[sysIdx] = {
+        ...openaiReq.messages[sysIdx],
+        content: orig ? `${PROXY_SYSTEM_PROMPT}\n\n${orig}` : PROXY_SYSTEM_PROMPT,
+      };
+    } else {
+      openaiReq.messages.unshift({ role: 'system', content: PROXY_SYSTEM_PROMPT });
+    }
+  }
+
   let ollamaRes;
   try {
     ollamaRes = await fetchWithRetry(`${ollamaBase}/v1/chat/completions`, {

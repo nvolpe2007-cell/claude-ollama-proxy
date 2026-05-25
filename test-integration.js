@@ -761,6 +761,121 @@ describe('POST /v1/messages (streaming) — tool calls', () => {
   });
 });
 
+// ── Tests: POST /v1/chat/completions — OpenAI passthrough ─────────────────────
+
+describe('POST /v1/chat/completions (non-streaming)', () => {
+  test('forwards request and returns raw OpenAI-format response', async () => {
+    const r = await request('POST', '/v1/chat/completions', {
+      model: 'qwen2.5:7b',
+      messages: [{ role: 'user', content: 'Hello' }],
+      max_tokens: 100,
+      stream: false
+    });
+    assert.equal(r.status, 200);
+    assert.ok(r.headers['content-type']?.includes('application/json'));
+    const b = json(r);
+    // Response is raw OpenAI format (not translated to Anthropic format)
+    assert.ok(Array.isArray(b.choices), 'should have choices array');
+    assert.ok(b.choices[0].message, 'should have message in first choice');
+    assert.equal(b.choices[0].message.role, 'assistant');
+    assert.equal(b.choices[0].message.content, 'Hello!');
+  });
+
+  test('resolves claude-* model names via MODEL_MAP', async () => {
+    const r = await request('POST', '/v1/chat/completions', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'Hi' }],
+      stream: false
+    });
+    assert.equal(r.status, 200);
+  });
+
+  test('400 when messages field is missing', async () => {
+    const r = await request('POST', '/v1/chat/completions', {
+      model: 'qwen2.5:7b',
+      stream: false
+      // messages omitted
+    });
+    assert.equal(r.status, 400);
+    const b = json(r);
+    assert.equal(b.error.type, 'invalid_request_error');
+    assert.ok(b.error.message.includes('messages'));
+  });
+
+  test('400 when messages is not an array', async () => {
+    const r = await request('POST', '/v1/chat/completions', {
+      model: 'qwen2.5:7b',
+      messages: 'not-an-array',
+      stream: false
+    });
+    assert.equal(r.status, 400);
+    const b = json(r);
+    assert.equal(b.error.type, 'invalid_request_error');
+  });
+
+  test('carries CORS headers', async () => {
+    const r = await request('POST', '/v1/chat/completions', {
+      model: 'qwen2.5:7b',
+      messages: [{ role: 'user', content: 'Hi' }],
+      stream: false
+    });
+    assert.ok(r.headers['access-control-allow-origin'], 'missing ACAO header');
+  });
+
+  test('carries request-id header', async () => {
+    const r = await request('POST', '/v1/chat/completions', {
+      model: 'qwen2.5:7b',
+      messages: [{ role: 'user', content: 'Hi' }],
+      stream: false
+    });
+    assert.ok(r.headers['request-id']?.startsWith('req_'), 'missing or malformed request-id');
+  });
+
+  test('increments request count in /metrics', async () => {
+    await request('POST', '/v1/chat/completions', {
+      model: 'qwen2.5:7b',
+      messages: [{ role: 'user', content: 'ping' }],
+      stream: false
+    });
+    const m = await request('GET', '/metrics');
+    const b = json(m);
+    assert.ok(b.requests_total['POST /v1/chat/completions'] > 0,
+      'POST /v1/chat/completions should appear in requests_total');
+  });
+});
+
+describe('POST /v1/chat/completions (streaming)', () => {
+  test('returns text/event-stream and pipes Ollama SSE', async () => {
+    const r = await request('POST', '/v1/chat/completions', {
+      model: 'qwen2.5:7b',
+      messages: [{ role: 'user', content: 'Hello' }],
+      max_tokens: 100,
+      stream: true
+    });
+    assert.equal(r.status, 200);
+    assert.ok(r.headers['content-type']?.includes('text/event-stream'));
+    // Body should contain SSE data lines and [DONE] sentinel
+    assert.ok(r.body.includes('data: '), 'should have data: lines');
+    assert.ok(r.body.includes('[DONE]'), 'should end with [DONE]');
+  });
+
+  test('streaming chunks are parseable and contain content', async () => {
+    const r = await request('POST', '/v1/chat/completions', {
+      model: 'qwen2.5:7b',
+      messages: [{ role: 'user', content: 'Hello' }],
+      stream: true
+    });
+    const dataLines = r.body.split('\n')
+      .filter(l => l.startsWith('data: ') && l.slice(6).trim() !== '[DONE]');
+    const chunks = dataLines
+      .map(l => { try { return JSON.parse(l.slice(6)); } catch { return null; } })
+      .filter(Boolean);
+    assert.ok(chunks.length > 0, 'should have parseable chunks');
+    const hasContent = chunks.some(c => c.choices?.[0]?.delta?.content);
+    assert.ok(hasContent, 'at least one chunk should carry content');
+  });
+});
+
 // ── Tests: POST /v1/messages — streaming thinking blocks ─────────────────────
 
 describe('POST /v1/messages (streaming) — thinking blocks', () => {
