@@ -2,6 +2,8 @@
 
 A lightweight Node.js proxy that translates Anthropic API requests (Claude format) into Ollama's OpenAI-compatible format. This lets you point **Claude Code** — or any tool that speaks the Anthropic `messages` API — at a local Ollama model instead of the real Claude API.
 
+Also accepts native **OpenAI chat format** directly, making it a drop-in proxy for OpenAI-compatible clients (Cursor, Continue, LiteLLM, etc.).
+
 ## How it works
 
 ```
@@ -16,6 +18,7 @@ The proxy handles:
 - Full Anthropic `messages` format including multi-part content blocks
 - Tool use / tool results (`tool_use`, `tool_result`) ↔ OpenAI function calling
 - Image content blocks (base64 and URL sources) → OpenAI vision format
+- `document` content blocks → plain text for Ollama
 - Both streaming (SSE) and non-streaming responses
 - Graceful errors when Ollama is offline
 
@@ -55,7 +58,7 @@ You should see:
 |---|---|---|
 | `OLLAMA_MODEL` | `qwen2.5:7b` | Ollama model to use for all requests |
 | `PROXY_PORT` | `4000` | Port the proxy listens on |
-| `OLLAMA_HOST` | `http://localhost:11434` | Base URL of your Ollama instance |
+| `OLLAMA_HOST` | `http://localhost:11434` | Base URL of your Ollama instance. Accepts a comma-separated list of URLs for round-robin load distribution across multiple Ollama instances/GPUs |
 | `PROXY_API_KEY` | *(unset)* | If set, require this key on every API request |
 | `MODEL_MAP` | *(unset)* | JSON map of `claude-*` names/prefixes to Ollama models (see below) |
 | `PROXY_TLS_CERT` | *(unset)* | Path to PEM certificate file — enables HTTPS when set |
@@ -63,8 +66,14 @@ You should see:
 | `CORS_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`; set to a specific origin to restrict browser access |
 | `OLLAMA_NUM_CTX` | *(model default)* | Context window size sent to Ollama. Model defaults are often only 2048 — set to `32768` or higher for real sessions |
 | `OLLAMA_KEEP_ALIVE` | *(Ollama default)* | How long the model stays loaded in GPU memory between requests (`"5m"`, `"0"` to unload immediately, `"-1"` to keep forever) |
-| `PROXY_TIMEOUT` | *(none)* | Hard per-request timeout in milliseconds. If Ollama does not respond within this window the proxy aborts and returns a `504` error (non-streaming) or an SSE error event (streaming). Useful when running behind a strict reverse-proxy timeout or to detect stuck model generation. |
-| `LOG_FORMAT` | `text` | Log format for request lines. `text` (default) writes human-readable lines; `json` writes a single JSON object per request — useful for log aggregation tools like Grafana Loki, Datadog, or AWS CloudWatch. Each JSON entry includes `ts`, `method`, `path`, `status`, `ms`, `request_id`, and (for `/v1/messages`) `model`, `tokens_in`, `tokens_out`. |
+| `PROXY_TIMEOUT` | *(none)* | Hard per-request timeout in milliseconds. If Ollama does not respond within this window the proxy aborts and returns a `504` error (non-streaming) or an SSE error event (streaming) |
+| `PROXY_MAX_TOKENS` | `8192` | Default `max_tokens` applied when the client omits the field. Increase for models with larger output budgets |
+| `PROXY_MAX_BODY_SIZE` | *(none)* | Hard limit on request body size in bytes. Requests that exceed this are rejected with `413`. Protects against runaway base64-image payloads. Example: `10485760` for 10 MB |
+| `PROXY_SYSTEM_PROMPT` | *(unset)* | Operator-defined text prepended to every request's system prompt. When the client also supplies a system prompt, the proxy's text comes first, separated by two newlines. Useful for enforcing consistent model behavior without modifying client config |
+| `PROXY_WARMUP` | `false` | When `true`, sends a minimal preflight request to Ollama after startup to pre-load the configured model into GPU memory, eliminating cold-start latency on the first real request |
+| `RATE_LIMIT_RPM` | *(none)* | Global request rate limit in requests per minute across all callers. Applies to `POST /v1/messages` and `POST /v1/messages/count_tokens`. Returns `429` with `retry-after` header when exceeded |
+| `RATE_LIMIT_PER_IP_RPM` | *(none)* | Per-client-IP rate limit in requests per minute. Uses `x-forwarded-for` when behind a reverse proxy. Both global and per-IP limits can be active simultaneously |
+| `LOG_FORMAT` | `text` | Log format for request lines. `text` writes human-readable lines; `json` writes a single JSON object per request — useful for log aggregation tools like Grafana Loki, Datadog, or AWS CloudWatch |
 
 Examples:
 
@@ -72,6 +81,7 @@ Examples:
 OLLAMA_MODEL=llama3.1:8b node proxy.js
 OLLAMA_HOST=http://192.168.1.50:11434 node proxy.js   # remote Ollama instance
 PROXY_API_KEY=mysecret node proxy.js                  # enable auth
+OLLAMA_NUM_CTX=32768 PROXY_WARMUP=true node proxy.js  # production setup
 ```
 
 ## Authentication
@@ -98,7 +108,7 @@ curl http://localhost:4000/v1/messages \
 
 When using Claude Code, set `ANTHROPIC_API_KEY=mysecret` and it will automatically send it as `x-api-key`.
 
-The `/health` endpoint is always unauthenticated so monitoring tools can reach it freely.
+The `/health` and `/metrics` endpoints are always unauthenticated so monitoring tools can reach them freely.
 
 ## Point Claude Code at the proxy
 
@@ -140,6 +150,14 @@ Returns the models currently loaded in Ollama in OpenAI-compatible format:
 }
 ```
 
+When `MODEL_MAP` is configured, Claude alias names (e.g. `claude-3-haiku`) are also included in the list so model-picker clients like Cursor and Continue can discover and select them.
+
+Look up a specific model by ID:
+
+```bash
+curl http://localhost:4000/v1/models/qwen2.5:7b
+```
+
 ## Check the proxy is running
 
 ```bash
@@ -160,6 +178,78 @@ Returns `200 OK` when Ollama is reachable:
 ```
 
 Returns `503` with `"status": "degraded"` if Ollama is offline.
+
+## Metrics
+
+### JSON metrics
+
+```bash
+curl http://localhost:4000/metrics
+```
+
+Returns an in-memory snapshot including:
+- Uptime, total request counts per route, HTTP status code breakdown
+- p50/p95/p99 latency percentiles (rolling 1000-sample window), min/avg/max
+- Cumulative input and output token totals
+- Per-model breakdown of request counts and token usage
+- Current active streaming connection count
+
+### Prometheus metrics
+
+```bash
+curl http://localhost:4000/metrics/prometheus
+```
+
+Returns the same data in [Prometheus text exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/) (version 0.0.4), ready to be scraped directly by Prometheus without any additional exporter. Useful for Grafana dashboards.
+
+Exposed metrics include `proxy_requests_total`, `proxy_http_responses_total`, `proxy_request_duration_ms`, `proxy_tokens_total`, `proxy_model_requests_total`, `proxy_model_tokens_total`, `proxy_active_streams`, and `proxy_errors_total`.
+
+## OpenAI-compatible passthrough
+
+The proxy also accepts native OpenAI chat format directly, making it a drop-in for OpenAI-compatible clients (Cursor, Continue, LiteLLM, etc.):
+
+```bash
+POST /v1/chat/completions
+```
+
+Requests are forwarded to Ollama with no format translation. All proxy features apply: authentication, rate limiting, retry, timeout, client-abort propagation, keepalive SSE comments, request logging, and per-model metrics. `MODEL_MAP` and `OLLAMA_NUM_CTX`/`OLLAMA_KEEP_ALIVE` tuning are applied. Both streaming and non-streaming are supported.
+
+## Rate limiting
+
+Two independent rate limits can be set simultaneously. Both apply to `POST /v1/messages` and `POST /v1/messages/count_tokens`.
+
+```bash
+# Global cap: 60 requests/min across all callers
+RATE_LIMIT_RPM=60 node proxy.js
+
+# Per-IP cap: 10 requests/min per client
+RATE_LIMIT_PER_IP_RPM=10 node proxy.js
+
+# Both active at once
+RATE_LIMIT_RPM=100 RATE_LIMIT_PER_IP_RPM=20 node proxy.js
+```
+
+When a limit is exceeded the proxy responds with `429 rate_limit_error` and sets `retry-after`, `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, and `x-ratelimit-reset-requests` headers — matching Anthropic's own API header naming.
+
+## System prompt injection
+
+Prepend a fixed system prompt to every request without modifying clients:
+
+```bash
+PROXY_SYSTEM_PROMPT="You are a helpful assistant. Always respond in English." node proxy.js
+```
+
+When the client already sends a system prompt, the proxy's text comes first, separated by two newlines. Handles string, array-of-blocks, and absent system prompts. Also applied to `POST /v1/messages/count_tokens` so token estimates reflect the injected text.
+
+## Multi-host round-robin
+
+Distribute load across multiple Ollama instances by setting `OLLAMA_HOST` to a comma-separated list:
+
+```bash
+OLLAMA_HOST=http://gpu1:11434,http://gpu2:11434,http://gpu3:11434 node proxy.js
+```
+
+Requests are distributed round-robin across all listed hosts. `GET /health` checks all hosts in parallel and reports per-host status in a `hosts` array.
 
 ## Model mapping (MODEL_MAP)
 
@@ -184,6 +274,8 @@ PROXY_TLS_CERT=/etc/ssl/proxy.crt PROXY_TLS_KEY=/etc/ssl/proxy.key node proxy.js
 The proxy automatically extracts `<think>…</think>` blocks produced by reasoning models (DeepSeek-R1, Qwen3-thinking, etc.) and converts them to proper Anthropic `thinking` content blocks. Claude Code displays them as structured reasoning without any extra configuration.
 
 When Claude Code enables extended thinking (sends `thinking: {type: "enabled", budget_tokens: N}`), the proxy forwards `think: true` to Ollama (Ollama 0.7+), which activates native thinking for supported models.
+
+Thinking blocks in assistant messages are also preserved in multi-turn conversation history — they are re-encoded as `<think>…</think>` tags when the conversation history is sent back to Ollama, so reasoning context is maintained across turns with DeepSeek-R1, Qwen3-thinking, and similar models.
 
 ```bash
 ollama pull deepseek-r1:7b
@@ -259,6 +351,8 @@ Add an `[Service]` override block, for example:
 [Service]
 Environment=OLLAMA_MODEL=qwen2.5-coder:7b
 Environment=PROXY_API_KEY=mysecret
+Environment=OLLAMA_NUM_CTX=32768
+Environment=PROXY_WARMUP=true
 ```
 
 Check status and logs:
@@ -321,5 +415,6 @@ OLLAMA_NUM_CTX=131072 node proxy.js   # 128k — for large codebases (needs more
 ## Limitations
 
 - Image blocks require a vision-capable model (e.g. `llava`, `qwen2.5-vl`); text-only models will error
-- `thinking` block signatures are synthetic placeholders — round-tripping thinking blocks across turns is not supported
+- `thinking` block signatures are synthetic placeholders — they are not cryptographically signed by Ollama
 - `think: true` forwarding requires Ollama 0.7+ and a model that supports native thinking (DeepSeek-R1, Qwen3-thinking)
+- PDF and binary document blocks are converted to a placeholder note; only text-source documents are passed through
