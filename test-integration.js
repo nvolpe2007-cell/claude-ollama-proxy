@@ -136,6 +136,18 @@ const mockOllama = http.createServer(async (req, res) => {
     return;
   }
 
+  if (path === '/api/embed') {
+    if (mockBehavior === 'embed-error') {
+      res.writeHead(500); res.end('{}'); return;
+    }
+    const body = JSON.parse(await readBody(req));
+    const inputs = Array.isArray(body.input) ? body.input : [body.input];
+    const embeddings = inputs.map(() => [0.1, 0.2, 0.3]);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ model: body.model, embeddings, prompt_eval_count: 5 }));
+    return;
+  }
+
   res.writeHead(404); res.end('{}');
 });
 
@@ -679,6 +691,124 @@ describe('GET /metrics/prometheus', () => {
       assert.ok(r.body.includes(`# TYPE ${name} gauge`), `missing TYPE gauge for ${name}`);
       assert.ok(r.body.match(new RegExp(`^${name} [0-9]`, 'm')), `missing value line for ${name}`);
     }
+  });
+});
+
+// ── Tests: POST /v1/embeddings ───────────────────────────────────────────────
+
+describe('POST /v1/embeddings', () => {
+  test('200 with OpenAI-format embedding response for string input', async () => {
+    const r = await request('POST', '/v1/embeddings', {
+      model: 'nomic-embed-text',
+      input: 'Hello world'
+    });
+    assert.equal(r.status, 200);
+    assert.ok(r.headers['content-type']?.includes('application/json'));
+    const b = json(r);
+    assert.equal(b.object, 'list');
+    assert.ok(Array.isArray(b.data));
+    assert.equal(b.data.length, 1);
+    assert.equal(b.data[0].object, 'embedding');
+    assert.ok(Array.isArray(b.data[0].embedding));
+    assert.equal(b.data[0].index, 0);
+    assert.ok(typeof b.model === 'string');
+    assert.equal(b.usage.prompt_tokens, 5);
+    assert.equal(b.usage.total_tokens, 5);
+  });
+
+  test('200 with multiple embeddings for array input', async () => {
+    const r = await request('POST', '/v1/embeddings', {
+      model: 'nomic-embed-text',
+      input: ['text one', 'text two']
+    });
+    assert.equal(r.status, 200);
+    const b = json(r);
+    assert.equal(b.object, 'list');
+    assert.equal(b.data.length, 2);
+    assert.equal(b.data[0].index, 0);
+    assert.equal(b.data[1].index, 1);
+    assert.ok(Array.isArray(b.data[0].embedding));
+    assert.ok(Array.isArray(b.data[1].embedding));
+  });
+
+  test('400 when input field is missing', async () => {
+    const r = await request('POST', '/v1/embeddings', {
+      model: 'nomic-embed-text'
+    });
+    assert.equal(r.status, 400);
+    const b = json(r);
+    assert.equal(b.error.type, 'invalid_request_error');
+    assert.ok(b.error.message.includes('input'));
+  });
+
+  test('400 on malformed JSON body', async () => {
+    const r = await new Promise((resolve, reject) => {
+      const payload = 'not json';
+      const opts = {
+        host: '127.0.0.1', port: PROXY_PORT,
+        method: 'POST', path: '/v1/embeddings',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
+      };
+      const req = http.request(opts, (res) => {
+        const chunks = [];
+        res.on('data', c => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() }));
+      });
+      req.on('error', reject);
+      req.write(payload);
+      req.end();
+    });
+    assert.equal(r.status, 400);
+  });
+
+  test('passes non-claude model names through unchanged', async () => {
+    const r = await request('POST', '/v1/embeddings', {
+      model: 'nomic-embed-text',
+      input: 'test'
+    });
+    assert.equal(r.status, 200);
+    assert.equal(json(r).model, 'nomic-embed-text');
+  });
+
+  test('resolves claude-* model names via MODEL_MAP', async () => {
+    const r = await request('POST', '/v1/embeddings', {
+      model: 'claude-3-haiku',
+      input: 'test'
+    });
+    assert.equal(r.status, 200);
+  });
+
+  test('502 when Ollama embed endpoint returns 5xx', async () => {
+    mockBehavior = 'embed-error';
+    const r = await request('POST', '/v1/embeddings', {
+      model: 'nomic-embed-text',
+      input: 'test'
+    });
+    assert.equal(r.status, 502);
+  });
+
+  test('carries CORS headers', async () => {
+    const r = await request('POST', '/v1/embeddings', {
+      model: 'nomic-embed-text',
+      input: 'test'
+    });
+    assert.ok(r.headers['access-control-allow-origin'], 'missing ACAO header');
+  });
+
+  test('carries request-id header', async () => {
+    const r = await request('POST', '/v1/embeddings', {
+      model: 'nomic-embed-text',
+      input: 'test'
+    });
+    assert.ok(r.headers['request-id']?.startsWith('req_'), 'missing or malformed request-id');
+  });
+
+  test('increments request count in /metrics', async () => {
+    await request('POST', '/v1/embeddings', { model: 'nomic-embed-text', input: 'ping' });
+    const m = await request('GET', '/metrics');
+    const b = json(m);
+    assert.ok(b.requests_total['POST /v1/embeddings'] > 0,
+      'POST /v1/embeddings should appear in requests_total');
   });
 });
 

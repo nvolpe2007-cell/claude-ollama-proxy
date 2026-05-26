@@ -1032,6 +1032,103 @@ async function handleModelById(req, res, modelId) {
   }));
 }
 
+async function handleEmbeddings(req, res) {
+  const ollamaBase = getOllamaHost();
+  const ac = new AbortController();
+
+  let timedOut = false;
+  let _timeoutId = null;
+  const clearTO = () => { if (_timeoutId) { clearTimeout(_timeoutId); _timeoutId = null; } };
+  if (PROXY_TIMEOUT) {
+    _timeoutId = setTimeout(() => {
+      timedOut = true;
+      if (!res.writableEnded) ac.abort();
+      console.warn(`Request timeout after ${PROXY_TIMEOUT}ms — aborting Ollama request`);
+    }, PROXY_TIMEOUT);
+  }
+
+  const onClientClose = () => { if (!res.writableEnded) { clearTO(); ac.abort(); } };
+  req.socket.once('close', onClientClose);
+
+  const body = await readBody(req);
+  let embedReq;
+  try { embedReq = JSON.parse(body); }
+  catch {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Request body is not valid JSON' } }));
+    return;
+  }
+
+  if (embedReq.input == null) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`input` is required' } }));
+    return;
+  }
+
+  const effectiveModel = resolveModel(embedReq.model);
+
+  let ollamaRes;
+  try {
+    ollamaRes = await fetchWithRetry(`${ollamaBase}/api/embed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: effectiveModel, input: embedReq.input }),
+      signal: ac.signal,
+    });
+  } catch (e) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    if (e.name === 'AbortError') {
+      if (timedOut) {
+        if (!res.headersSent) res.writeHead(504, { 'Content-Type': 'application/json' });
+        if (!res.writableEnded) res.end(JSON.stringify({
+          error: { type: 'request_timeout', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms` }
+        }));
+      } else {
+        res.end();
+      }
+      return;
+    }
+    const isConnRefused = e.cause?.code === 'ECONNREFUSED' || e.message.includes('ECONNREFUSED');
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'ollama_unreachable', message: e.message + (isConnRefused ? ' — is Ollama running? Try: ollama serve' : '') } }));
+    return;
+  }
+
+  req.socket.off('close', onClientClose);
+  clearTO();
+
+  if (!ollamaRes.ok) {
+    const err = await ollamaRes.text();
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'ollama_error', message: err } }));
+    return;
+  }
+
+  let data;
+  try { data = await ollamaRes.json(); }
+  catch {
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'ollama_error', message: 'Failed to parse Ollama embeddings response' } }));
+    return;
+  }
+
+  const embeddings = data.embeddings || [];
+  const promptTokens = data.prompt_eval_count || 0;
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    object: 'list',
+    data: embeddings.map((emb, i) => ({ object: 'embedding', embedding: emb, index: i })),
+    model: effectiveModel,
+    usage: { prompt_tokens: promptTokens, total_tokens: promptTokens },
+  }));
+}
+
 async function handleCountTokens(req, res) {
   const body = await readBody(req);
   let anthropicReq;
@@ -1452,6 +1549,11 @@ async function requestHandler(req, res) {
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
       await handleCountTokens(req, res);
+    } else if (req.method === 'POST' && path === '/v1/embeddings') {
+      if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      await handleEmbeddings(req, res);
     } else if (req.method === 'GET' && path === '/v1/models') {
       if (!checkAuth(req, res)) return;
       await handleModels(req, res);
@@ -1593,6 +1695,7 @@ module.exports = {
   OLLAMA_HOSTS,
   requestHandler,
   handleOpenAIChat,
+  handleEmbeddings,
   handleMetricsPrometheus,
   // Rate-limit internals exported for unit testing only.
   checkRateLimit,
