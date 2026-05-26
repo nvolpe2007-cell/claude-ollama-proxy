@@ -12,6 +12,9 @@ A Node.js proxy that translates Anthropic API requests (Claude format) into Olla
 - Translates responses back to Anthropic format (OpenAI-format requests are piped verbatim)
 
 ## Config
+
+All config is read from environment variables. The proxy also automatically loads a `.env` file from the current working directory (or the script's own directory) at startup — variables already set in the shell environment always take precedence (12-factor style).
+
 ```
 OLLAMA_MODEL=qwen2.5:7b        (default model)
 OLLAMA_HOST=<url>[,<url>...]   (Ollama base URL; comma-separated list for round-robin multi-host; default http://localhost:11434)
@@ -46,6 +49,7 @@ node proxy.js
 Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 
 ## What's implemented
+- `.env` file loading — proxy reads a `.env` file from `process.cwd()` (or `__dirname` if different) at startup; shell environment variables always take precedence; supports `KEY=VALUE`, single/double-quoted values, `#` comments, and blank lines; `parseDotEnv()` helper exported for unit testing
 - SSE streaming with full Anthropic event sequence
 - tool_use / tool_result round-trip (streaming and non-streaming)
 - Image content block support (base64 and URL sources → OpenAI vision format)

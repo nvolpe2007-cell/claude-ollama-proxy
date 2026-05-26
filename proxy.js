@@ -1,6 +1,48 @@
 const http  = require('http');
 const https = require('https');
 const fs    = require('fs');
+const path  = require('path');
+
+// ── .env file loading ─────────────────────────────────────────────────────────
+// Parses KEY=VALUE pairs from a .env string. Exported for unit-testing.
+function parseDotEnv(content) {
+  const vars = {};
+  for (const raw of content.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq < 1) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    // Strip surrounding single or double quotes.
+    if (val.length >= 2 &&
+        ((val[0] === '"' && val[val.length - 1] === '"') ||
+         (val[0] === "'" && val[val.length - 1] === "'")))
+      val = val.slice(1, -1);
+    vars[key] = val;
+  }
+  return vars;
+}
+
+// Load .env from cwd (and script dir if different) before reading any config.
+// Variables already in the environment always take precedence (12-factor style).
+;(function loadDotEnv() {
+  const candidates = [path.join(process.cwd(), '.env')];
+  if (path.resolve(__dirname) !== path.resolve(process.cwd()))
+    candidates.push(path.join(__dirname, '.env'));
+  for (const file of candidates) {
+    let src;
+    try { src = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    const vars = parseDotEnv(src);
+    let loaded = 0;
+    for (const [k, v] of Object.entries(vars)) {
+      if (!(k in process.env)) { process.env[k] = v; loaded++; }
+    }
+    if (loaded > 0)
+      console.log(`[claude-ollama-proxy] .env: loaded ${loaded} variable(s) from ${file}`);
+    break; // stop after the first found file
+  }
+})();
 
 // Multi-host: OLLAMA_HOST may be a comma-separated list of Ollama base URLs.
 // Requests are distributed round-robin across all listed hosts so you can
@@ -1537,6 +1579,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  parseDotEnv,
   resolveModel,
   toOpenAIMessages,
   toOpenAITools,

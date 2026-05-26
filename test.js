@@ -3,6 +3,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  parseDotEnv,
   resolveModel,
   toOpenAIMessages,
   toOpenAITools,
@@ -701,5 +702,71 @@ describe('getClientIp', () => {
   test('falls back to "unknown" when socket has no remoteAddress', () => {
     const req = { headers: {}, socket: {} };
     assert.equal(getClientIp(req), 'unknown');
+  });
+});
+
+// ── parseDotEnv ───────────────────────────────────────────────────────────────
+
+describe('parseDotEnv', () => {
+  test('returns empty object for empty input', () => {
+    assert.deepEqual(parseDotEnv(''), {});
+    assert.deepEqual(parseDotEnv('\n\n\n'), {});
+  });
+
+  test('parses simple KEY=VALUE pairs', () => {
+    const result = parseDotEnv('FOO=bar\nBAZ=qux');
+    assert.equal(result.FOO, 'bar');
+    assert.equal(result.BAZ, 'qux');
+  });
+
+  test('skips blank lines', () => {
+    const result = parseDotEnv('\nFOO=bar\n\nBAZ=qux\n');
+    assert.deepEqual(result, { FOO: 'bar', BAZ: 'qux' });
+  });
+
+  test('skips lines starting with #', () => {
+    const result = parseDotEnv('# this is a comment\nFOO=bar\n# another comment\nBAZ=qux');
+    assert.deepEqual(result, { FOO: 'bar', BAZ: 'qux' });
+  });
+
+  test('skips lines with no = sign', () => {
+    const result = parseDotEnv('NOEQUALS\nFOO=bar');
+    assert.deepEqual(result, { FOO: 'bar' });
+  });
+
+  test('strips surrounding double quotes from value', () => {
+    const result = parseDotEnv('MSG="hello world"');
+    assert.equal(result.MSG, 'hello world');
+  });
+
+  test('strips surrounding single quotes from value', () => {
+    const result = parseDotEnv("MSG='hello world'");
+    assert.equal(result.MSG, 'hello world');
+  });
+
+  test('does not strip mismatched quotes', () => {
+    const result = parseDotEnv('MSG="hello world\'');
+    assert.equal(result.MSG, '"hello world\'');
+  });
+
+  test('preserves = signs inside the value', () => {
+    const result = parseDotEnv('URL=http://example.com?a=1&b=2');
+    assert.equal(result.URL, 'http://example.com?a=1&b=2');
+  });
+
+  test('handles values with spaces around = when key/val are trimmed', () => {
+    const result = parseDotEnv('  FOO = bar  ');
+    assert.equal(result.FOO, 'bar');
+  });
+
+  test('parses MODEL_MAP JSON value without quotes', () => {
+    const json = '{"claude-3-haiku":"qwen2.5:7b"}';
+    const result = parseDotEnv(`MODEL_MAP=${json}`);
+    assert.equal(result.MODEL_MAP, json);
+  });
+
+  test('empty value is an empty string', () => {
+    const result = parseDotEnv('FOO=');
+    assert.equal(result.FOO, '');
   });
 });
