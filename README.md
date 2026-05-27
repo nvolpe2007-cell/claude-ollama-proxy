@@ -158,6 +158,20 @@ Look up a specific model by ID:
 curl http://localhost:4000/v1/models/qwen2.5:7b
 ```
 
+## Live dashboard
+
+Open **http://localhost:4000/** in your browser to see a live status dashboard. It auto-refreshes every 5 seconds and shows:
+
+- Ollama connectivity status and per-host health (for multi-host deployments)
+- Active streaming connections
+- Startup config (model, port, auth, TLS, rate limits, context window)
+- Per-route request counts and HTTP status code breakdown
+- p50/p95/p99/min/max/avg latency
+- Cumulative input and output token totals
+- Per-model usage breakdown
+
+No external dependencies — the dashboard is served directly by the proxy and polls its own `/health` and `/metrics` endpoints.
+
 ## Check the proxy is running
 
 ```bash

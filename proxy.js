@@ -1316,6 +1316,182 @@ async function handleMetricsPrometheus(req, res) {
   res.end(out.join('\n') + '\n');
 }
 
+// GET / — live HTML dashboard showing proxy health, metrics, and model usage.
+// Self-contained: zero external deps, polls /health + /metrics every 5 s.
+// Static config (model, port, hosts, etc.) is embedded server-side for instant display.
+function handleDashboard(req, res) {
+  const cfg = JSON.stringify({
+    model:              MODEL,
+    port:               Number(PORT),
+    hosts:              OLLAMA_HOSTS,
+    auth:               !!PROXY_API_KEY,
+    tls:                !!TLS_CERT,
+    logFormat:          LOG_FORMAT,
+    maxTokens:          PROXY_MAX_TOKENS,
+    numCtx:             OLLAMA_NUM_CTX,
+    rateLimitRpm:       RATE_LIMIT_RPM,
+    rateLimitPerIpRpm:  RATE_LIMIT_PER_IP_RPM,
+    warmup:             PROXY_WARMUP,
+    timeout:            PROXY_TIMEOUT,
+    maxBodySize:        PROXY_MAX_BODY_SIZE,
+    systemPrompt:       PROXY_SYSTEM_PROMPT ? PROXY_SYSTEM_PROMPT.slice(0, 120) + (PROXY_SYSTEM_PROMPT.length > 120 ? '…' : '') : null,
+  });
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude-Ollama Proxy</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#c9d1d9;padding:20px 24px;min-height:100vh}
+h1{color:#e6edf3;font-size:1.4rem;font-weight:600;padding-bottom:12px;border-bottom:1px solid #21262d;display:flex;align-items:center;gap:8px}
+h1 span.dot{width:10px;height:10px;border-radius:50%;background:#3fb950;display:inline-block;flex-shrink:0}
+h1 span.dot.err{background:#f85149}
+.ts{color:#8b949e;font-size:11px;margin:8px 0 18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:14px 16px}
+.card h2{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:#8b949e;margin-bottom:10px}
+.row{display:flex;justify-content:space-between;align-items:baseline;padding:3px 0;font-size:13px;border-bottom:1px solid #0d1117}
+.row:last-child{border-bottom:none}
+.lbl{color:#8b949e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:56%;font-size:12px}
+.val{font-family:"SF Mono",Consolas,monospace;color:#58a6ff;text-align:right;font-size:12px}
+.ok{color:#3fb950}.err{color:#f85149}.warn{color:#d29922}
+.badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600}
+.badge.ok{background:#0d3d1a;color:#3fb950}
+.badge.err{background:#4d1b1b;color:#f85149}
+.badge.warn{background:#3d2c00;color:#d29922}
+.sep{margin-top:8px;padding-top:8px;border-top:1px dashed #21262d}
+a{color:#58a6ff;text-decoration:none;font-size:12px}a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<h1><span class="dot" id="dot"></span>Claude-Ollama Proxy</h1>
+<div class="ts" id="ts">Loading…</div>
+<div class="grid" id="grid"></div>
+<script>
+const C=${cfg};
+function fmt(n){return n==null?'—':typeof n==='number'?n.toLocaleString():n}
+function ms(n){return n==null?'—':n.toLocaleString()+'&thinsp;ms'}
+function row(l,v,cls){return'<div class="row"><span class="lbl">'+l+'</span><span class="val '+(cls||'")>'+v+'</span></div>'}
+function badge(ok,okT,errT){return'<span class="badge '+(ok?'ok':'err')+'">'+(ok?okT:errT)+'</span>'}
+async function refresh(){
+  const [h,m]=await Promise.all([
+    fetch('/health').then(r=>r.json()).catch(()=>null),
+    fetch('/metrics').then(r=>r.json()).catch(()=>null)
+  ]);
+  const ollamaOk=h&&(h.status==='ok'||h.ollama==='reachable');
+  document.getElementById('dot').className='dot'+(ollamaOk?'':' err');
+  document.getElementById('ts').textContent='Last updated: '+new Date().toLocaleTimeString()+' — refreshes every 5 s';
+  let g='';
+
+  // ── Status card ──────────────────────────────────────────────────────────────
+  g+='<div class="card"><h2>Status</h2>';
+  g+=row('Proxy',badge(true,'Running',''));
+  g+=row('Ollama',badge(ollamaOk,'Reachable','Unreachable'));
+  if(h&&h.hosts&&h.hosts.length>1){
+    h.hosts.forEach(hh=>{
+      const ok2=hh.status==='ok';
+      g+=row(hh.url.replace(/^https?:\/\//,''),badge(ok2,'OK',hh.error||'Err'));
+    });
+  } else if(h&&h.ollamaError){
+    g+=row('Error','<span class="err">'+h.ollamaError+'</span>');
+  }
+  g+=row('Active streams','<span class="'+(m&&m.active_streams>0?'ok':'val')+'">'+(m?m.active_streams:0)+'</span>');
+  g+=row('Uptime',m?fmt(m.uptime_seconds)+' s':'—');
+  g+='</div>';
+
+  // ── Config card ──────────────────────────────────────────────────────────────
+  g+='<div class="card"><h2>Config</h2>';
+  g+=row('Model',C.model);
+  g+=row('Port',C.port);
+  if(C.hosts.length===1)g+=row('Ollama host',C.hosts[0].replace(/^https?:\/\//,''));
+  else g+=row('Ollama hosts',C.hosts.length+' (round-robin)');
+  g+=row('Auth',badge(C.auth,'Enabled','Open — no key'));
+  g+=row('TLS',badge(C.tls,'HTTPS','HTTP'));
+  g+=row('Default max_tokens',fmt(C.maxTokens));
+  g+=row('Context (num_ctx)',C.numCtx?fmt(C.numCtx):'model default');
+  if(C.timeout)g+=row('Timeout',fmt(C.timeout)+' ms');
+  if(C.rateLimitRpm)g+=row('Rate limit (global)',fmt(C.rateLimitRpm)+' req/min');
+  if(C.rateLimitPerIpRpm)g+=row('Rate limit (per-IP)',fmt(C.rateLimitPerIpRpm)+' req/min');
+  if(C.maxBodySize)g+=row('Max body',fmt(C.maxBodySize)+' B');
+  g+=row('Log format',C.logFormat);
+  if(C.systemPrompt)g+=row('System prompt',\`<span title="\${C.systemPrompt}" style="cursor:help">set ℹ</span>\`);
+  g+='<div class="sep"></div>';
+  g+='<div class="row" style="gap:8px"><a href="/health">health</a><a href="/metrics">metrics JSON</a><a href="/metrics/prometheus">prometheus</a><a href="/v1/models">models</a></div>';
+  g+='</div>';
+
+  // ── Requests card ─────────────────────────────────────────────────────────────
+  g+='<div class="card"><h2>Requests</h2>';
+  if(m){
+    const routes=Object.entries(m.requests_total||{});
+    if(routes.length){routes.forEach(([k,v])=>g+=row(k,fmt(v)));}
+    else g+='<div class="row"><span class="lbl" style="color:#8b949e">No requests yet</span></div>';
+    g+=row('Errors (5xx)',m.errors_total?m.errors_total:'0',m.errors_total>0?'err':'ok');
+  }
+  g+='</div>';
+
+  // ── Latency card ──────────────────────────────────────────────────────────────
+  g+='<div class="card"><h2>Latency</h2>';
+  if(m){
+    g+=row('p50',ms(m.latency_p50_ms));
+    g+=row('p95',ms(m.latency_p95_ms));
+    g+=row('p99',ms(m.latency_p99_ms));
+    g+=row('Min',ms(m.latency_min_ms));
+    g+=row('Max',ms(m.latency_max_ms));
+    g+=row('Avg',ms(m.latency_avg_ms));
+  }else{g+='<div class="row"><span class="lbl" style="color:#8b949e">No data yet</span></div>';}
+  g+='</div>';
+
+  // ── Tokens card ───────────────────────────────────────────────────────────────
+  g+='<div class="card"><h2>Tokens (this session)</h2>';
+  if(m){
+    const tot=(m.tokens_input_total||0)+(m.tokens_output_total||0);
+    g+=row('Input',fmt(m.tokens_input_total));
+    g+=row('Output',fmt(m.tokens_output_total));
+    g+=row('Total',fmt(tot));
+    if(C.rateLimitRpm){const pct=Math.round((m.tokens_input_total||0)/C.rateLimitRpm*100);g+=row('vs rate limit',pct+'%');}
+  }else{g+='<div class="row"><span class="lbl" style="color:#8b949e">No data yet</span></div>';}
+  g+='</div>';
+
+  // ── HTTP status codes card ────────────────────────────────────────────────────
+  const codes=m&&m.status_codes?Object.entries(m.status_codes):[];
+  if(codes.length){
+    g+='<div class="card"><h2>HTTP Status Codes</h2>';
+    codes.sort().forEach(([code,cnt])=>{
+      const cls=code.startsWith('5')?'err':code.startsWith('4')?'warn':'ok';
+      g+=row(code,fmt(cnt),cls);
+    });
+    g+='</div>';
+  }
+
+  // ── Per-model usage card ──────────────────────────────────────────────────────
+  const models=m&&m.models_usage?Object.entries(m.models_usage):[];
+  if(models.length){
+    g+='<div class="card"><h2>Model Usage</h2>';
+    models.forEach(([model,v],i)=>{
+      if(i>0)g+='<div class="sep"></div>';
+      g+='<div style="color:#e6edf3;font-size:12px;font-family:monospace;padding:4px 0">'+model+'</div>';
+      g+=row('Requests',fmt(v.requests));
+      g+=row('Tokens in',fmt(v.tokens_in));
+      g+=row('Tokens out',fmt(v.tokens_out));
+    });
+    g+='</div>';
+  }
+
+  document.getElementById('grid').innerHTML=g;
+}
+refresh();
+setInterval(refresh,5000);
+</script>
+</body>
+</html>`;
+
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(html);
+}
+
 // Accepts OpenAI-format POST /v1/chat/completions requests and forwards them to Ollama,
 // applying auth, rate-limiting, timeout, retry, abort, and metrics — same as the Anthropic path.
 // Useful for OpenAI-compatible clients (Cursor, Continue, LiteLLM, etc.) without format translation.
@@ -1560,6 +1736,12 @@ async function requestHandler(req, res) {
     } else if (req.method === 'GET' && path.startsWith('/v1/models/')) {
       if (!checkAuth(req, res)) return;
       await handleModelById(req, res, decodeURIComponent(path.slice('/v1/models/'.length)));
+    } else if (req.method === 'GET' && (path === '/' || path === '')) {
+      handleDashboard(req, res);
+    } else if (req.method === 'GET' && path === '/favicon.ico') {
+      // Return 204 so browser console stays clean when the dashboard is open.
+      res.writeHead(204);
+      res.end();
     } else if (req.method === 'GET' && path === '/health') {
       await handleHealth(req, res);
     } else if (req.method === 'GET' && path === '/metrics') {
