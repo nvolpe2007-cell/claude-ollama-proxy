@@ -4,6 +4,8 @@ const assert = require('node:assert/strict');
 
 const {
   parseDotEnv,
+  parseOllamaOptions,
+  OLLAMA_OPTIONS,
   resolveModel,
   toOpenAIMessages,
   toOpenAITools,
@@ -768,5 +770,56 @@ describe('parseDotEnv', () => {
   test('empty value is an empty string', () => {
     const result = parseDotEnv('FOO=');
     assert.equal(result.FOO, '');
+  });
+});
+
+// ── parseOllamaOptions ────────────────────────────────────────────────────────
+
+describe('parseOllamaOptions', () => {
+  test('returns empty object for falsy input', () => {
+    assert.deepEqual(parseOllamaOptions(null), {});
+    assert.deepEqual(parseOllamaOptions(undefined), {});
+    assert.deepEqual(parseOllamaOptions(''), {});
+  });
+
+  test('parses a valid JSON object', () => {
+    const result = parseOllamaOptions('{"repeat_penalty":1.1,"mirostat":2,"num_gpu":33}');
+    assert.deepEqual(result, { repeat_penalty: 1.1, mirostat: 2, num_gpu: 33 });
+  });
+
+  test('returns empty object and warns on invalid JSON', () => {
+    const orig = console.warn;
+    const warns = [];
+    console.warn = (...a) => warns.push(a.join(' '));
+    const result = parseOllamaOptions('{bad json}');
+    console.warn = orig;
+    assert.deepEqual(result, {});
+    assert.ok(warns.some(w => w.includes('OLLAMA_OPTIONS')));
+  });
+
+  test('returns empty object and warns when value is an array', () => {
+    const orig = console.warn;
+    const warns = [];
+    console.warn = (...a) => warns.push(a.join(' '));
+    const result = parseOllamaOptions('[1,2,3]');
+    console.warn = orig;
+    assert.deepEqual(result, {});
+    assert.ok(warns.some(w => w.includes('OLLAMA_OPTIONS')));
+  });
+
+  test('returns empty object and warns when value is a scalar', () => {
+    const orig = console.warn;
+    const warns = [];
+    console.warn = (...a) => warns.push(a.join(' '));
+    const result = parseOllamaOptions('"just a string"');
+    console.warn = orig;
+    assert.deepEqual(result, {});
+    assert.ok(warns.some(w => w.includes('OLLAMA_OPTIONS')));
+  });
+
+  test('OLLAMA_OPTIONS module constant is an object (not set in test env)', () => {
+    assert.ok(OLLAMA_OPTIONS !== null);
+    assert.equal(typeof OLLAMA_OPTIONS, 'object');
+    assert.ok(!Array.isArray(OLLAMA_OPTIONS));
   });
 });

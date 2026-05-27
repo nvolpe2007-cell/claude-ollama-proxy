@@ -102,6 +102,26 @@ const PROXY_MAX_BODY_SIZE = (() => {
   return n;
 })();
 
+// Optional JSON object of arbitrary Ollama model parameters to include in every request.
+// Useful for deployment-level tuning (repeat_penalty, mirostat, num_gpu, tfs_z, etc.)
+// without adding individual env vars for each knob. Per-request client params take
+// precedence; dedicated env vars (OLLAMA_NUM_CTX, OLLAMA_KEEP_ALIVE) take highest precedence.
+// Example: OLLAMA_OPTIONS='{"repeat_penalty":1.1,"mirostat":2,"num_gpu":33}'
+function parseOllamaOptions(str) {
+  if (!str) return {};
+  let v;
+  try { v = JSON.parse(str); } catch (e) {
+    console.warn('Warning: OLLAMA_OPTIONS is not valid JSON, ignoring:', e.message);
+    return {};
+  }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) {
+    console.warn('Warning: OLLAMA_OPTIONS must be a JSON object (not array/scalar), ignoring');
+    return {};
+  }
+  return v;
+}
+const OLLAMA_OPTIONS = parseOllamaOptions(process.env.OLLAMA_OPTIONS);
+
 // Optional request rate limits. Both apply only to POST /v1/messages and
 // POST /v1/messages/count_tokens. Unset (disabled) by default.
 // RATE_LIMIT_RPM        — global cap across all callers (requests / minute).
@@ -571,7 +591,11 @@ async function handleMessages(req, res) {
   // Ollama 0.7+ passes think:true to supported models (Qwen3-thinking, DeepSeek-R1, etc.)
   // which makes them emit <think>…</think> blocks the proxy already handles.
   if (anthropicReq.thinking?.type === 'enabled') openaiReq.think = true;
-  // Apply global Ollama tuning defaults (overrideable per-deployment via env vars).
+  // OLLAMA_OPTIONS: fill in Ollama-specific params not already set by the request.
+  for (const [k, v] of Object.entries(OLLAMA_OPTIONS)) {
+    if (!(k in openaiReq)) openaiReq[k] = v;
+  }
+  // Dedicated env vars take highest precedence (unconditional overwrite).
   if (OLLAMA_NUM_CTX)    openaiReq.num_ctx    = OLLAMA_NUM_CTX;
   if (OLLAMA_KEEP_ALIVE) openaiReq.keep_alive = OLLAMA_KEEP_ALIVE;
 
@@ -1076,7 +1100,7 @@ async function handleEmbeddings(req, res) {
     ollamaRes = await fetchWithRetry(`${ollamaBase}/api/embed`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: effectiveModel, input: embedReq.input }),
+      body: JSON.stringify({ ...OLLAMA_OPTIONS, model: effectiveModel, input: embedReq.input }),
       signal: ac.signal,
     });
   } catch (e) {
@@ -1335,6 +1359,7 @@ function handleDashboard(req, res) {
     timeout:            PROXY_TIMEOUT,
     maxBodySize:        PROXY_MAX_BODY_SIZE,
     systemPrompt:       PROXY_SYSTEM_PROMPT ? PROXY_SYSTEM_PROMPT.slice(0, 120) + (PROXY_SYSTEM_PROMPT.length > 120 ? '…' : '') : null,
+    ollamaOptions:      Object.keys(OLLAMA_OPTIONS).length > 0 ? JSON.stringify(OLLAMA_OPTIONS) : null,
   });
 
   const html = `<!DOCTYPE html>
@@ -1418,6 +1443,7 @@ async function refresh(){
   if(C.maxBodySize)g+=row('Max body',fmt(C.maxBodySize)+' B');
   g+=row('Log format',C.logFormat);
   if(C.systemPrompt)g+=row('System prompt',\`<span title="\${C.systemPrompt}" style="cursor:help">set ℹ</span>\`);
+  if(C.ollamaOptions)g+=row('Ollama options',\`<span title="\${C.ollamaOptions}" style="cursor:help;font-size:11px">\${C.ollamaOptions.length>40?C.ollamaOptions.slice(0,40)+'…':C.ollamaOptions}</span>\`);
   g+='<div class="sep"></div>';
   g+='<div class="row" style="gap:8px"><a href="/health">health</a><a href="/metrics">metrics JSON</a><a href="/metrics/prometheus">prometheus</a><a href="/v1/models">models</a></div>';
   g+='</div>';
@@ -1535,6 +1561,11 @@ async function handleOpenAIChat(req, res) {
   const effectiveModel = resolveModel(openaiReq.model);
   openaiReq.model = effectiveModel;
   if (!openaiReq.max_tokens)  openaiReq.max_tokens  = PROXY_MAX_TOKENS;
+  // OLLAMA_OPTIONS: fill in deployment-level params not already in the client request.
+  for (const [k, v] of Object.entries(OLLAMA_OPTIONS)) {
+    if (!(k in openaiReq)) openaiReq[k] = v;
+  }
+  // Dedicated env vars take highest precedence (unconditional overwrite).
   if (OLLAMA_NUM_CTX)         openaiReq.num_ctx      = OLLAMA_NUM_CTX;
   if (OLLAMA_KEEP_ALIVE)      openaiReq.keep_alive   = OLLAMA_KEEP_ALIVE;
   const streaming = openaiReq.stream === true;
@@ -1815,7 +1846,10 @@ if (require.main === module) {
     console.log(`  Warmup: ${PROXY_WARMUP ? 'enabled — pre-loading model on startup' : 'disabled (set PROXY_WARMUP=true to pre-load model)'}`);
     const rlGlobal = RATE_LIMIT_RPM        ? `global ${RATE_LIMIT_RPM} req/min`    : 'no global limit';
     const rlIp     = RATE_LIMIT_PER_IP_RPM ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min` : 'no per-IP limit';
-    console.log(`  RateLimit: ${rlGlobal}; ${rlIp} (set RATE_LIMIT_RPM / RATE_LIMIT_PER_IP_RPM)\n`);
+    console.log(`  RateLimit: ${rlGlobal}; ${rlIp} (set RATE_LIMIT_RPM / RATE_LIMIT_PER_IP_RPM)`);
+    if (Object.keys(OLLAMA_OPTIONS).length > 0)
+      console.log(`  Options: OLLAMA_OPTIONS=${JSON.stringify(OLLAMA_OPTIONS)}`);
+    console.log('');
 
     if (PROXY_WARMUP) {
       // Fire warmup asynchronously so the server is already accepting connections while we load.
@@ -1864,6 +1898,8 @@ if (require.main === module) {
 
 module.exports = {
   parseDotEnv,
+  parseOllamaOptions,
+  OLLAMA_OPTIONS,
   resolveModel,
   toOpenAIMessages,
   toOpenAITools,
