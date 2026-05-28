@@ -73,6 +73,12 @@ const CORS_ORIGIN   = process.env.CORS_ORIGIN     || '*';
 // 'json' emits a single-line JSON object per request, useful for log aggregation tools
 // (Grafana Loki, Datadog, CloudWatch, etc.).
 const LOG_FORMAT    = process.env.LOG_FORMAT       || 'text';
+// LOG_LEVEL controls verbosity. 'info' (default) logs one summary line per request.
+// 'debug' additionally logs the full translated OpenAI-format body sent to Ollama and,
+// for non-streaming requests, the raw Ollama response — invaluable for diagnosing why
+// message conversion, system-prompt injection, or tool formatting produces unexpected results.
+// Large base64 image payloads are automatically truncated so logs stay readable.
+const LOG_LEVEL     = process.env.LOG_LEVEL        || 'info';
 // Ollama-specific tuning defaults applied to every request.
 // num_ctx controls the context window — Ollama model defaults (often 2048) are too small
 // for real Claude Code sessions; set this to at least 32768 in production.
@@ -124,6 +130,33 @@ function parseOllamaOptions(str) {
   return v;
 }
 const OLLAMA_OPTIONS = parseOllamaOptions(process.env.OLLAMA_OPTIONS);
+
+// Returns a sanitized deep copy of obj with long base64 strings replaced by a short
+// placeholder so debug log lines stay human-readable even when requests contain images.
+// Matches: the `data` key for Anthropic base64 source blocks, and the `url` key when
+// its value is a data-URL (i.e. starts with "data:") for OpenAI image_url blocks.
+function sanitizeForLog(obj, maxChars = 200) {
+  if (Array.isArray(obj)) return obj.map(x => sanitizeForLog(x, maxChars));
+  if (obj && typeof obj === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === 'string' && v.length > maxChars &&
+          (k === 'data' || (k === 'url' && v.startsWith('data:')))) {
+        out[k] = `<base64 ${v.length} chars>`;
+      } else {
+        out[k] = sanitizeForLog(v, maxChars);
+      }
+    }
+    return out;
+  }
+  return obj;
+}
+
+// Logs obj as pretty JSON under a label when LOG_LEVEL=debug. No-op otherwise.
+function debugLog(label, obj) {
+  if (LOG_LEVEL !== 'debug') return;
+  console.log(`[DEBUG] ${label}:\n${JSON.stringify(sanitizeForLog(obj), null, 2)}`);
+}
 
 // Optional request rate limits. Both apply only to POST /v1/messages and
 // POST /v1/messages/count_tokens. Unset (disabled) by default.
@@ -602,6 +635,8 @@ async function handleMessages(req, res) {
   if (OLLAMA_NUM_CTX)    openaiReq.num_ctx    = OLLAMA_NUM_CTX;
   if (OLLAMA_KEEP_ALIVE) openaiReq.keep_alive = OLLAMA_KEEP_ALIVE;
 
+  debugLog(`→ Ollama [${ollamaBase}]`, openaiReq);
+
   let ollamaRes;
   try {
     ollamaRes = await fetchWithRetry(`${ollamaBase}/v1/chat/completions`, {
@@ -665,6 +700,7 @@ async function handleMessages(req, res) {
     }
     req.socket.off('close', onClientClose);
     clearTO();
+    debugLog('← Ollama response', data);
     const choice = data.choices?.[0];
     if (!choice) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -1372,6 +1408,7 @@ function handleDashboard(req, res) {
     auth:               !!PROXY_API_KEY,
     tls:                !!TLS_CERT,
     logFormat:          LOG_FORMAT,
+    logLevel:           LOG_LEVEL,
     maxTokens:          PROXY_MAX_TOKENS,
     numCtx:             OLLAMA_NUM_CTX,
     keepAlive:          OLLAMA_KEEP_ALIVE,
@@ -1466,6 +1503,7 @@ async function refresh(){
   if(C.rateLimitPerIpRpm)g+=row('Rate limit (per-IP)',fmt(C.rateLimitPerIpRpm)+' req/min');
   if(C.maxBodySize)g+=row('Max body',fmt(C.maxBodySize)+' B');
   g+=row('Log format',C.logFormat);
+  if(C.logLevel==='debug')g+=row('Log level','<span class="warn">debug (verbose)</span>');
   if(C.systemPrompt)g+=row('System prompt',\`<span title="\${C.systemPrompt}" style="cursor:help">set ℹ</span>\`);
   if(C.ollamaOptions)g+=row('Ollama options',\`<span title="\${C.ollamaOptions}" style="cursor:help;font-size:11px">\${C.ollamaOptions.length>40?C.ollamaOptions.slice(0,40)+'…':C.ollamaOptions}</span>\`);
   g+='<div class="sep"></div>';
@@ -1610,6 +1648,8 @@ async function handleOpenAIChat(req, res) {
       openaiReq.messages.unshift({ role: 'system', content: PROXY_SYSTEM_PROMPT });
     }
   }
+
+  debugLog(`→ Ollama [${ollamaBase}] (OpenAI passthrough)`, openaiReq);
 
   let ollamaRes;
   try {
@@ -1866,7 +1906,7 @@ if (require.main === module) {
     console.log(`  MaxTok: default max_tokens=${PROXY_MAX_TOKENS} (set PROXY_MAX_TOKENS to change)`);
     console.log(`  MaxBody: ${PROXY_MAX_BODY_SIZE ? `${PROXY_MAX_BODY_SIZE} B per request` : 'unlimited (set PROXY_MAX_BODY_SIZE to limit)'}`);
     if (PROXY_SYSTEM_PROMPT) console.log(`  SysPrompt: ${PROXY_SYSTEM_PROMPT.slice(0, 80)}${PROXY_SYSTEM_PROMPT.length > 80 ? '…' : ''}`);
-    console.log(`  Logs  : format=${LOG_FORMAT} (set LOG_FORMAT=json for structured logging)`);
+    console.log(`  Logs  : format=${LOG_FORMAT} level=${LOG_LEVEL} (LOG_FORMAT=json for structured; LOG_LEVEL=debug for full request/response bodies)`);
     console.log(`  Warmup: ${PROXY_WARMUP ? 'enabled — pre-loading model on startup' : 'disabled (set PROXY_WARMUP=true to pre-load model)'}`);
     const rlGlobal = RATE_LIMIT_RPM        ? `global ${RATE_LIMIT_RPM} req/min`    : 'no global limit';
     const rlIp     = RATE_LIMIT_PER_IP_RPM ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min` : 'no per-IP limit';
@@ -1933,6 +1973,7 @@ module.exports = {
   imageBlockToOpenAI,
   injectSystemPrompt,
   logRequest,
+  sanitizeForLog,
   getOllamaHost,
   OLLAMA_HOSTS,
   requestHandler,

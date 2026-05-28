@@ -15,6 +15,7 @@ const {
   imageBlockToOpenAI,
   injectSystemPrompt,
   logRequest,
+  sanitizeForLog,
   getOllamaHost,
   OLLAMA_HOSTS,
   checkRateLimit,
@@ -869,5 +870,62 @@ describe('MODEL_MAP alias resolution logic', () => {
   test('empty map resolves everything to null', () => {
     assert.equal(resolveAlias('claude-3-haiku', {}), null);
     assert.equal(resolveAlias('qwen2.5:7b',     {}), null);
+  });
+});
+
+// ── sanitizeForLog ────────────────────────────────────────────────────────────
+
+describe('sanitizeForLog', () => {
+  test('passes through scalars and short strings unchanged', () => {
+    assert.equal(sanitizeForLog('hello'), 'hello');
+    assert.equal(sanitizeForLog(42), 42);
+    assert.equal(sanitizeForLog(null), null);
+    assert.equal(sanitizeForLog(true), true);
+  });
+
+  test('truncates long `data` field with a placeholder', () => {
+    const longData = 'A'.repeat(500);
+    const result = sanitizeForLog({ source: { type: 'base64', data: longData } });
+    assert.equal(result.source.type, 'base64');
+    assert.match(result.source.data, /^<base64 500 chars>$/);
+  });
+
+  test('preserves short `data` fields', () => {
+    const result = sanitizeForLog({ data: 'abc' });
+    assert.equal(result.data, 'abc');
+  });
+
+  test('truncates data-URL `url` fields', () => {
+    const dataUrl = 'data:image/png;base64,' + 'B'.repeat(300);
+    const result = sanitizeForLog({ image_url: { url: dataUrl } });
+    assert.match(result.image_url.url, /^<base64/);
+  });
+
+  test('leaves non-data-URL `url` fields alone', () => {
+    const result = sanitizeForLog({ url: 'https://example.com/img.png' });
+    assert.equal(result.url, 'https://example.com/img.png');
+  });
+
+  test('recursively sanitizes arrays', () => {
+    const longData = 'C'.repeat(500);
+    const result = sanitizeForLog([{ data: longData }, { text: 'hi' }]);
+    assert.match(result[0].data, /^<base64/);
+    assert.equal(result[1].text, 'hi');
+  });
+
+  test('deep-copies the object without mutating the original', () => {
+    const longData = 'D'.repeat(500);
+    const original = { data: longData };
+    sanitizeForLog(original);
+    assert.equal(original.data, longData); // original unchanged
+  });
+
+  test('sanitizes nested OpenAI messages array with image_url blocks', () => {
+    const dataUrl = 'data:image/jpeg;base64,' + 'E'.repeat(400);
+    const messages = [
+      { role: 'user', content: [{ type: 'image_url', image_url: { url: dataUrl } }] }
+    ];
+    const result = sanitizeForLog(messages);
+    assert.match(result[0].content[0].image_url.url, /^<base64/);
   });
 });
