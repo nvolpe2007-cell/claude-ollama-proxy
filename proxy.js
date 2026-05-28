@@ -3,6 +3,9 @@ const https = require('https');
 const fs    = require('fs');
 const path  = require('path');
 
+let PROXY_VERSION = 'unknown';
+try { PROXY_VERSION = require('./package.json').version; } catch {}
+
 // ── .env file loading ─────────────────────────────────────────────────────────
 // Parses KEY=VALUE pairs from a .env string. Exported for unit-testing.
 function parseDotEnv(content) {
@@ -1040,7 +1043,23 @@ async function handleModelById(req, res, modelId) {
     return;
   }
 
-  const model = (data.models || []).find(m => m.name === modelId);
+  const allModels = data.models || [];
+
+  // Try exact match against real Ollama model names first.
+  let model = allModels.find(m => m.name === modelId);
+
+  // If not found, resolve via MODEL_MAP aliases — same logic as handleModels exposes them
+  // in GET /v1/models. This ensures GET /v1/models/:id is consistent with GET /v1/models.
+  if (!model) {
+    let targetName = MODEL_MAP[modelId];
+    if (!targetName) {
+      for (const [key, target] of Object.entries(MODEL_MAP)) {
+        if (modelId.startsWith(key)) { targetName = target; break; }
+      }
+    }
+    if (targetName) model = allModels.find(m => m.name === targetName);
+  }
+
   if (!model) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Model '${modelId}' not found in Ollama` } }));
@@ -1049,7 +1068,7 @@ async function handleModelById(req, res, modelId) {
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    id: model.name,
+    id: modelId,   // always return the requested ID (alias or real name)
     object: 'model',
     created: model.modified_at ? Math.floor(new Date(model.modified_at).getTime() / 1000) : 0,
     owned_by: 'ollama'
@@ -1210,6 +1229,7 @@ async function handleHealth(req, res) {
   res.end(JSON.stringify({
     status: allOk ? 'ok' : 'degraded',
     proxy: 'running',
+    version: PROXY_VERSION,
     hosts: hostResults,
     ollama: first.status === 'ok' ? 'reachable' : 'unreachable',
     ollamaError: first.error || undefined,
@@ -1346,6 +1366,7 @@ async function handleMetricsPrometheus(req, res) {
 function handleDashboard(req, res) {
   const cfg = JSON.stringify({
     model:              MODEL,
+    version:            PROXY_VERSION,
     port:               Number(PORT),
     hosts:              OLLAMA_HOSTS,
     auth:               !!PROXY_API_KEY,
@@ -1353,6 +1374,7 @@ function handleDashboard(req, res) {
     logFormat:          LOG_FORMAT,
     maxTokens:          PROXY_MAX_TOKENS,
     numCtx:             OLLAMA_NUM_CTX,
+    keepAlive:          OLLAMA_KEEP_ALIVE,
     rateLimitRpm:       RATE_LIMIT_RPM,
     rateLimitPerIpRpm:  RATE_LIMIT_PER_IP_RPM,
     warmup:             PROXY_WARMUP,
@@ -1430,6 +1452,7 @@ async function refresh(){
   // ── Config card ──────────────────────────────────────────────────────────────
   g+='<div class="card"><h2>Config</h2>';
   g+=row('Model',C.model);
+  g+=row('Version',C.version);
   g+=row('Port',C.port);
   if(C.hosts.length===1)g+=row('Ollama host',C.hosts[0].replace(/^https?:\/\//,''));
   else g+=row('Ollama hosts',C.hosts.length+' (round-robin)');
@@ -1437,6 +1460,7 @@ async function refresh(){
   g+=row('TLS',badge(C.tls,'HTTPS','HTTP'));
   g+=row('Default max_tokens',fmt(C.maxTokens));
   g+=row('Context (num_ctx)',C.numCtx?fmt(C.numCtx):'model default');
+  if(C.keepAlive)g+=row('Keep-alive',C.keepAlive);
   if(C.timeout)g+=row('Timeout',fmt(C.timeout)+' ms');
   if(C.rateLimitRpm)g+=row('Rate limit (global)',fmt(C.rateLimitRpm)+' req/min');
   if(C.rateLimitPerIpRpm)g+=row('Rate limit (per-IP)',fmt(C.rateLimitPerIpRpm)+' req/min');

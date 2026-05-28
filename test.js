@@ -823,3 +823,51 @@ describe('parseOllamaOptions', () => {
     assert.ok(!Array.isArray(OLLAMA_OPTIONS));
   });
 });
+
+// ── MODEL_MAP alias resolution (unit-level, mirrors handleModelById logic) ────
+// handleModelById resolves aliases the same way resolveModel does, so we verify
+// the shared logic here; integration coverage lives in test-integration.js.
+
+describe('MODEL_MAP alias resolution logic', () => {
+  // Simulate the lookup logic extracted from handleModelById: given a modelId and
+  // a MODEL_MAP, find the target Ollama model name (or null if not mapped).
+  function resolveAlias(modelId, map) {
+    let target = map[modelId];
+    if (!target) {
+      for (const [key, val] of Object.entries(map)) {
+        if (modelId.startsWith(key)) { target = val; break; }
+      }
+    }
+    return target || null;
+  }
+
+  const map = {
+    'claude-3-haiku':  'qwen2.5:7b',
+    'claude-3-sonnet': 'qwen2.5:14b',
+    'claude-3-opus':   'qwen2.5:72b',
+  };
+
+  test('exact alias match returns target model name', () => {
+    assert.equal(resolveAlias('claude-3-haiku', map), 'qwen2.5:7b');
+    assert.equal(resolveAlias('claude-3-opus',  map), 'qwen2.5:72b');
+  });
+
+  test('prefix alias match returns target (e.g. claude-3-haiku-20240307)', () => {
+    assert.equal(resolveAlias('claude-3-haiku-20240307', map), 'qwen2.5:7b');
+    assert.equal(resolveAlias('claude-3-sonnet-20250219', map), 'qwen2.5:14b');
+  });
+
+  test('real Ollama model name (not in map) resolves to null', () => {
+    assert.equal(resolveAlias('qwen2.5:7b', map), null);
+    assert.equal(resolveAlias('llama3:8b',  map), null);
+  });
+
+  test('unknown claude-* name not in map resolves to null', () => {
+    assert.equal(resolveAlias('claude-instant-1', map), null);
+  });
+
+  test('empty map resolves everything to null', () => {
+    assert.equal(resolveAlias('claude-3-haiku', {}), null);
+    assert.equal(resolveAlias('qwen2.5:7b',     {}), null);
+  });
+});
