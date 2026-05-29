@@ -1008,6 +1008,110 @@ describe('POST /v1/chat/completions (streaming)', () => {
 
 // ── Tests: POST /v1/messages — streaming thinking blocks ─────────────────────
 
+describe('POST /v1/completions (legacy text completions)', () => {
+  test('non-streaming: returns text_completion envelope with correct fields', async () => {
+    const r = await request('POST', '/v1/completions', {
+      model: 'qwen2.5:7b',
+      prompt: 'Say hello',
+      max_tokens: 50,
+    });
+    assert.equal(r.status, 200);
+    const b = json(r);
+    assert.equal(b.object, 'text_completion');
+    assert.ok(b.id.startsWith('cmpl_'), 'id should have cmpl_ prefix');
+    assert.ok(typeof b.created === 'number', 'created should be a unix timestamp');
+    assert.equal(b.model, 'qwen2.5:7b');
+    assert.ok(Array.isArray(b.choices), 'choices should be an array');
+    assert.equal(b.choices.length, 1);
+    assert.equal(typeof b.choices[0].text, 'string');
+    assert.equal(b.choices[0].index, 0);
+    assert.ok(b.choices[0].text.length > 0, 'response text should not be empty');
+    assert.ok(b.usage.prompt_tokens > 0);
+    assert.ok(b.usage.completion_tokens > 0);
+    assert.ok(b.usage.total_tokens > 0);
+  });
+
+  test('non-streaming: array prompt returns valid text_completion response', async () => {
+    // Unit tests verify exact joining; here we confirm the full round-trip succeeds.
+    const r = await request('POST', '/v1/completions', {
+      prompt: ['first part', 'second part'],
+    });
+    assert.equal(r.status, 200);
+    const b = json(r);
+    assert.equal(b.object, 'text_completion');
+    assert.ok(Array.isArray(b.choices));
+    assert.equal(typeof b.choices[0].text, 'string');
+  });
+
+  test('non-streaming: 400 when prompt is missing', async () => {
+    const r = await request('POST', '/v1/completions', { model: 'qwen2.5:7b' });
+    assert.equal(r.status, 400);
+    const b = json(r);
+    assert.equal(b.error.type, 'invalid_request_error');
+    assert.match(b.error.message, /prompt/);
+  });
+
+  test('non-streaming: 400 on malformed JSON body', async () => {
+    // Send raw bytes instead of using the json helper
+    const r = await new Promise((resolve, reject) => {
+      const payload = 'NOT JSON';
+      const h = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) };
+      const req = http.request(
+        { host: '127.0.0.1', port: PROXY_PORT, method: 'POST', path: '/v1/completions', headers: h },
+        (res) => {
+          const chunks = [];
+          res.on('data', c => chunks.push(c));
+          res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() }));
+        }
+      );
+      req.on('error', reject);
+      req.write(payload);
+      req.end();
+    });
+    assert.equal(r.status, 400);
+    const b = JSON.parse(r.body);
+    assert.equal(b.error.type, 'invalid_request_error');
+  });
+
+  test('streaming: returns text/event-stream with text_completion chunks', async () => {
+    const r = await request('POST', '/v1/completions', {
+      model: 'qwen2.5:7b',
+      prompt: 'Say hello',
+      stream: true,
+    });
+    assert.equal(r.status, 200);
+    assert.ok(r.headers['content-type']?.includes('text/event-stream'));
+
+    const dataLines = r.body
+      .split('\n')
+      .filter(l => l.startsWith('data: ') && l.slice(6).trim() !== '[DONE]');
+    assert.ok(dataLines.length > 0, 'should have at least one data event');
+
+    // All parseable chunks should use the text_completion object type
+    const chunks = dataLines.map(l => { try { return JSON.parse(l.slice(6)); } catch { return null; } }).filter(Boolean);
+    const contentChunks = chunks.filter(c => c.choices?.[0]?.text !== undefined);
+    assert.ok(contentChunks.length > 0, 'should have content chunks');
+    for (const c of contentChunks) {
+      assert.equal(c.object, 'text_completion');
+      assert.ok(c.id.startsWith('cmpl_'));
+      assert.equal(c.choices[0].index, 0);
+    }
+
+    // The full concatenated text should equal the mock response
+    const fullText = contentChunks.map(c => c.choices[0].text).join('');
+    assert.equal(fullText, 'Hello!');
+  });
+
+  test('metrics: POST /v1/completions appears in requests_total after a request', async () => {
+    await request('POST', '/v1/completions', { prompt: 'hi' });
+    const m = json(await request('GET', '/metrics', null));
+    assert.ok(
+      m.requests_total['POST /v1/completions'] > 0,
+      'POST /v1/completions should appear in requests_total'
+    );
+  });
+});
+
 describe('POST /v1/messages (streaming) — thinking blocks', () => {
   test('routes <think> tag content to thinking block then text block', async () => {
     mockBehavior = 'streaming-think';
