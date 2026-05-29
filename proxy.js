@@ -1780,6 +1780,240 @@ async function handleOpenAIChat(req, res) {
   res.end();
 }
 
+// POST /v1/completions — legacy OpenAI text completions API.
+// Converts the `prompt` field into a single-turn chat message and forwards to Ollama,
+// then converts the chat response back into the text completions envelope that older
+// clients (some LiteLLM configs, older Continue builds, scripts) expect.
+// Supports streaming (SSE) and non-streaming. Applies full proxy infrastructure:
+// auth, rate-limiting, timeout, retry, client-abort, keepalive, CORS, metrics.
+async function handleOpenAICompletions(req, res) {
+  const ollamaBase = getOllamaHost();
+  const ac = new AbortController();
+
+  let timedOut = false;
+  let _timeoutId = null;
+  const clearTO = () => { if (_timeoutId) { clearTimeout(_timeoutId); _timeoutId = null; } };
+  if (PROXY_TIMEOUT) {
+    _timeoutId = setTimeout(() => {
+      timedOut = true;
+      if (!res.writableEnded) ac.abort();
+      console.warn(`Request timeout after ${PROXY_TIMEOUT}ms — aborting Ollama request`);
+    }, PROXY_TIMEOUT);
+  }
+
+  const onClientClose = () => { if (!res.writableEnded) { clearTO(); ac.abort(); } };
+  req.socket.once('close', onClientClose);
+
+  const body = await readBody(req);
+  let completionReq;
+  try { completionReq = JSON.parse(body); }
+  catch {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Request body is not valid JSON' } }));
+    return;
+  }
+
+  if (completionReq.prompt == null) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`prompt` is required' } }));
+    return;
+  }
+
+  const effectiveModel = resolveModel(completionReq.model);
+  const streaming = completionReq.stream === true;
+
+  // Normalize prompt to a single string; OpenAI spec allows string or array of strings.
+  const promptText = Array.isArray(completionReq.prompt)
+    ? completionReq.prompt.join('\n')
+    : String(completionReq.prompt);
+
+  // Build an OpenAI chat request so we can forward to Ollama's /v1/chat/completions.
+  const chatReq = {
+    model: effectiveModel,
+    messages: [{ role: 'user', content: promptText }],
+    max_tokens: completionReq.max_tokens || PROXY_MAX_TOKENS,
+    stream: streaming,
+    ...(streaming && { stream_options: { include_usage: true } }),
+  };
+  if (completionReq.temperature !== undefined) chatReq.temperature = completionReq.temperature;
+  if (completionReq.top_p      !== undefined) chatReq.top_p      = completionReq.top_p;
+  if (completionReq.stop       !== undefined) chatReq.stop       = completionReq.stop;
+  if (completionReq.seed       !== undefined) chatReq.seed       = completionReq.seed;
+  for (const [k, v] of Object.entries(OLLAMA_OPTIONS)) {
+    if (!(k in chatReq)) chatReq[k] = v;
+  }
+  if (OLLAMA_NUM_CTX)    chatReq.num_ctx    = OLLAMA_NUM_CTX;
+  if (OLLAMA_KEEP_ALIVE) chatReq.keep_alive = OLLAMA_KEEP_ALIVE;
+
+  if (PROXY_SYSTEM_PROMPT) {
+    chatReq.messages.unshift({ role: 'system', content: PROXY_SYSTEM_PROMPT });
+  }
+
+  debugLog(`→ Ollama [${ollamaBase}] (completions)`, chatReq);
+
+  let ollamaRes;
+  try {
+    ollamaRes = await fetchWithRetry(`${ollamaBase}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chatReq),
+      signal: ac.signal,
+    });
+  } catch (e) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    if (e.name === 'AbortError') {
+      if (timedOut) {
+        if (!res.headersSent) res.writeHead(504, { 'Content-Type': 'application/json' });
+        if (!res.writableEnded) res.end(JSON.stringify({
+          error: { type: 'timeout_error', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms`, code: 'timeout' }
+        }));
+      } else {
+        res.end();
+      }
+      return;
+    }
+    const isConnRefused = e.cause?.code === 'ECONNREFUSED' || e.message.includes('ECONNREFUSED');
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'connection_error', message: e.message + (isConnRefused ? ' — is Ollama running? Try: ollama serve' : '') } }));
+    return;
+  }
+
+  if (!ollamaRes.ok) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    const err = await ollamaRes.text();
+    res.writeHead(ollamaRes.status, { 'Content-Type': 'application/json' });
+    res.end(err);
+    return;
+  }
+
+  const completionId = () => 'cmpl_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+  // ── Non-streaming ────────────────────────────────────────────────────────────
+  if (!streaming) {
+    let data;
+    try { data = await ollamaRes.json(); }
+    catch (e) {
+      req.socket.off('close', onClientClose);
+      clearTO();
+      if (e.name === 'AbortError') {
+        if (timedOut) {
+          if (!res.headersSent) res.writeHead(504, { 'Content-Type': 'application/json' });
+          if (!res.writableEnded) res.end(JSON.stringify({ error: { type: 'timeout_error', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms` } }));
+        } else {
+          res.end();
+        }
+        return;
+      }
+      throw e;
+    }
+    req.socket.off('close', onClientClose);
+    clearTO();
+    const choice = data.choices?.[0];
+    const promptTok     = data.usage?.prompt_tokens     || 0;
+    const completionTok = data.usage?.completion_tokens || 0;
+    recordTokens(promptTok, completionTok, effectiveModel);
+    res._logMeta = { model: effectiveModel, tokensIn: promptTok, tokensOut: completionTok };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      id: completionId(),
+      object: 'text_completion',
+      created: Math.floor(Date.now() / 1000),
+      model: effectiveModel,
+      choices: [{
+        text: choice?.message?.content || '',
+        index: 0,
+        logprobs: null,
+        finish_reason: choice?.finish_reason || 'stop',
+      }],
+      usage: {
+        prompt_tokens:     promptTok,
+        completion_tokens: completionTok,
+        total_tokens:      promptTok + completionTok,
+      },
+    }));
+    return;
+  }
+
+  // ── Streaming ─────────────────────────────────────────────────────────────────
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+  _metrics.activeStreams++;
+
+  const id = completionId();
+  const created = Math.floor(Date.now() / 1000);
+  let inputTokens = 0;
+  let outputTokens = 0;
+  const keepAlive = setInterval(() => res.writableEnded || res.write(': keepalive\n\n'), 15_000);
+  const reader = ollamaRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) { res.write(line + '\n'); continue; }
+        const raw = line.slice(6).trim();
+        if (raw === '[DONE]') { res.write('data: [DONE]\n\n'); continue; }
+        let chunk;
+        try { chunk = JSON.parse(raw); } catch { res.write(line + '\n'); continue; }
+
+        if (chunk.usage) {
+          inputTokens  = chunk.usage.prompt_tokens     || inputTokens;
+          outputTokens = chunk.usage.completion_tokens || outputTokens;
+        }
+
+        const choice = chunk.choices?.[0];
+        if (!choice) continue;
+
+        // Convert chat delta to completions delta.
+        const text = choice.delta?.content || '';
+        const completionsChunk = {
+          id, object: 'text_completion', created, model: effectiveModel,
+          choices: [{ text, index: 0, logprobs: null, finish_reason: choice.finish_reason || null }],
+        };
+        res.write(`data: ${JSON.stringify(completionsChunk)}\n\n`);
+      }
+    }
+    if (buf) res.write(buf);
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      if (timedOut && !res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ error: { type: 'timeout_error', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms` } })}\n\n`);
+      }
+    } else {
+      console.error('Completions stream error:', e.message);
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ error: { type: 'stream_error', message: e.message } })}\n\n`);
+      }
+    }
+  } finally {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    clearInterval(keepAlive);
+    _metrics.activeStreams--;
+  }
+
+  recordTokens(inputTokens, outputTokens, effectiveModel);
+  res._logMeta = { model: effectiveModel, tokensIn: inputTokens, tokensOut: outputTokens };
+  res.end();
+}
+
 async function requestHandler(req, res) {
   // CORS headers on every response — must happen before any writeHead call.
   setCORSHeaders(res);
@@ -1815,6 +2049,11 @@ async function requestHandler(req, res) {
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
       await handleOpenAIChat(req, res);
+    } else if (req.method === 'POST' && path === '/v1/completions') {
+      if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      await handleOpenAICompletions(req, res);
     } else if (req.method === 'POST' && path === '/v1/messages/count_tokens') {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
@@ -1918,32 +2157,34 @@ if (require.main === module) {
     if (PROXY_WARMUP) {
       // Fire warmup asynchronously so the server is already accepting connections while we load.
       // Uses setImmediate to yield back to the event loop first.
+      // Warms all configured hosts in parallel so every GPU is ready, not just the first.
       setImmediate(async () => {
-        const ollamaBase = OLLAMA_HOSTS[0];
-        console.log(`  Warmup: sending preflight to ${ollamaBase} to load ${MODEL} into GPU memory…`);
-        try {
-          const r = await fetch(`${ollamaBase}/v1/chat/completions`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: MODEL,
-              messages: [{ role: 'user', content: '.' }],
-              max_tokens: 1,
-              stream: false,
-              ...(OLLAMA_KEEP_ALIVE && { keep_alive: OLLAMA_KEEP_ALIVE }),
-            }),
-            // Allow up to 3 minutes — large models can take time on first load.
-            signal: AbortSignal.timeout(180_000),
-          });
-          if (r.ok) {
-            console.log('  Warmup: model ready — GPU memory loaded\n');
-          } else {
-            const text = await r.text().catch(() => '');
-            console.warn(`  Warmup: Ollama returned HTTP ${r.status} — first real request will retry: ${text.slice(0, 120)}\n`);
+        console.log(`  Warmup: sending preflight to ${OLLAMA_HOSTS.length} host(s) to load ${MODEL} into GPU memory…`);
+        await Promise.all(OLLAMA_HOSTS.map(async (ollamaBase) => {
+          try {
+            const r = await fetch(`${ollamaBase}/v1/chat/completions`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: MODEL,
+                messages: [{ role: 'user', content: '.' }],
+                max_tokens: 1,
+                stream: false,
+                ...(OLLAMA_KEEP_ALIVE && { keep_alive: OLLAMA_KEEP_ALIVE }),
+              }),
+              // Allow up to 3 minutes — large models can take time on first load.
+              signal: AbortSignal.timeout(180_000),
+            });
+            if (r.ok) {
+              console.log(`  Warmup: ${ollamaBase} ready — model loaded\n`);
+            } else {
+              const text = await r.text().catch(() => '');
+              console.warn(`  Warmup: ${ollamaBase} returned HTTP ${r.status}: ${text.slice(0, 120)}\n`);
+            }
+          } catch (e) {
+            console.warn(`  Warmup: ${ollamaBase} failed (${e.message}) — model will load on first request\n`);
           }
-        } catch (e) {
-          console.warn(`  Warmup: failed (${e.message}) — first request will load model on demand\n`);
-        }
+        }));
       });
     }
   });
@@ -1978,6 +2219,7 @@ module.exports = {
   OLLAMA_HOSTS,
   requestHandler,
   handleOpenAIChat,
+  handleOpenAICompletions,
   handleEmbeddings,
   handleMetricsPrometheus,
   // Rate-limit internals exported for unit testing only.

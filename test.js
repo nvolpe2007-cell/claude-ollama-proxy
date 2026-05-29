@@ -929,3 +929,164 @@ describe('sanitizeForLog', () => {
     assert.match(result[0].content[0].image_url.url, /^<base64/);
   });
 });
+
+// ── POST /v1/completions (handleOpenAICompletions) ────────────────────────────
+// These tests exercise the handler in isolation by providing mock req/res objects
+// and a stubbed fetch so no real Ollama instance is required.
+
+describe('handleOpenAICompletions', () => {
+  const { handleOpenAICompletions } = require('./proxy');
+
+  // Minimal mock request builder.
+  function mockReq(body) {
+    const chunks = [JSON.stringify(body)];
+    const req = {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST',
+      url: '/v1/completions',
+      [Symbol.asyncIterator]: async function* () { for (const c of chunks) yield c; },
+    };
+    return req;
+  }
+
+  // Minimal mock response builder; captures writeHead / end calls.
+  function mockRes() {
+    const res = {
+      headersSent: false,
+      writableEnded: false,
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(status) { this._status = status; this.headersSent = true; },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; },
+      on() {},
+    };
+    return res;
+  }
+
+  // Replace global fetch with a one-shot stub that resolves with an OpenAI chat response.
+  function stubFetch(chatResponse, status = 200) {
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: status < 400,
+      status,
+      json: async () => chatResponse,
+      text: async () => JSON.stringify(chatResponse),
+      body: null,
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  test('returns 400 when body is not valid JSON', async () => {
+    const req = {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST', url: '/v1/completions',
+      [Symbol.asyncIterator]: async function* () { yield 'NOT JSON'; },
+    };
+    const res = mockRes();
+    await handleOpenAICompletions(req, res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+  });
+
+  test('returns 400 when prompt is missing', async () => {
+    const req = mockReq({ model: 'llama3' });
+    const res = mockRes();
+    await handleOpenAICompletions(req, res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /prompt/);
+  });
+
+  test('returns text_completion envelope for non-streaming request', async () => {
+    const restore = stubFetch({
+      choices: [{ message: { content: 'Hello world' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 5, completion_tokens: 3 },
+    });
+    try {
+      const req = mockReq({ model: 'llama3', prompt: 'Say hi' });
+      const res = mockRes();
+      await handleOpenAICompletions(req, res);
+      assert.equal(res._status, 200);
+      const body = JSON.parse(res._body);
+      assert.equal(body.object, 'text_completion');
+      assert.equal(body.choices.length, 1);
+      assert.equal(body.choices[0].text, 'Hello world');
+      assert.equal(body.choices[0].index, 0);
+      assert.equal(body.choices[0].finish_reason, 'stop');
+      assert.ok(body.id.startsWith('cmpl_'));
+      assert.equal(body.usage.prompt_tokens, 5);
+      assert.equal(body.usage.completion_tokens, 3);
+      assert.equal(body.usage.total_tokens, 8);
+    } finally {
+      restore();
+    }
+  });
+
+  test('joins array prompt into a single string', async () => {
+    let sentBody;
+    const origFetch = global.fetch;
+    global.fetch = async (_url, opts) => {
+      sentBody = JSON.parse(opts.body);
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }),
+      };
+    };
+    try {
+      const req = mockReq({ prompt: ['part one', 'part two'] });
+      const res = mockRes();
+      await handleOpenAICompletions(req, res);
+      assert.equal(sentBody.messages[0].content, 'part one\npart two');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  test('id has cmpl_ prefix and created is a unix timestamp', async () => {
+    const restore = stubFetch({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    });
+    try {
+      const req = mockReq({ prompt: 'test' });
+      const res = mockRes();
+      const before = Math.floor(Date.now() / 1000);
+      await handleOpenAICompletions(req, res);
+      const after = Math.floor(Date.now() / 1000);
+      const body = JSON.parse(res._body);
+      assert.match(body.id, /^cmpl_/);
+      assert.ok(body.created >= before && body.created <= after + 1);
+    } finally {
+      restore();
+    }
+  });
+
+  test('returns upstream status when Ollama returns a non-ok response', async () => {
+    // Use a non-ok but non-5xx response so fetchWithRetry does not retry
+    // (retrying would add multi-second backoff delays to the test suite).
+    const origFetch = global.fetch;
+    global.fetch = async () => ({
+      ok: false, status: 400,
+      text: async () => JSON.stringify({ error: 'bad model' }),
+    });
+    try {
+      const req = mockReq({ prompt: 'hi' });
+      const res = mockRes();
+      await handleOpenAICompletions(req, res);
+      assert.equal(res._status, 400);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+});
