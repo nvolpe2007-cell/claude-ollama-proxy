@@ -1163,3 +1163,398 @@ describe('trackActiveLlmRequest', () => {
     assert.equal(_metrics.activeLlmRequests, before, 'both decremented after second finish');
   });
 });
+
+// ── handleMessages ────────────────────────────────────────────────────────────
+// Unit tests for the core Anthropic-format handler using mock req/res/fetch.
+// Covers non-streaming and streaming paths without needing a real Ollama server.
+
+describe('handleMessages', () => {
+  const { handleMessages } = require('./proxy');
+
+  function mockReq(body) {
+    return {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST',
+      url: '/v1/messages',
+      [Symbol.asyncIterator]: async function* () { yield JSON.stringify(body); },
+    };
+  }
+
+  function mockRes() {
+    const res = {
+      headersSent: false,
+      writableEnded: false,
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(status) { this._status = status; this.headersSent = true; },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; },
+      on() {},
+    };
+    return res;
+  }
+
+  // Stubs global.fetch for a single non-streaming Ollama response.
+  // Returns a restore function. Uses status 200 + ok:true so fetchWithRetry
+  // returns immediately without any backoff delays.
+  function stubFetch(chatResponse) {
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      json: async () => chatResponse,
+      text: async () => JSON.stringify(chatResponse),
+      body: null,
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  // Stubs global.fetch to return a non-ok 4xx response so the proxy returns 502.
+  // 4xx is below the 500 threshold so fetchWithRetry returns immediately (no retry delay).
+  function stubFetchError(status = 400, text = 'bad request') {
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: false, status,
+      text: async () => text,
+      body: null,
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  // Stubs global.fetch to return a streaming SSE response.
+  // Each element of sseLines is emitted as a separate chunk followed by \n.
+  function stubStreamFetch(sseLines) {
+    const enc = new TextEncoder();
+    let pos = 0;
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      body: {
+        getReader() {
+          return {
+            async read() {
+              if (pos >= sseLines.length) return { done: true, value: undefined };
+              return { done: false, value: enc.encode(sseLines[pos++] + '\n') };
+            },
+            releaseLock() {},
+          };
+        },
+      },
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  // Parses a raw SSE body string into [{event, data}] objects.
+  function parseSse(body) {
+    const events = [];
+    let event = null;
+    for (const line of body.split('\n')) {
+      if (line.startsWith('event: ')) { event = line.slice(7).trim(); }
+      else if (line.startsWith('data: ')) {
+        try { events.push({ event, data: JSON.parse(line.slice(6)) }); } catch {}
+        event = null;
+      }
+    }
+    return events;
+  }
+
+  // ── Input validation ─────────────────────────────────────────────────────────
+
+  test('400 on invalid JSON body', async () => {
+    const req = {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST', url: '/v1/messages',
+      [Symbol.asyncIterator]: async function* () { yield 'NOT JSON'; },
+    };
+    const res = mockRes();
+    await handleMessages(req, res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('400 when messages field is absent', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({ model: 'llama3' }), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /messages/);
+  });
+
+  test('400 when messages is not an array', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({ messages: 'not-an-array' }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  // ── Non-streaming path ───────────────────────────────────────────────────────
+
+  test('non-streaming: returns correct Anthropic message envelope', async () => {
+    const restore = stubFetch({
+      choices: [{ message: { content: 'Hello!' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    });
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({
+        model: 'claude-3-haiku',
+        messages: [{ role: 'user', content: 'Hello' }],
+        max_tokens: 100, stream: false,
+      }), res);
+      assert.equal(res._status, 200);
+      const body = JSON.parse(res._body);
+      assert.equal(body.type, 'message');
+      assert.equal(body.role, 'assistant');
+      assert.ok(body.id.startsWith('msg_'), `id should start with msg_, got: ${body.id}`);
+      assert.ok(Array.isArray(body.content));
+      assert.equal(body.content[0].type, 'text');
+      assert.equal(body.content[0].text, 'Hello!');
+      assert.equal(body.stop_reason, 'end_turn');
+    } finally { restore(); }
+  });
+
+  test('non-streaming: usage includes prompt-caching compat fields', async () => {
+    const restore = stubFetch({
+      choices: [{ message: { content: 'Hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 5, completion_tokens: 3 },
+    });
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Hi' }], stream: false }), res);
+      const body = JSON.parse(res._body);
+      assert.equal(body.usage.input_tokens, 5);
+      assert.equal(body.usage.output_tokens, 3);
+      assert.equal(body.usage.cache_creation_input_tokens, 0);
+      assert.equal(body.usage.cache_read_input_tokens, 0);
+    } finally { restore(); }
+  });
+
+  test('non-streaming: tool_calls finish_reason maps to tool_use stop_reason', async () => {
+    const restore = stubFetch({
+      choices: [{
+        message: {
+          content: null,
+          tool_calls: [{
+            id: 'call_1', type: 'function',
+            function: { name: 'get_weather', arguments: '{"city":"London"}' },
+          }],
+        },
+        finish_reason: 'tool_calls',
+      }],
+      usage: { prompt_tokens: 20, completion_tokens: 8 },
+    });
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Weather?' }], stream: false }), res);
+      const body = JSON.parse(res._body);
+      assert.equal(body.stop_reason, 'tool_use');
+      const tu = body.content.find(c => c.type === 'tool_use');
+      assert.ok(tu, 'should have tool_use block');
+      assert.equal(tu.name, 'get_weather');
+      assert.deepEqual(tu.input, { city: 'London' });
+      assert.ok(tu.id, 'tool_use block should have an id');
+    } finally { restore(); }
+  });
+
+  test('non-streaming: length finish_reason maps to max_tokens stop_reason', async () => {
+    const restore = stubFetch({
+      choices: [{ message: { content: 'Truncated…' }, finish_reason: 'length' }],
+      usage: { prompt_tokens: 10, completion_tokens: 100 },
+    });
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Tell me everything' }], stream: false }), res);
+      assert.equal(JSON.parse(res._body).stop_reason, 'max_tokens');
+    } finally { restore(); }
+  });
+
+  test('non-streaming: empty choices array returns 502', async () => {
+    const restore = stubFetch({ choices: [], usage: {} });
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Hi' }], stream: false }), res);
+      assert.equal(res._status, 502);
+      assert.equal(JSON.parse(res._body).error.type, 'ollama_error');
+    } finally { restore(); }
+  });
+
+  test('non-streaming: Ollama 4xx proxied as 502', async () => {
+    const restore = stubFetchError(404, 'model not found');
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Hi' }], stream: false }), res);
+      assert.equal(res._status, 502);
+    } finally { restore(); }
+  });
+
+  test('non-streaming: <think> tags extracted into thinking content block', async () => {
+    const restore = stubFetch({
+      choices: [{
+        message: { content: '<think>my reasoning</think>my answer' },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 15, completion_tokens: 10 },
+    });
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Think hard' }], stream: false }), res);
+      const body = JSON.parse(res._body);
+      const thinking = body.content.find(c => c.type === 'thinking');
+      const text     = body.content.find(c => c.type === 'text');
+      assert.ok(thinking, 'should have thinking block');
+      assert.equal(thinking.thinking, 'my reasoning');
+      assert.ok(thinking.signature, 'thinking block should carry a signature');
+      assert.ok(text, 'should have text block');
+      assert.equal(text.text, 'my answer');
+    } finally { restore(); }
+  });
+
+  // ── Streaming path ───────────────────────────────────────────────────────────
+
+  test('streaming: emits required Anthropic SSE event types', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"content":"!"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Hello' }], stream: true }), res);
+      assert.equal(res._status, 200);
+      const events = parseSse(res._body);
+      const types  = events.map(e => e.event);
+      for (const t of ['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop']) {
+        assert.ok(types.includes(t), `missing SSE event type: ${t}`);
+      }
+      // Correct text assembled from deltas
+      const text = events
+        .filter(e => e.event === 'content_block_delta' && e.data.delta?.type === 'text_delta')
+        .map(e => e.data.delta.text).join('');
+      assert.equal(text, 'Hi!');
+    } finally { restore(); }
+  });
+
+  test('streaming: message_start includes prompt-caching compat usage fields', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'ping' }], stream: true }), res);
+      const start = parseSse(res._body).find(e => e.event === 'message_start');
+      assert.equal(start.data.message.usage.cache_creation_input_tokens, 0);
+      assert.equal(start.data.message.usage.cache_read_input_tokens, 0);
+    } finally { restore(); }
+  });
+
+  test('streaming: message_delta carries stop_reason and correct token counts', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":4}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'x' }], stream: true }), res);
+      const delta = parseSse(res._body).find(e => e.event === 'message_delta');
+      assert.equal(delta.data.delta.stop_reason, 'end_turn');
+      assert.equal(delta.data.usage.input_tokens, 7);
+      assert.equal(delta.data.usage.output_tokens, 4);
+      assert.equal(delta.data.usage.cache_creation_input_tokens, 0);
+      assert.equal(delta.data.usage.cache_read_input_tokens, 0);
+    } finally { restore(); }
+  });
+
+  test('streaming: message_stop is the final emitted event', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'ok' }], stream: true }), res);
+      const events = parseSse(res._body);
+      assert.equal(events[events.length - 1].event, 'message_stop');
+    } finally { restore(); }
+  });
+
+  test('streaming: tool_use block produces content_block_start with correct name and id', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_xyz","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\":\\"London\\"}"}}]},"finish_reason":"tool_calls"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":10}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Weather?' }], stream: true }), res);
+      const events = parseSse(res._body);
+
+      // tool_use content_block_start
+      const toolStart = events.find(e =>
+        e.event === 'content_block_start' && e.data.content_block?.type === 'tool_use'
+      );
+      assert.ok(toolStart, 'should have tool_use content_block_start');
+      assert.equal(toolStart.data.content_block.name, 'get_weather');
+      assert.ok(toolStart.data.content_block.id, 'tool_use block should have an id');
+
+      // input_json_delta events reconstruct the full argument JSON
+      const jsonDeltas = events.filter(e =>
+        e.event === 'content_block_delta' && e.data.delta?.type === 'input_json_delta'
+      );
+      assert.ok(jsonDeltas.length > 0, 'should have input_json_delta events');
+      const fullArgs = jsonDeltas.map(e => e.data.delta.partial_json).join('');
+      assert.deepEqual(JSON.parse(fullArgs), { city: 'London' });
+
+      // stop_reason must be tool_use
+      const delta = events.find(e => e.event === 'message_delta');
+      assert.equal(delta.data.delta.stop_reason, 'tool_use');
+    } finally { restore(); }
+  });
+
+  test('streaming: thinking tags produce thinking content block with signature_delta', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"<think>"},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"content":"my reasoning"},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"content":"</think>answer"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Think' }], stream: true }), res);
+      const events = parseSse(res._body);
+
+      const thinkStart = events.find(e =>
+        e.event === 'content_block_start' && e.data.content_block?.type === 'thinking'
+      );
+      assert.ok(thinkStart, 'should have thinking content_block_start');
+
+      const sigDelta = events.find(e =>
+        e.event === 'content_block_delta' && e.data.delta?.type === 'signature_delta'
+      );
+      assert.ok(sigDelta, 'should have signature_delta');
+      assert.ok(sigDelta.data.delta.signature, 'signature must be non-empty');
+
+      const textStart = events.find(e =>
+        e.event === 'content_block_start' && e.data.content_block?.type === 'text'
+      );
+      assert.ok(textStart, 'should have text content_block_start after thinking');
+
+      // thinking block index must be lower than text block index
+      assert.ok(thinkStart.data.index < textStart.data.index,
+        'thinking block must precede text block in index ordering');
+    } finally { restore(); }
+  });
+});

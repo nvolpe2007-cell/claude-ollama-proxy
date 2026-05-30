@@ -2280,6 +2280,7 @@ module.exports = {
   getOllamaHost,
   OLLAMA_HOSTS,
   requestHandler,
+  handleMessages,
   handleOpenAIChat,
   handleOpenAICompletions,
   handleEmbeddings,
