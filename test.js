@@ -21,6 +21,9 @@ const {
   checkRateLimit,
   getClientIp,
   _rateLimitWindows,
+  checkConcurrency,
+  trackActiveLlmRequest,
+  _metrics,
 } = require('./proxy');
 
 // ── resolveModel ──────────────────────────────────────────────────────────────
@@ -1088,5 +1091,75 @@ describe('handleOpenAICompletions', () => {
     } finally {
       global.fetch = origFetch;
     }
+  });
+});
+
+// ── checkConcurrency / trackActiveLlmRequest ──────────────────────────────────
+
+// Minimal EventEmitter-based mock for the res object used by concurrency helpers.
+function mockConcurrRes() {
+  const { EventEmitter } = require('events');
+  const r = new EventEmitter();
+  r.headersSent = false;
+  r._status = null;
+  r._body = null;
+  r.writeHead = (status) => { r._status = status; r.headersSent = true; };
+  r.end = (body) => { r._body = body; r.emit('finish'); };
+  r.setHeader = () => {};
+  r.getHeader = () => undefined;
+  return r;
+}
+
+describe('checkConcurrency', () => {
+  test('returns true without writing a response when PROXY_MAX_CONCURRENCY is unset', () => {
+    // In the test environment PROXY_MAX_CONCURRENCY is not set, so the guard is a no-op.
+    const res = mockConcurrRes();
+    const result = checkConcurrency(res);
+    assert.equal(result, true);
+    assert.equal(res._status, null, 'should not write any response when limit is unset');
+  });
+});
+
+describe('trackActiveLlmRequest', () => {
+  test('decrements activeLlmRequests when finish fires', () => {
+    const before = _metrics.activeLlmRequests;
+    _metrics.activeLlmRequests++;
+    const res = mockConcurrRes();
+    trackActiveLlmRequest(res);
+    assert.equal(_metrics.activeLlmRequests, before + 1, 'still elevated before finish');
+    res.emit('finish');
+    assert.equal(_metrics.activeLlmRequests, before, 'decremented after finish');
+  });
+
+  test('decrements activeLlmRequests when close fires (dropped connection)', () => {
+    const before = _metrics.activeLlmRequests;
+    _metrics.activeLlmRequests++;
+    const res = mockConcurrRes();
+    trackActiveLlmRequest(res);
+    res.emit('close');
+    assert.equal(_metrics.activeLlmRequests, before, 'decremented after close');
+  });
+
+  test('decrements exactly once even when both finish and close fire', () => {
+    const before = _metrics.activeLlmRequests;
+    _metrics.activeLlmRequests++;
+    const res = mockConcurrRes();
+    trackActiveLlmRequest(res);
+    res.emit('finish');
+    res.emit('close');
+    assert.equal(_metrics.activeLlmRequests, before, 'decremented exactly once');
+  });
+
+  test('multiple independent trackActiveLlmRequest calls each decrement their own count', () => {
+    const before = _metrics.activeLlmRequests;
+    _metrics.activeLlmRequests += 2;
+    const res1 = mockConcurrRes();
+    const res2 = mockConcurrRes();
+    trackActiveLlmRequest(res1);
+    trackActiveLlmRequest(res2);
+    res1.emit('finish');
+    assert.equal(_metrics.activeLlmRequests, before + 1, 'only one decremented after first finish');
+    res2.emit('finish');
+    assert.equal(_metrics.activeLlmRequests, before, 'both decremented after second finish');
   });
 });

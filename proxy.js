@@ -101,6 +101,13 @@ const PROXY_SYSTEM_PROMPT = process.env.PROXY_SYSTEM_PROMPT || null;
 // rejected with 413 before the body is read, protecting against runaway base64-image payloads.
 // Default is no limit. Example: PROXY_MAX_BODY_SIZE=10485760 for 10 MB.
 const PROXY_WARMUP       = process.env.PROXY_WARMUP === 'true';
+// Optional limit on simultaneous in-flight Ollama inference requests.
+// When reached, new requests get 503 overloaded_error + Retry-After: 1 instead of
+// competing for GPU VRAM and causing OOM errors or severe latency spikes.
+// Applies to POST /v1/messages, /v1/chat/completions, and /v1/completions.
+// Embeddings and token-counting are not gated (they use separate lightweight endpoints).
+const PROXY_MAX_CONCURRENCY = process.env.PROXY_MAX_CONCURRENCY
+  ? Number(process.env.PROXY_MAX_CONCURRENCY) : null;
 const PROXY_MAX_BODY_SIZE = (() => {
   if (!process.env.PROXY_MAX_BODY_SIZE) return null;
   const n = Number(process.env.PROXY_MAX_BODY_SIZE);
@@ -185,8 +192,9 @@ const _metrics = {
   latencies:    [],   // last 1000 durations (ms) for percentile calculations
   tokensIn:     0,
   tokensOut:    0,
-  activeStreams: 0,
-  errors:       0,
+  activeStreams:      0,
+  activeLlmRequests: 0,  // in-flight inference requests (gated by PROXY_MAX_CONCURRENCY)
+  errors:            0,
   modelsUsed:   {},   // 'model-name' → { requests, tokensIn, tokensOut }
 };
 
@@ -534,6 +542,36 @@ function checkRateLimit(key, limit, req, res) {
     return false;
   }
   return true;
+}
+
+// Returns true and records the in-flight request if below PROXY_MAX_CONCURRENCY;
+// writes a 503 overloaded_error and returns false when the limit is reached.
+// Node.js is single-threaded, so the check + increment before the first await is race-free.
+function checkConcurrency(res) {
+  if (!PROXY_MAX_CONCURRENCY) return true;
+  if (_metrics.activeLlmRequests >= PROXY_MAX_CONCURRENCY) {
+    res.setHeader('retry-after', '1');
+    if (!res.headersSent) res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'overloaded_error',
+        message: `Proxy at max concurrency (${PROXY_MAX_CONCURRENCY} in-flight requests). Retry after 1s.`,
+      },
+    }));
+    return false;
+  }
+  _metrics.activeLlmRequests++;
+  return true;
+}
+
+// Schedules exactly one decrement of activeLlmRequests when the response ends,
+// covering both a normal finish and a forcibly-dropped connection.
+function trackActiveLlmRequest(res) {
+  let done = false;
+  const dec = () => { if (!done) { done = true; _metrics.activeLlmRequests--; } };
+  res.once('finish', dec);
+  res.once('close', dec);
 }
 
 // Retry fetch on transient Ollama 5xx errors or network failures.
@@ -1297,6 +1335,8 @@ async function handleMetrics(req, res) {
     tokens_input_total:  _metrics.tokensIn,
     tokens_output_total: _metrics.tokensOut,
     active_streams:      _metrics.activeStreams,
+    active_llm_requests: _metrics.activeLlmRequests,
+    concurrency_limit:   PROXY_MAX_CONCURRENCY,
     errors_total:        _metrics.errors,
     models_usage:        modelsUsage,
   }, null, 2));
@@ -1355,6 +1395,18 @@ async function handleMetricsPrometheus(req, res) {
   out.push('# TYPE proxy_active_streams gauge');
   out.push(`proxy_active_streams ${_metrics.activeStreams}`);
   out.push('');
+
+  out.push('# HELP proxy_active_llm_requests Current number of in-flight LLM inference requests');
+  out.push('# TYPE proxy_active_llm_requests gauge');
+  out.push(`proxy_active_llm_requests ${_metrics.activeLlmRequests}`);
+  out.push('');
+
+  if (PROXY_MAX_CONCURRENCY) {
+    out.push('# HELP proxy_concurrency_limit Configured max concurrent in-flight LLM requests');
+    out.push('# TYPE proxy_concurrency_limit gauge');
+    out.push(`proxy_concurrency_limit ${PROXY_MAX_CONCURRENCY}`);
+    out.push('');
+  }
 
   out.push('# HELP proxy_model_requests_total Total completed LLM requests per model');
   out.push('# TYPE proxy_model_requests_total counter');
@@ -1419,6 +1471,7 @@ function handleDashboard(req, res) {
     maxBodySize:        PROXY_MAX_BODY_SIZE,
     systemPrompt:       PROXY_SYSTEM_PROMPT ? PROXY_SYSTEM_PROMPT.slice(0, 120) + (PROXY_SYSTEM_PROMPT.length > 120 ? '…' : '') : null,
     ollamaOptions:      Object.keys(OLLAMA_OPTIONS).length > 0 ? JSON.stringify(OLLAMA_OPTIONS) : null,
+    maxConcurrency:     PROXY_MAX_CONCURRENCY,
   });
 
   const html = `<!DOCTYPE html>
@@ -1483,6 +1536,7 @@ async function refresh(){
     g+=row('Error','<span class="err">'+h.ollamaError+'</span>');
   }
   g+=row('Active streams','<span class="'+(m&&m.active_streams>0?'ok':'val')+'">'+(m?m.active_streams:0)+'</span>');
+  if(C.maxConcurrency){const cur=m?m.active_llm_requests:0;const cls=cur>=C.maxConcurrency?'warn':cur>0?'ok':'val';g+=row('In-flight requests','<span class="'+cls+'">'+cur+'/'+C.maxConcurrency+'</span>');}
   g+=row('Uptime',m?fmt(m.uptime_seconds)+' s':'—');
   g+='</div>';
 
@@ -1501,6 +1555,7 @@ async function refresh(){
   if(C.timeout)g+=row('Timeout',fmt(C.timeout)+' ms');
   if(C.rateLimitRpm)g+=row('Rate limit (global)',fmt(C.rateLimitRpm)+' req/min');
   if(C.rateLimitPerIpRpm)g+=row('Rate limit (per-IP)',fmt(C.rateLimitPerIpRpm)+' req/min');
+  if(C.maxConcurrency)g+=row('Max concurrency',fmt(C.maxConcurrency)+' req');
   if(C.maxBodySize)g+=row('Max body',fmt(C.maxBodySize)+' B');
   g+=row('Log format',C.logFormat);
   if(C.logLevel==='debug')g+=row('Log level','<span class="warn">debug (verbose)</span>');
@@ -2043,16 +2098,22 @@ async function requestHandler(req, res) {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (!checkConcurrency(res)) return;
+      trackActiveLlmRequest(res);
       await handleMessages(req, res);
     } else if (req.method === 'POST' && path === '/v1/chat/completions') {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (!checkConcurrency(res)) return;
+      trackActiveLlmRequest(res);
       await handleOpenAIChat(req, res);
     } else if (req.method === 'POST' && path === '/v1/completions') {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (!checkConcurrency(res)) return;
+      trackActiveLlmRequest(res);
       await handleOpenAICompletions(req, res);
     } else if (req.method === 'POST' && path === '/v1/messages/count_tokens') {
       if (!checkAuth(req, res)) return;
@@ -2150,6 +2211,7 @@ if (require.main === module) {
     const rlGlobal = RATE_LIMIT_RPM        ? `global ${RATE_LIMIT_RPM} req/min`    : 'no global limit';
     const rlIp     = RATE_LIMIT_PER_IP_RPM ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min` : 'no per-IP limit';
     console.log(`  RateLimit: ${rlGlobal}; ${rlIp} (set RATE_LIMIT_RPM / RATE_LIMIT_PER_IP_RPM)`);
+    console.log(`  Concurrency: ${PROXY_MAX_CONCURRENCY ? `max ${PROXY_MAX_CONCURRENCY} simultaneous LLM requests (503 when exceeded)` : 'unlimited (set PROXY_MAX_CONCURRENCY to prevent GPU OOM)'}`);
     if (Object.keys(OLLAMA_OPTIONS).length > 0)
       console.log(`  Options: OLLAMA_OPTIONS=${JSON.stringify(OLLAMA_OPTIONS)}`);
     console.log('');
@@ -2226,4 +2288,8 @@ module.exports = {
   checkRateLimit,
   getClientIp,
   _rateLimitWindows,
+  // Concurrency-limit internals exported for unit testing only.
+  checkConcurrency,
+  trackActiveLlmRequest,
+  _metrics,
 };
