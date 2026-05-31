@@ -816,17 +816,20 @@ async function handleMessages(req, res) {
   });
 
   let textBlockOpen = false;
-  let textIndex = 0;           // anthropic block index of the text block (captured on first open)
-  const toolBlocks = {};       // openai tool index → { anthropicIndex, id, name, args }
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let stopReason = null;       // set on finish_reason; message_delta deferred until after loop
+  let textBlockIdx  = -1;      // anthropic index of the currently open text block
+  const toolBlocks  = {};      // openai tool index → { anthropicIndex, id, name, args }
+  let inputTokens   = 0;
+  let outputTokens  = 0;
+  let stopReason    = null;    // set on finish_reason; message_delta deferred until after loop
 
   // State machine for routing <think>…</think> content to Anthropic thinking blocks.
-  // Models like DeepSeek-R1 and Qwen3-thinking prefix their response with a <think> block.
-  let thinkState = 'initial';  // 'initial' | 'thinking' | 'text'
-  let thinkBuf   = '';         // chars pending routing (straddle tag boundaries)
-  let thinkCount = 0;          // thinking blocks fully closed so far
+  // Supports interleaved thinking: multiple alternating think/text blocks in one response
+  // (Qwen3-thinking, DeepSeek-R1, and models using anthropic-beta: interleaved-thinking-*).
+  let thinkState   = 'initial'; // 'initial' | 'thinking' | 'text'
+  let thinkBuf     = '';        // chars pending routing (straddle tag boundaries)
+  let thinkCount   = 0;         // thinking blocks fully closed so far
+  let thinkIdx     = 0;         // anthropic index of the currently open thinking block
+  let nextBlockIdx = 0;         // monotonic block-index counter shared by think/text/tool blocks
 
   function routeThinkChunk(flush) {
     for (;;) {
@@ -835,8 +838,9 @@ async function handleMessages(req, res) {
       if (thinkState === 'initial') {
         const tag = '<think>';
         if (thinkBuf.startsWith(tag)) {
+          thinkIdx = nextBlockIdx++;
           sendSSE(res, 'content_block_start', {
-            type: 'content_block_start', index: thinkCount,
+            type: 'content_block_start', index: thinkIdx,
             content_block: { type: 'thinking', thinking: '' }
           });
           sendSSE(res, 'ping', { type: 'ping' });
@@ -856,14 +860,14 @@ async function handleMessages(req, res) {
         const ei = thinkBuf.indexOf(etag);
         if (ei !== -1) {
           if (ei > 0) sendSSE(res, 'content_block_delta', {
-            type: 'content_block_delta', index: thinkCount,
+            type: 'content_block_delta', index: thinkIdx,
             delta: { type: 'thinking_delta', thinking: thinkBuf.slice(0, ei) }
           });
           sendSSE(res, 'content_block_delta', {
-            type: 'content_block_delta', index: thinkCount,
+            type: 'content_block_delta', index: thinkIdx,
             delta: { type: 'signature_delta', signature: 'ollama-proxy-extracted' }
           });
-          sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkCount });
+          sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkIdx });
           thinkCount++;
           thinkBuf = thinkBuf.slice(ei + etag.length);
           thinkState = 'initial';
@@ -876,7 +880,7 @@ async function handleMessages(req, res) {
           : (lt > 0 ? lt : Math.max(0, thinkBuf.length - etag.length));
         if (safe > 0) {
           sendSSE(res, 'content_block_delta', {
-            type: 'content_block_delta', index: thinkCount,
+            type: 'content_block_delta', index: thinkIdx,
             delta: { type: 'thinking_delta', thinking: thinkBuf.slice(0, safe) }
           });
           thinkBuf = thinkBuf.slice(safe);
@@ -885,17 +889,76 @@ async function handleMessages(req, res) {
       }
 
       // thinkState === 'text'
+      // Check for a new <think> tag — supports interleaved thinking/text blocks
+      // (anthropic-beta: interleaved-thinking-*, Qwen3-thinking, DeepSeek-R1).
+      const tag = '<think>';
+      const ti = thinkBuf.indexOf(tag);
+      if (ti === 0) {
+        // Buffer starts with <think>: close open text block and switch back to 'initial'.
+        if (textBlockOpen) {
+          sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
+          textBlockOpen = false;
+        }
+        thinkState = 'initial';
+        continue;
+      }
+      if (ti > 0) {
+        // Text before <think>: emit it, close text block, then let 'initial' open the think block.
+        if (!textBlockOpen) {
+          textBlockIdx = nextBlockIdx++;
+          sendSSE(res, 'content_block_start', {
+            type: 'content_block_start', index: textBlockIdx,
+            content_block: { type: 'text', text: '' }
+          });
+          sendSSE(res, 'ping', { type: 'ping' });
+          textBlockOpen = true;
+        }
+        sendSSE(res, 'content_block_delta', {
+          type: 'content_block_delta', index: textBlockIdx,
+          delta: { type: 'text_delta', text: thinkBuf.slice(0, ti) }
+        });
+        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
+        textBlockOpen = false;
+        thinkBuf = thinkBuf.slice(ti);
+        thinkState = 'initial';
+        continue;
+      }
+      // No '<think>' in buffer. Hold back a possible partial tag at the end (unless flushing).
+      if (!flush) {
+        const lt = thinkBuf.lastIndexOf('<');
+        if (lt >= 0 && tag.startsWith(thinkBuf.slice(lt))) {
+          const safe = thinkBuf.slice(0, lt);
+          if (safe) {
+            if (!textBlockOpen) {
+              textBlockIdx = nextBlockIdx++;
+              sendSSE(res, 'content_block_start', {
+                type: 'content_block_start', index: textBlockIdx,
+                content_block: { type: 'text', text: '' }
+              });
+              sendSSE(res, 'ping', { type: 'ping' });
+              textBlockOpen = true;
+            }
+            sendSSE(res, 'content_block_delta', {
+              type: 'content_block_delta', index: textBlockIdx,
+              delta: { type: 'text_delta', text: safe }
+            });
+          }
+          thinkBuf = thinkBuf.slice(lt);
+          break;
+        }
+      }
+      // No think tags — emit everything as a text delta.
       if (!textBlockOpen) {
-        textIndex = thinkCount;  // thinking blocks, if any, occupy lower indices
+        textBlockIdx = nextBlockIdx++;
         sendSSE(res, 'content_block_start', {
-          type: 'content_block_start', index: textIndex,
+          type: 'content_block_start', index: textBlockIdx,
           content_block: { type: 'text', text: '' }
         });
         sendSSE(res, 'ping', { type: 'ping' });
         textBlockOpen = true;
       }
       sendSSE(res, 'content_block_delta', {
-        type: 'content_block_delta', index: textIndex,
+        type: 'content_block_delta', index: textBlockIdx,
         delta: { type: 'text_delta', text: thinkBuf }
       });
       thinkBuf = '';
@@ -947,7 +1010,7 @@ async function handleMessages(req, res) {
           for (const tc of delta.tool_calls) {
             const oi = tc.index; // openai index
             if (!toolBlocks[oi]) {
-              const ai = thinkCount + (textBlockOpen ? 1 : 0) + oi;
+              const ai = nextBlockIdx + oi;
               toolBlocks[oi] = {
                 anthropicIndex: ai,
                 id: tc.id || `toolu_${oi}`,
@@ -991,14 +1054,14 @@ async function handleMessages(req, res) {
           routeThinkChunk(true);
           if (thinkState === 'thinking') {
             sendSSE(res, 'content_block_delta', {
-              type: 'content_block_delta', index: thinkCount,
+              type: 'content_block_delta', index: thinkIdx,
               delta: { type: 'signature_delta', signature: 'ollama-proxy-extracted' }
             });
-            sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkCount });
+            sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkIdx });
             thinkCount++;
           }
           if (textBlockOpen) {
-            sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textIndex });
+            sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
           }
           for (const tb of Object.values(toolBlocks)) {
             sendSSE(res, 'content_block_stop', {
@@ -1015,14 +1078,14 @@ async function handleMessages(req, res) {
       routeThinkChunk(true);
       if (thinkState === 'thinking') {
         sendSSE(res, 'content_block_delta', {
-          type: 'content_block_delta', index: thinkCount,
+          type: 'content_block_delta', index: thinkIdx,
           delta: { type: 'signature_delta', signature: 'ollama-proxy-extracted' }
         });
-        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkCount });
+        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkIdx });
         thinkCount++;
       }
       if (textBlockOpen) {
-        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textIndex });
+        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
       }
       for (const tb of Object.values(toolBlocks)) {
         sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: tb.anthropicIndex });

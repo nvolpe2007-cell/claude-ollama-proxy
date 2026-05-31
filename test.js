@@ -1557,4 +1557,51 @@ describe('handleMessages', () => {
         'thinking block must precede text block in index ordering');
     } finally { restore(); }
   });
+
+  test('streaming: interleaved think/text blocks get correct sequential indices', async () => {
+    // Simulates a model that outputs: <think>A</think>text1<think>B</think>text2
+    // Each block should get a unique, monotonically increasing Anthropic index.
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"<think>A</think>mid<think>B</think>end"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":10}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'go' }], stream: true }), res);
+      const events = parseSse(res._body);
+
+      const blockStarts = events.filter(e => e.event === 'content_block_start');
+      // Expect: thinking[0], text[1], thinking[2], text[3]
+      assert.equal(blockStarts.length, 4, 'should open exactly 4 content blocks');
+
+      const [b0, b1, b2, b3] = blockStarts;
+      assert.equal(b0.data.content_block.type, 'thinking', 'block 0 should be thinking');
+      assert.equal(b0.data.index, 0, 'block 0 index = 0');
+      assert.equal(b1.data.content_block.type, 'text',    'block 1 should be text');
+      assert.equal(b1.data.index, 1, 'block 1 index = 1');
+      assert.equal(b2.data.content_block.type, 'thinking', 'block 2 should be thinking');
+      assert.equal(b2.data.index, 2, 'block 2 index = 2');
+      assert.equal(b3.data.content_block.type, 'text',    'block 3 should be text');
+      assert.equal(b3.data.index, 3, 'block 3 index = 3');
+
+      // Each block should have a matching stop event.
+      const blockStops = events.filter(e => e.event === 'content_block_stop');
+      assert.equal(blockStops.length, 4, 'should have 4 content_block_stop events');
+      assert.deepEqual(
+        blockStops.map(e => e.data.index).sort((a, b) => a - b),
+        [0, 1, 2, 3],
+        'stop indices must match start indices'
+      );
+
+      // Text content of each text block should be "mid" and "end".
+      const textDeltas = events
+        .filter(e => e.event === 'content_block_delta' && e.data.delta?.type === 'text_delta')
+        .map(e => ({ index: e.data.index, text: e.data.delta.text }));
+      const mid = textDeltas.filter(d => d.index === 1).map(d => d.text).join('');
+      const end = textDeltas.filter(d => d.index === 3).map(d => d.text).join('');
+      assert.equal(mid, 'mid', 'text block 1 should contain "mid"');
+      assert.equal(end, 'end', 'text block 3 should contain "end"');
+    } finally { restore(); }
+  });
 });
