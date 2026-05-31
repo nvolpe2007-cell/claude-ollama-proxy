@@ -108,6 +108,15 @@ const PROXY_WARMUP       = process.env.PROXY_WARMUP === 'true';
 // Embeddings and token-counting are not gated (they use separate lightweight endpoints).
 const PROXY_MAX_CONCURRENCY = process.env.PROXY_MAX_CONCURRENCY
   ? Number(process.env.PROXY_MAX_CONCURRENCY) : null;
+// Optional queue for requests that arrive when all concurrency slots are taken.
+// PROXY_MAX_QUEUE_SIZE  — max number of requests that may wait in the queue; when full
+//                         new arrivals still get 503 immediately. Default: no queuing (503 always).
+// PROXY_MAX_QUEUE_TIMEOUT — ms a queued request waits before giving up with 503.
+//                           Default: no timeout (waits indefinitely until a slot opens).
+const PROXY_MAX_QUEUE_SIZE    = process.env.PROXY_MAX_QUEUE_SIZE
+  ? Number(process.env.PROXY_MAX_QUEUE_SIZE) : null;
+const PROXY_MAX_QUEUE_TIMEOUT = process.env.PROXY_MAX_QUEUE_TIMEOUT
+  ? Number(process.env.PROXY_MAX_QUEUE_TIMEOUT) : null;
 const PROXY_MAX_BODY_SIZE = (() => {
   if (!process.env.PROXY_MAX_BODY_SIZE) return null;
   const n = Number(process.env.PROXY_MAX_BODY_SIZE);
@@ -194,9 +203,13 @@ const _metrics = {
   tokensOut:    0,
   activeStreams:      0,
   activeLlmRequests: 0,  // in-flight inference requests (gated by PROXY_MAX_CONCURRENCY)
+  queuedLlmRequests: 0,  // requests waiting for a concurrency slot
   errors:            0,
   modelsUsed:   {},   // 'model-name' → { requests, tokensIn, tokensOut }
 };
+
+// Queue of { onGranted } entries waiting for a concurrency slot.
+const _concurrencyQueue = [];
 
 function recordRequest(method, path, status, ms) {
   const k = `${method} ${path}`;
@@ -544,6 +557,92 @@ function checkRateLimit(key, limit, req, res) {
   return true;
 }
 
+// Transfers a concurrency slot to the first queued waiter, or decrements the in-flight
+// counter if the queue is empty. Called by trackActiveLlmRequest on request completion.
+function releaseLlmSlot() {
+  if (_concurrencyQueue.length > 0) {
+    // Hand the slot directly to the next waiter — activeLlmRequests stays the same.
+    const { onGranted } = _concurrencyQueue.shift();
+    onGranted();
+  } else {
+    _metrics.activeLlmRequests--;
+  }
+}
+
+// Async slot acquisition with optional queuing when at max concurrency.
+// Returns true when the caller has acquired a slot (activeLlmRequests already incremented).
+// Returns false and writes a 503 / queued-too-long response when no slot can be obtained.
+// When PROXY_MAX_CONCURRENCY is unset, always grants immediately and tracks the counter
+// (fixes a prior bug where activeLlmRequests went negative when no limit was configured).
+async function acquireLlmSlot(req, res) {
+  if (!PROXY_MAX_CONCURRENCY) {
+    _metrics.activeLlmRequests++;
+    return true;
+  }
+  if (_metrics.activeLlmRequests < PROXY_MAX_CONCURRENCY) {
+    _metrics.activeLlmRequests++;
+    return true;
+  }
+  // At max concurrency — try to queue if PROXY_MAX_QUEUE_SIZE is set.
+  if (!PROXY_MAX_QUEUE_SIZE || _concurrencyQueue.length >= PROXY_MAX_QUEUE_SIZE) {
+    const queueInfo = PROXY_MAX_QUEUE_SIZE
+      ? `, queue full (${PROXY_MAX_QUEUE_SIZE})`
+      : '';
+    res.setHeader('retry-after', '1');
+    if (!res.headersSent) res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'overloaded_error',
+        message: `Proxy at max concurrency (${PROXY_MAX_CONCURRENCY} in-flight${queueInfo}). Retry after 1s.`,
+      },
+    }));
+    return false;
+  }
+
+  // Queue the request and suspend until a slot is handed to us.
+  _metrics.queuedLlmRequests++;
+  return new Promise(resolve => {
+    let done = false;
+
+    // Called by releaseLlmSlot when our turn arrives. The slot is ours;
+    // activeLlmRequests was NOT decremented (transferred, not freed+re-acquired).
+    const onGranted = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      req.socket.off('close', onDisconnect);
+      _metrics.queuedLlmRequests--;
+      resolve(true);
+    };
+
+    // Called on timeout or client disconnect while waiting in the queue.
+    const onAbort = (reason) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      req.socket.off('close', onDisconnect);
+      const idx = _concurrencyQueue.findIndex(e => e.onGranted === onGranted);
+      if (idx >= 0) _concurrencyQueue.splice(idx, 1);
+      _metrics.queuedLlmRequests--;
+      if (!res.headersSent) {
+        res.setHeader('retry-after', '1');
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: reason } }));
+      }
+      resolve(false);
+    };
+
+    const timer = PROXY_MAX_QUEUE_TIMEOUT
+      ? setTimeout(() => onAbort(`Request queued for ${PROXY_MAX_QUEUE_TIMEOUT}ms with no slot available. Retry after 1s.`), PROXY_MAX_QUEUE_TIMEOUT)
+      : null;
+    const onDisconnect = () => onAbort('Client disconnected while waiting in concurrency queue.');
+
+    req.socket.once('close', onDisconnect);
+    _concurrencyQueue.push({ onGranted });
+  });
+}
+
 // Returns true and records the in-flight request if below PROXY_MAX_CONCURRENCY;
 // writes a 503 overloaded_error and returns false when the limit is reached.
 // Node.js is single-threaded, so the check + increment before the first await is race-free.
@@ -565,11 +664,11 @@ function checkConcurrency(res) {
   return true;
 }
 
-// Schedules exactly one decrement of activeLlmRequests when the response ends,
-// covering both a normal finish and a forcibly-dropped connection.
+// Schedules exactly one slot release when the response ends (normal finish or dropped connection).
+// Calls releaseLlmSlot which either hands the slot to the next queue waiter or decrements the counter.
 function trackActiveLlmRequest(res) {
   let done = false;
-  const dec = () => { if (!done) { done = true; _metrics.activeLlmRequests--; } };
+  const dec = () => { if (!done) { done = true; releaseLlmSlot(); } };
   res.once('finish', dec);
   res.once('close', dec);
 }
@@ -1399,7 +1498,9 @@ async function handleMetrics(req, res) {
     tokens_output_total: _metrics.tokensOut,
     active_streams:      _metrics.activeStreams,
     active_llm_requests: _metrics.activeLlmRequests,
+    queued_llm_requests: _metrics.queuedLlmRequests,
     concurrency_limit:   PROXY_MAX_CONCURRENCY,
+    queue_limit:         PROXY_MAX_QUEUE_SIZE,
     errors_total:        _metrics.errors,
     models_usage:        modelsUsage,
   }, null, 2));
@@ -1464,10 +1565,22 @@ async function handleMetricsPrometheus(req, res) {
   out.push(`proxy_active_llm_requests ${_metrics.activeLlmRequests}`);
   out.push('');
 
+  out.push('# HELP proxy_queued_llm_requests Current number of LLM requests waiting in the concurrency queue');
+  out.push('# TYPE proxy_queued_llm_requests gauge');
+  out.push(`proxy_queued_llm_requests ${_metrics.queuedLlmRequests}`);
+  out.push('');
+
   if (PROXY_MAX_CONCURRENCY) {
     out.push('# HELP proxy_concurrency_limit Configured max concurrent in-flight LLM requests');
     out.push('# TYPE proxy_concurrency_limit gauge');
     out.push(`proxy_concurrency_limit ${PROXY_MAX_CONCURRENCY}`);
+    out.push('');
+  }
+
+  if (PROXY_MAX_QUEUE_SIZE) {
+    out.push('# HELP proxy_queue_limit Configured max number of requests that may wait in the concurrency queue');
+    out.push('# TYPE proxy_queue_limit gauge');
+    out.push(`proxy_queue_limit ${PROXY_MAX_QUEUE_SIZE}`);
     out.push('');
   }
 
@@ -1535,6 +1648,8 @@ function handleDashboard(req, res) {
     systemPrompt:       PROXY_SYSTEM_PROMPT ? PROXY_SYSTEM_PROMPT.slice(0, 120) + (PROXY_SYSTEM_PROMPT.length > 120 ? '…' : '') : null,
     ollamaOptions:      Object.keys(OLLAMA_OPTIONS).length > 0 ? JSON.stringify(OLLAMA_OPTIONS) : null,
     maxConcurrency:     PROXY_MAX_CONCURRENCY,
+    maxQueueSize:       PROXY_MAX_QUEUE_SIZE,
+    queueTimeoutMs:     PROXY_MAX_QUEUE_TIMEOUT,
   });
 
   const html = `<!DOCTYPE html>
@@ -1600,6 +1715,7 @@ async function refresh(){
   }
   g+=row('Active streams','<span class="'+(m&&m.active_streams>0?'ok':'val')+'">'+(m?m.active_streams:0)+'</span>');
   if(C.maxConcurrency){const cur=m?m.active_llm_requests:0;const cls=cur>=C.maxConcurrency?'warn':cur>0?'ok':'val';g+=row('In-flight requests','<span class="'+cls+'">'+cur+'/'+C.maxConcurrency+'</span>');}
+  if(C.maxQueueSize){const q=m?m.queued_llm_requests:0;const cls=q>0?'warn':'val';g+=row('Queued requests','<span class="'+cls+'">'+q+'/'+C.maxQueueSize+'</span>');}
   g+=row('Uptime',m?fmt(m.uptime_seconds)+' s':'—');
   g+='</div>';
 
@@ -1619,6 +1735,7 @@ async function refresh(){
   if(C.rateLimitRpm)g+=row('Rate limit (global)',fmt(C.rateLimitRpm)+' req/min');
   if(C.rateLimitPerIpRpm)g+=row('Rate limit (per-IP)',fmt(C.rateLimitPerIpRpm)+' req/min');
   if(C.maxConcurrency)g+=row('Max concurrency',fmt(C.maxConcurrency)+' req');
+  if(C.maxQueueSize)g+=row('Queue depth',fmt(C.maxQueueSize)+' req'+(C.queueTimeoutMs?', '+fmt(C.queueTimeoutMs)+'ms timeout':''));
   if(C.maxBodySize)g+=row('Max body',fmt(C.maxBodySize)+' B');
   g+=row('Log format',C.logFormat);
   if(C.logLevel==='debug')g+=row('Log level','<span class="warn">debug (verbose)</span>');
@@ -2161,21 +2278,21 @@ async function requestHandler(req, res) {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
-      if (!checkConcurrency(res)) return;
+      if (!await acquireLlmSlot(req, res)) return;
       trackActiveLlmRequest(res);
       await handleMessages(req, res);
     } else if (req.method === 'POST' && path === '/v1/chat/completions') {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
-      if (!checkConcurrency(res)) return;
+      if (!await acquireLlmSlot(req, res)) return;
       trackActiveLlmRequest(res);
       await handleOpenAIChat(req, res);
     } else if (req.method === 'POST' && path === '/v1/completions') {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
-      if (!checkConcurrency(res)) return;
+      if (!await acquireLlmSlot(req, res)) return;
       trackActiveLlmRequest(res);
       await handleOpenAICompletions(req, res);
     } else if (req.method === 'POST' && path === '/v1/messages/count_tokens') {
@@ -2275,6 +2392,8 @@ if (require.main === module) {
     const rlIp     = RATE_LIMIT_PER_IP_RPM ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min` : 'no per-IP limit';
     console.log(`  RateLimit: ${rlGlobal}; ${rlIp} (set RATE_LIMIT_RPM / RATE_LIMIT_PER_IP_RPM)`);
     console.log(`  Concurrency: ${PROXY_MAX_CONCURRENCY ? `max ${PROXY_MAX_CONCURRENCY} simultaneous LLM requests (503 when exceeded)` : 'unlimited (set PROXY_MAX_CONCURRENCY to prevent GPU OOM)'}`);
+    if (PROXY_MAX_QUEUE_SIZE)
+      console.log(`  Queue    : up to ${PROXY_MAX_QUEUE_SIZE} requests queued${PROXY_MAX_QUEUE_TIMEOUT ? ` (${PROXY_MAX_QUEUE_TIMEOUT}ms timeout)` : ' (no timeout)'}`);
     if (Object.keys(OLLAMA_OPTIONS).length > 0)
       console.log(`  Options: OLLAMA_OPTIONS=${JSON.stringify(OLLAMA_OPTIONS)}`);
     console.log('');
@@ -2354,6 +2473,9 @@ module.exports = {
   _rateLimitWindows,
   // Concurrency-limit internals exported for unit testing only.
   checkConcurrency,
+  acquireLlmSlot,
+  releaseLlmSlot,
   trackActiveLlmRequest,
+  _concurrencyQueue,
   _metrics,
 };

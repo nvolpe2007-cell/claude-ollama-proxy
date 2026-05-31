@@ -1164,6 +1164,73 @@ describe('trackActiveLlmRequest', () => {
   });
 });
 
+// ── acquireLlmSlot / releaseLlmSlot ──────────────────────────────────────────
+
+describe('acquireLlmSlot / releaseLlmSlot', () => {
+  const { acquireLlmSlot, releaseLlmSlot, _concurrencyQueue, _metrics } = require('./proxy');
+
+  function mockSlotReq() {
+    return {
+      headers: {},
+      socket: {
+        remoteAddress: '127.0.0.1',
+        once: () => {},
+        off: () => {},
+      },
+    };
+  }
+  function mockSlotRes() {
+    return {
+      headersSent: false, writableEnded: false, _status: null, _body: '',
+      setHeader() {}, getHeader() {},
+      writeHead(s) { this._status = s; this.headersSent = true; },
+      end(b = '') { this._body += b; this.writableEnded = true; },
+    };
+  }
+
+  test('when PROXY_MAX_CONCURRENCY is unset, grants slot immediately and increments counter', async () => {
+    const before = _metrics.activeLlmRequests;
+    const result = await acquireLlmSlot(mockSlotReq(), mockSlotRes());
+    assert.equal(result, true, 'should return true when no limit set');
+    assert.equal(_metrics.activeLlmRequests, before + 1, 'activeLlmRequests should be incremented');
+    releaseLlmSlot(); // cleanup
+    assert.equal(_metrics.activeLlmRequests, before, 'counter back to baseline after release');
+  });
+
+  test('releaseLlmSlot decrements activeLlmRequests when queue is empty', () => {
+    const before = _metrics.activeLlmRequests;
+    _metrics.activeLlmRequests++;
+    assert.equal(_concurrencyQueue.length, 0, 'queue must be empty for this test');
+    releaseLlmSlot();
+    assert.equal(_metrics.activeLlmRequests, before, 'counter decremented');
+  });
+
+  test('releaseLlmSlot calls onGranted and does NOT decrement activeLlmRequests when queue has waiters', () => {
+    const before = _metrics.activeLlmRequests;
+    _metrics.activeLlmRequests++;   // simulate one slot in use
+    _metrics.queuedLlmRequests++;   // simulate one waiter
+
+    let granted = false;
+    // Push a synthetic queue entry (mirrors what acquireLlmSlot does internally).
+    _concurrencyQueue.push({
+      onGranted: () => {
+        granted = true;
+        _metrics.queuedLlmRequests--;   // mirrors what onGranted in acquireLlmSlot does
+      },
+    });
+
+    releaseLlmSlot();
+
+    assert.equal(granted, true, 'onGranted should be called');
+    assert.equal(_metrics.activeLlmRequests, before + 1, 'slot transferred — activeLlmRequests unchanged');
+    assert.equal(_metrics.queuedLlmRequests, 0, 'queuedLlmRequests decremented by onGranted');
+
+    // Cleanup: release the transferred slot.
+    releaseLlmSlot();
+    assert.equal(_metrics.activeLlmRequests, before, 'counter back to baseline after cleanup');
+  });
+});
+
 // ── handleMessages ────────────────────────────────────────────────────────────
 // Unit tests for the core Anthropic-format handler using mock req/res/fetch.
 // Covers non-streaming and streaming paths without needing a real Ollama server.
