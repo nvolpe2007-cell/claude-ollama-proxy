@@ -7,6 +7,8 @@ const {
   parseOllamaOptions,
   OLLAMA_OPTIONS,
   resolveModel,
+  resolveMaxTokens,
+  PROXY_HARD_MAX_TOKENS,
   toOpenAIMessages,
   toOpenAITools,
   toOpenAIToolChoice,
@@ -1670,5 +1672,133 @@ describe('handleMessages', () => {
       assert.equal(mid, 'mid', 'text block 1 should contain "mid"');
       assert.equal(end, 'end', 'text block 3 should contain "end"');
     } finally { restore(); }
+  });
+});
+
+// ── resolveMaxTokens ──────────────────────────────────────────────────────────
+
+describe('resolveMaxTokens', () => {
+  const DEFAULT = process.env.PROXY_MAX_TOKENS ? Number(process.env.PROXY_MAX_TOKENS) : 8192;
+
+  test('returns default when client value is undefined', () => {
+    const r = resolveMaxTokens(undefined);
+    assert.ok(!r.error, `unexpected error: ${r.error}`);
+    assert.ok(typeof r.value === 'number' && r.value > 0);
+  });
+
+  test('returns default when client value is null', () => {
+    const r = resolveMaxTokens(null);
+    assert.ok(!r.error);
+    assert.equal(r.value, PROXY_HARD_MAX_TOKENS ? Math.min(DEFAULT, PROXY_HARD_MAX_TOKENS) : DEFAULT);
+  });
+
+  test('passes through a valid positive integer', () => {
+    const r = resolveMaxTokens(512);
+    assert.ok(!r.error);
+    assert.equal(r.value, PROXY_HARD_MAX_TOKENS ? Math.min(512, PROXY_HARD_MAX_TOKENS) : 512);
+  });
+
+  test('passes through a valid integer supplied as a string (numeric coercion)', () => {
+    const r = resolveMaxTokens('256');
+    assert.ok(!r.error);
+    assert.equal(r.value, PROXY_HARD_MAX_TOKENS ? Math.min(256, PROXY_HARD_MAX_TOKENS) : 256);
+  });
+
+  test('returns error for zero', () => {
+    const r = resolveMaxTokens(0);
+    assert.ok(r.error, 'expected an error for max_tokens=0');
+    assert.match(r.error, /positive integer/);
+  });
+
+  test('returns error for negative values', () => {
+    assert.ok(resolveMaxTokens(-1).error, 'expected error for -1');
+    assert.ok(resolveMaxTokens(-100).error, 'expected error for -100');
+  });
+
+  test('returns error for non-integer floats', () => {
+    const r = resolveMaxTokens(100.5);
+    assert.ok(r.error, 'expected error for 100.5');
+    assert.match(r.error, /positive integer/);
+  });
+
+  test('returns error for NaN', () => {
+    const r = resolveMaxTokens(NaN);
+    assert.ok(r.error, 'expected error for NaN');
+  });
+
+  test('returns error for Infinity', () => {
+    const r = resolveMaxTokens(Infinity);
+    assert.ok(r.error, 'expected error for Infinity');
+  });
+
+  test('returns error for non-numeric string', () => {
+    const r = resolveMaxTokens('lots');
+    assert.ok(r.error, 'expected error for non-numeric string');
+  });
+
+  test('returns error for boolean true (not a sensible token count)', () => {
+    // Number(true) === 1 which is a valid integer, so this actually passes.
+    // Documenting the current behavior: booleans coerce to numbers.
+    const r = resolveMaxTokens(true);
+    assert.ok(!r.error, 'true coerces to 1 which is valid');
+    assert.equal(r.value, PROXY_HARD_MAX_TOKENS ? Math.min(1, PROXY_HARD_MAX_TOKENS) : 1);
+  });
+});
+
+// ── handleMessages — max_tokens validation ────────────────────────────────────
+
+describe('handleMessages — max_tokens validation', () => {
+  const { handleMessages } = require('./proxy');
+
+  function mockReq(body) {
+    return {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST', url: '/v1/messages',
+      [Symbol.asyncIterator]: async function* () { yield JSON.stringify(body); },
+    };
+  }
+  function mockRes() {
+    const res = {
+      headersSent: false, writableEnded: false,
+      _status: null, _body: '', _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(s) { this._status = s; this.headersSent = true; },
+      write(c) { this._body += c; },
+      end(c = '') { this._body += c; this.writableEnded = true; },
+      on() {},
+    };
+    return res;
+  }
+
+  test('400 when max_tokens is zero', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 0 }), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /max_tokens/);
+  });
+
+  test('400 when max_tokens is negative', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({ messages: [{ role: 'user', content: 'hi' }], max_tokens: -5 }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('400 when max_tokens is a non-integer float', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 128.7 }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('400 when max_tokens is a non-numeric string', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 'big' }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
   });
 });

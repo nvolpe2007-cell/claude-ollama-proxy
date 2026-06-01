@@ -562,6 +562,43 @@ describe('POST /v1/messages — input validation', () => {
     const b = json(r);
     assert.equal(b.error.type, 'invalid_request_error');
   });
+
+  test('400 when max_tokens is zero', async () => {
+    const r = await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'Hi' }],
+      max_tokens: 0,
+      stream: false,
+    });
+    assert.equal(r.status, 400);
+    const b = json(r);
+    assert.equal(b.error.type, 'invalid_request_error');
+    assert.ok(b.error.message.includes('max_tokens'));
+  });
+
+  test('400 when max_tokens is negative', async () => {
+    const r = await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'Hi' }],
+      max_tokens: -1,
+      stream: false,
+    });
+    assert.equal(r.status, 400);
+    const b = json(r);
+    assert.equal(b.error.type, 'invalid_request_error');
+  });
+
+  test('200 when max_tokens is omitted (uses default)', async () => {
+    const r = await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'Hi' }],
+      stream: false,
+      // max_tokens intentionally omitted
+    });
+    assert.equal(r.status, 200);
+    const b = json(r);
+    assert.equal(b.type, 'message');
+  });
 });
 
 // ── Tests: stream defaults to false ──────────────────────────────────────────

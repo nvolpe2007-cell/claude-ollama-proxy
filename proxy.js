@@ -92,6 +92,20 @@ const PROXY_TIMEOUT     = process.env.PROXY_TIMEOUT     ? Number(process.env.PRO
 // Default max_tokens when the client does not specify one. 8192 is a safe default for most
 // Ollama models; set higher (e.g. 32768) for models with large output budgets.
 const PROXY_MAX_TOKENS  = process.env.PROXY_MAX_TOKENS  ? Number(process.env.PROXY_MAX_TOKENS)  : 8192;
+// Hard ceiling on output tokens per request. When set, any client-requested max_tokens above
+// this value is silently clamped down to PROXY_HARD_MAX_TOKENS. Useful on shared deployments
+// to prevent a single caller from monopolising the GPU with an enormous generation budget.
+// The default PROXY_MAX_TOKENS is also capped so operators only need to set one value.
+// Applies to POST /v1/messages, /v1/chat/completions, and /v1/completions.
+const PROXY_HARD_MAX_TOKENS = (() => {
+  if (!process.env.PROXY_HARD_MAX_TOKENS) return null;
+  const n = Number(process.env.PROXY_HARD_MAX_TOKENS);
+  if (!Number.isFinite(n) || n < 1) {
+    console.warn('Warning: PROXY_HARD_MAX_TOKENS must be a positive integer, ignoring');
+    return null;
+  }
+  return Math.floor(n);
+})();
 // Optional system prompt injected before every request's system field.
 // Useful for enforcing consistent model behavior across all callers without modifying clients.
 // When the client also supplies a system prompt, the proxy's prompt is prepended (separated by
@@ -273,6 +287,27 @@ function resolveModel(requestedModel) {
     return MODEL;
   }
   return requestedModel;
+}
+
+// Resolves the effective max_tokens for a request:
+//   1. Uses the client's value if provided and valid.
+//   2. Falls back to PROXY_MAX_TOKENS when client omits it.
+//   3. Clamps the result to PROXY_HARD_MAX_TOKENS (when set).
+// Returns { value: number } on success, or { error: string } when the client
+// supplied an invalid value (non-integer, ≤ 0) so the caller can return 400.
+function resolveMaxTokens(clientValue) {
+  if (clientValue !== undefined && clientValue !== null) {
+    const n = Number(clientValue);
+    if (!Number.isFinite(n) || n < 1 || Math.floor(n) !== n) {
+      return { error: '`max_tokens` must be a positive integer' };
+    }
+    const effective = PROXY_HARD_MAX_TOKENS ? Math.min(n, PROXY_HARD_MAX_TOKENS) : n;
+    return { value: effective };
+  }
+  const fallback = PROXY_HARD_MAX_TOKENS
+    ? Math.min(PROXY_MAX_TOKENS, PROXY_HARD_MAX_TOKENS)
+    : PROXY_MAX_TOKENS;
+  return { value: fallback };
 }
 
 // Merges PROXY_SYSTEM_PROMPT with the request's system field.
@@ -733,6 +768,15 @@ async function handleMessages(req, res) {
     return;
   }
 
+  const maxTokensResult = resolveMaxTokens(anthropicReq.max_tokens);
+  if (maxTokensResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: maxTokensResult.error } }));
+    return;
+  }
+
   // Anthropic API spec: stream defaults to false when not specified.
   const streaming = anthropicReq.stream === true;
 
@@ -744,7 +788,7 @@ async function handleMessages(req, res) {
     model: effectiveModel,
     messages: toOpenAIMessages(anthropicReq.messages, injectSystemPrompt(anthropicReq.system)),
     stream: streaming,
-    max_tokens: anthropicReq.max_tokens || PROXY_MAX_TOKENS,
+    max_tokens: maxTokensResult.value,
     ...(streaming && { stream_options: { include_usage: true } }),
   };
 
@@ -1638,6 +1682,7 @@ function handleDashboard(req, res) {
     logFormat:          LOG_FORMAT,
     logLevel:           LOG_LEVEL,
     maxTokens:          PROXY_MAX_TOKENS,
+    hardMaxTokens:      PROXY_HARD_MAX_TOKENS,
     numCtx:             OLLAMA_NUM_CTX,
     keepAlive:          OLLAMA_KEEP_ALIVE,
     rateLimitRpm:       RATE_LIMIT_RPM,
@@ -1729,6 +1774,7 @@ async function refresh(){
   g+=row('Auth',badge(C.auth,'Enabled','Open — no key'));
   g+=row('TLS',badge(C.tls,'HTTPS','HTTP'));
   g+=row('Default max_tokens',fmt(C.maxTokens));
+  if(C.hardMaxTokens)g+=row('Hard max_tokens cap',fmt(C.hardMaxTokens));
   g+=row('Context (num_ctx)',C.numCtx?fmt(C.numCtx):'model default');
   if(C.keepAlive)g+=row('Keep-alive',C.keepAlive);
   if(C.timeout)g+=row('Timeout',fmt(C.timeout)+' ms');
@@ -1857,7 +1903,15 @@ async function handleOpenAIChat(req, res) {
 
   const effectiveModel = resolveModel(openaiReq.model);
   openaiReq.model = effectiveModel;
-  if (!openaiReq.max_tokens)  openaiReq.max_tokens  = PROXY_MAX_TOKENS;
+  const chatMaxResult = resolveMaxTokens(openaiReq.max_tokens || null);
+  if (chatMaxResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: chatMaxResult.error } }));
+    return;
+  }
+  openaiReq.max_tokens = chatMaxResult.value;
   // OLLAMA_OPTIONS: fill in deployment-level params not already in the client request.
   for (const [k, v] of Object.entries(OLLAMA_OPTIONS)) {
     if (!(k in openaiReq)) openaiReq[k] = v;
@@ -2061,6 +2115,15 @@ async function handleOpenAICompletions(req, res) {
   const effectiveModel = resolveModel(completionReq.model);
   const streaming = completionReq.stream === true;
 
+  const compMaxResult = resolveMaxTokens(completionReq.max_tokens ?? null);
+  if (compMaxResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: compMaxResult.error } }));
+    return;
+  }
+
   // Normalize prompt to a single string; OpenAI spec allows string or array of strings.
   const promptText = Array.isArray(completionReq.prompt)
     ? completionReq.prompt.join('\n')
@@ -2070,7 +2133,7 @@ async function handleOpenAICompletions(req, res) {
   const chatReq = {
     model: effectiveModel,
     messages: [{ role: 'user', content: promptText }],
-    max_tokens: completionReq.max_tokens || PROXY_MAX_TOKENS,
+    max_tokens: compMaxResult.value,
     stream: streaming,
     ...(streaming && { stream_options: { include_usage: true } }),
   };
@@ -2383,7 +2446,7 @@ if (require.main === module) {
     console.log(`  Ctx   : ${OLLAMA_NUM_CTX ? `num_ctx=${OLLAMA_NUM_CTX}` : 'model default (set OLLAMA_NUM_CTX to override)'}`);
     if (OLLAMA_KEEP_ALIVE) console.log(`  Keep  : keep_alive=${OLLAMA_KEEP_ALIVE}`);
     console.log(`  Timeout: ${PROXY_TIMEOUT ? `${PROXY_TIMEOUT}ms per request` : 'none (set PROXY_TIMEOUT to limit)'}`);
-    console.log(`  MaxTok: default max_tokens=${PROXY_MAX_TOKENS} (set PROXY_MAX_TOKENS to change)`);
+    console.log(`  MaxTok: default max_tokens=${PROXY_MAX_TOKENS}${PROXY_HARD_MAX_TOKENS ? ` (hard cap: ${PROXY_HARD_MAX_TOKENS})` : ' (set PROXY_HARD_MAX_TOKENS to cap)'}`);
     console.log(`  MaxBody: ${PROXY_MAX_BODY_SIZE ? `${PROXY_MAX_BODY_SIZE} B per request` : 'unlimited (set PROXY_MAX_BODY_SIZE to limit)'}`);
     if (PROXY_SYSTEM_PROMPT) console.log(`  SysPrompt: ${PROXY_SYSTEM_PROMPT.slice(0, 80)}${PROXY_SYSTEM_PROMPT.length > 80 ? '…' : ''}`);
     console.log(`  Logs  : format=${LOG_FORMAT} level=${LOG_LEVEL} (LOG_FORMAT=json for structured; LOG_LEVEL=debug for full request/response bodies)`);
@@ -2450,6 +2513,8 @@ module.exports = {
   parseOllamaOptions,
   OLLAMA_OPTIONS,
   resolveModel,
+  resolveMaxTokens,
+  PROXY_HARD_MAX_TOKENS,
   toOpenAIMessages,
   toOpenAITools,
   toOpenAIToolChoice,
