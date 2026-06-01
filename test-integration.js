@@ -42,8 +42,45 @@ const mockOllama = http.createServer(async (req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      models: [{ name: 'qwen2.5:7b', modified_at: '2025-01-01T00:00:00Z' }]
+      models: [{
+        name: 'qwen2.5:7b',
+        modified_at: '2025-01-01T00:00:00Z',
+        size: 4661233792,
+        details: {
+          format: 'gguf',
+          family: 'qwen2',
+          families: ['qwen2'],
+          parameter_size: '7.6B',
+          quantization_level: 'Q4_K_M',
+        },
+      }]
     }));
+    return;
+  }
+
+  if (path === '/api/show') {
+    if (mockBehavior === 'ollama-error') {
+      res.writeHead(500); res.end('{}'); return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      modelfile: 'FROM qwen2.5:7b',
+      parameters: 'num_ctx 32768\ntemperature 0.7',
+      template: '{{ .Prompt }}',
+      system: 'You are a helpful assistant.',
+      details: { format: 'gguf', family: 'qwen2', parameter_size: '7.6B', quantization_level: 'Q4_K_M' },
+      model_info: { 'llm.context_length': 32768, 'general.architecture': 'qwen2' },
+    }));
+    return;
+  }
+
+  if (req.method === 'DELETE' && path === '/api/delete') {
+    const body = JSON.parse(await readBody(req));
+    if (body.model === 'qwen2.5:7b') {
+      res.writeHead(200); res.end('');
+    } else {
+      res.writeHead(404); res.end(JSON.stringify({ error: 'model not found' }));
+    }
     return;
   }
 
@@ -1146,6 +1183,103 @@ describe('POST /v1/completions (legacy text completions)', () => {
       m.requests_total['POST /v1/completions'] > 0,
       'POST /v1/completions should appear in requests_total'
     );
+  });
+});
+
+// ── Tests: GET /v1/models — metadata enrichment ────────────────────────────────
+
+describe('GET /v1/models — metadata enrichment', () => {
+  test('model entries include details object with parameter_size and quantization', async () => {
+    const r = await request('GET', '/v1/models');
+    assert.equal(r.status, 200);
+    const b = json(r);
+    const model = b.data.find(m => m.id === 'qwen2.5:7b');
+    assert.ok(model, 'qwen2.5:7b should be in the list');
+    assert.ok(model.details, 'model should have details field');
+    assert.equal(model.details.parameter_size, '7.6B');
+    assert.equal(model.details.quantization_level, 'Q4_K_M');
+    assert.equal(model.details.family, 'qwen2');
+    assert.equal(model.details.format, 'gguf');
+  });
+
+  test('model entries include size in bytes', async () => {
+    const r = await request('GET', '/v1/models');
+    const b = json(r);
+    const model = b.data.find(m => m.id === 'qwen2.5:7b');
+    assert.ok(model.size != null, 'model should have size field');
+    assert.equal(typeof model.size, 'number');
+    assert.ok(model.size > 0, 'size should be positive');
+  });
+});
+
+// ── Tests: GET /v1/models/:id — /api/show enrichment ─────────────────────────
+
+describe('GET /v1/models/:id — api/show enrichment', () => {
+  test('includes details and size from tags', async () => {
+    const r = await request('GET', '/v1/models/qwen2.5:7b');
+    assert.equal(r.status, 200);
+    const b = json(r);
+    assert.ok(b.details, 'should have details');
+    assert.equal(b.details.parameter_size, '7.6B');
+    assert.ok(b.size != null, 'should have size');
+  });
+
+  test('includes context_length from api/show model_info', async () => {
+    const r = await request('GET', '/v1/models/qwen2.5:7b');
+    assert.equal(r.status, 200);
+    const b = json(r);
+    assert.equal(b.context_length, 32768, 'context_length should come from model_info');
+  });
+
+  test('includes system and template from api/show', async () => {
+    const r = await request('GET', '/v1/models/qwen2.5:7b');
+    const b = json(r);
+    assert.equal(b.system, 'You are a helpful assistant.');
+    assert.ok(typeof b.template === 'string' && b.template.length > 0, 'template should be a non-empty string');
+  });
+
+  test('404 for unknown model is still 404', async () => {
+    const r = await request('GET', '/v1/models/no-such-model:latest');
+    assert.equal(r.status, 404);
+  });
+});
+
+// ── Tests: DELETE /v1/models/:id ──────────────────────────────────────────────
+
+describe('DELETE /v1/models/:id', () => {
+  test('200 with {deleted:true} for an existing model', async () => {
+    const r = await request('DELETE', '/v1/models/qwen2.5:7b');
+    assert.equal(r.status, 200);
+    const b = json(r);
+    assert.equal(b.deleted, true);
+    assert.equal(b.id, 'qwen2.5:7b');
+  });
+
+  test('404 for a model not in Ollama', async () => {
+    const r = await request('DELETE', '/v1/models/no-such-model:latest');
+    assert.equal(r.status, 404);
+    const b = json(r);
+    assert.equal(b.error.type, 'not_found_error');
+  });
+
+  test('carries CORS headers', async () => {
+    const r = await request('DELETE', '/v1/models/qwen2.5:7b');
+    assert.ok(r.headers['access-control-allow-origin'], 'missing ACAO header');
+  });
+
+  test('carries request-id header', async () => {
+    const r = await request('DELETE', '/v1/models/qwen2.5:7b');
+    assert.ok(r.headers['request-id']?.startsWith('req_'), 'missing or malformed request-id');
+  });
+
+  test('OPTIONS preflight now allows DELETE method', async () => {
+    const r = await request('OPTIONS', '/v1/models/qwen2.5:7b', null, {
+      Origin: 'https://app.example.com',
+      'Access-Control-Request-Method': 'DELETE',
+    });
+    assert.equal(r.status, 204);
+    assert.ok(r.headers['access-control-allow-methods']?.includes('DELETE'),
+      'DELETE should be in Access-Control-Allow-Methods');
   });
 });
 

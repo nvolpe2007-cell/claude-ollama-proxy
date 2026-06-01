@@ -505,7 +505,7 @@ function extractThinkingParts(text) {
 // Prefers a specific origin when CORS_ORIGIN is set; defaults to wildcard.
 function setCORSHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers',
     'Content-Type, x-api-key, Authorization, anthropic-version, anthropic-beta');
   res.setHeader('Access-Control-Max-Age', '86400');
@@ -1286,7 +1286,12 @@ async function handleModels(req, res) {
     id: m.name,
     object: 'model',
     created: m.modified_at ? Math.floor(new Date(m.modified_at).getTime() / 1000) : 0,
-    owned_by: 'ollama'
+    owned_by: 'ollama',
+    // Expose Ollama metadata already present in /api/tags at no extra cost.
+    // Clients (Continue, Open WebUI, Cursor) can use parameter_size and
+    // quantization_level to display helpful model info without extra requests.
+    ...(m.details ? { details: m.details } : {}),
+    ...(m.size != null ? { size: m.size } : {}),
   }));
 
   // When MODEL_MAP is configured, also expose the Claude alias names so model-picker
@@ -1297,14 +1302,23 @@ async function handleModels(req, res) {
   for (const m of data.models || []) {
     createdByTarget[m.name] = m.modified_at ? Math.floor(new Date(m.modified_at).getTime() / 1000) : 0;
   }
+  const byTargetDetails = {};
+  for (const m of data.models || []) {
+    byTargetDetails[m.name] = { details: m.details, size: m.size };
+  }
   const aliasModels = Object.entries(MODEL_MAP)
     .filter(([alias]) => !ollamaIds.has(alias))
-    .map(([alias, target]) => ({
-      id: alias,
-      object: 'model',
-      created: createdByTarget[target] || 0,
-      owned_by: 'ollama',
-    }));
+    .map(([alias, target]) => {
+      const meta = byTargetDetails[target] || {};
+      return {
+        id: alias,
+        object: 'model',
+        created: createdByTarget[target] || 0,
+        owned_by: 'ollama',
+        ...(meta.details ? { details: meta.details } : {}),
+        ...(meta.size != null ? { size: meta.size } : {}),
+      };
+    });
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ object: 'list', data: [...ollamaModels, ...aliasModels] }));
@@ -1346,13 +1360,75 @@ async function handleModelById(req, res, modelId) {
     return;
   }
 
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
+  // Best-effort: enrich with /api/show details (context length, template, default system).
+  // If the show call fails for any reason the basic response is still returned.
+  let showData = null;
+  try {
+    const showRes = await fetch(`${ollamaBase}/api/show`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: model.name }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (showRes.ok) showData = await showRes.json();
+  } catch { /* ignore — show is best-effort */ }
+
+  const resp = {
     id: modelId,   // always return the requested ID (alias or real name)
     object: 'model',
     created: model.modified_at ? Math.floor(new Date(model.modified_at).getTime() / 1000) : 0,
-    owned_by: 'ollama'
-  }));
+    owned_by: 'ollama',
+    ...(model.details ? { details: model.details } : {}),
+    ...(model.size != null ? { size: model.size } : {}),
+  };
+
+  if (showData) {
+    // model_info keys follow GGUF naming conventions; fall back gracefully if absent.
+    const ctxLen = showData.model_info?.['llm.context_length'] ?? null;
+    if (ctxLen != null) resp.context_length = ctxLen;
+    if (showData.system)   resp.system   = showData.system;
+    if (showData.template) resp.template  = showData.template;
+  }
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(resp));
+}
+
+// DELETE /v1/models/:id — deletes a model from Ollama via DELETE /api/delete.
+// Auth-gated like other model management endpoints. Returns {deleted:true,id} on
+// success, 404 if the model isn't in Ollama, 502 if Ollama is unreachable.
+async function handleDeleteModel(req, res, modelId) {
+  const ollamaBase = getOllamaHost();
+  let ollamaRes;
+  try {
+    ollamaRes = await fetch(`${ollamaBase}/api/delete`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: modelId }),
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch (e) {
+    const isConnRefused = e.cause?.code === 'ECONNREFUSED' || e.message.includes('ECONNREFUSED');
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: { type: 'ollama_unreachable', message: e.message + (isConnRefused ? ' — is Ollama running?' : '') }
+    }));
+    return;
+  }
+
+  if (ollamaRes.status === 200) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ deleted: true, id: modelId }));
+  } else if (ollamaRes.status === 404) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Model '${modelId}' not found in Ollama` } }));
+  } else {
+    const err = await ollamaRes.text().catch(() => '');
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: { type: 'ollama_error', message: err || `Ollama returned HTTP ${ollamaRes.status}` }
+    }));
+  }
 }
 
 async function handleEmbeddings(req, res) {
@@ -2374,6 +2450,9 @@ async function requestHandler(req, res) {
     } else if (req.method === 'GET' && path.startsWith('/v1/models/')) {
       if (!checkAuth(req, res)) return;
       await handleModelById(req, res, decodeURIComponent(path.slice('/v1/models/'.length)));
+    } else if (req.method === 'DELETE' && path.startsWith('/v1/models/')) {
+      if (!checkAuth(req, res)) return;
+      await handleDeleteModel(req, res, decodeURIComponent(path.slice('/v1/models/'.length)));
     } else if (req.method === 'GET' && (path === '/' || path === '')) {
       handleDashboard(req, res);
     } else if (req.method === 'GET' && path === '/favicon.ico') {
@@ -2531,6 +2610,7 @@ module.exports = {
   handleOpenAIChat,
   handleOpenAICompletions,
   handleEmbeddings,
+  handleDeleteModel,
   handleMetricsPrometheus,
   // Rate-limit internals exported for unit testing only.
   checkRateLimit,
