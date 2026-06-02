@@ -1431,6 +1431,123 @@ async function handleDeleteModel(req, res, modelId) {
   }
 }
 
+// POST /v1/models/pull — pulls a model from the Ollama registry through the proxy.
+// Auth-gated like other model management endpoints. Supports non-streaming
+// ({pulled:true,id,object:'model'} on success) and streaming (Ollama's NDJSON
+// progress piped as SSE so operators can watch download progress in real time).
+// Client-abort propagation cancels in-flight pulls, freeing bandwidth immediately.
+async function handlePullModel(req, res) {
+  const ollamaBase = getOllamaHost();
+
+  const body = await readBody(req);
+  let pullReq;
+  try { pullReq = JSON.parse(body); }
+  catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Request body is not valid JSON' } }));
+    return;
+  }
+
+  if (!pullReq.model || typeof pullReq.model !== 'string') {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`model` is required and must be a string' } }));
+    return;
+  }
+
+  const streaming = pullReq.stream === true;
+
+  const ac = new AbortController();
+  const onClientClose = () => { if (!res.writableEnded) ac.abort(); };
+  req.socket.once('close', onClientClose);
+
+  let ollamaRes;
+  try {
+    ollamaRes = await fetch(`${ollamaBase}/api/pull`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: pullReq.model, stream: streaming }),
+      signal: ac.signal,
+    });
+  } catch (e) {
+    req.socket.off('close', onClientClose);
+    if (e.name === 'AbortError') { if (!res.writableEnded) res.end(); return; }
+    const isConnRefused = e.cause?.code === 'ECONNREFUSED' || e.message.includes('ECONNREFUSED');
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: { type: 'ollama_unreachable', message: e.message + (isConnRefused ? ' — is Ollama running? Try: ollama serve' : '') }
+    }));
+    return;
+  }
+
+  if (!ollamaRes.ok) {
+    req.socket.off('close', onClientClose);
+    const err = await ollamaRes.text().catch(() => '');
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'ollama_error', message: err || `Ollama returned HTTP ${ollamaRes.status}` } }));
+    return;
+  }
+
+  if (!streaming) {
+    let data;
+    try { data = await ollamaRes.json(); }
+    catch {
+      req.socket.off('close', onClientClose);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'ollama_error', message: 'Failed to parse Ollama pull response' } }));
+      return;
+    }
+    req.socket.off('close', onClientClose);
+    if (data.error) {
+      res.writeHead(422, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'ollama_error', message: data.error } }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ id: pullReq.model, pulled: true, object: 'model', status: data.status || 'success' }));
+    return;
+  }
+
+  // Streaming: pipe Ollama's NDJSON progress as SSE so callers can watch download progress.
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+
+  const reader = ollamaRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let success = false;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let obj;
+        try { obj = JSON.parse(line); } catch { continue; }
+        if (obj.status === 'success' || obj.status === 'already exists') success = true;
+        res.write(`data: ${JSON.stringify(obj)}\n\n`);
+      }
+    }
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ id: pullReq.model, pulled: success, done: true })}\n\n`);
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError' && !res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ error: { type: 'stream_error', message: e.message } })}\n\n`);
+    }
+  } finally {
+    req.socket.off('close', onClientClose);
+  }
+
+  res.end();
+}
+
 async function handleEmbeddings(req, res) {
   const ollamaBase = getOllamaHost();
   const ac = new AbortController();
@@ -2453,6 +2570,9 @@ async function requestHandler(req, res) {
     } else if (req.method === 'DELETE' && path.startsWith('/v1/models/')) {
       if (!checkAuth(req, res)) return;
       await handleDeleteModel(req, res, decodeURIComponent(path.slice('/v1/models/'.length)));
+    } else if (req.method === 'POST' && path === '/v1/models/pull') {
+      if (!checkAuth(req, res)) return;
+      await handlePullModel(req, res);
     } else if (req.method === 'GET' && (path === '/' || path === '')) {
       handleDashboard(req, res);
     } else if (req.method === 'GET' && path === '/favicon.ico') {
@@ -2611,6 +2731,7 @@ module.exports = {
   handleOpenAICompletions,
   handleEmbeddings,
   handleDeleteModel,
+  handlePullModel,
   handleMetricsPrometheus,
   // Rate-limit internals exported for unit testing only.
   checkRateLimit,

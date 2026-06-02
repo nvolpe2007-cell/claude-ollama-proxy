@@ -84,6 +84,26 @@ const mockOllama = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && path === '/api/pull') {
+    const pullBody = JSON.parse(await readBody(req));
+    if (pullBody.model === 'bad:model') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'pull model manifest: file does not exist' }));
+      return;
+    }
+    if (pullBody.stream) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.write(JSON.stringify({ status: 'pulling manifest' }) + '\n');
+      res.write(JSON.stringify({ status: 'downloading sha256:abc', digest: 'sha256:abc', total: 100, completed: 50 }) + '\n');
+      res.write(JSON.stringify({ status: 'success' }) + '\n');
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'success' }));
+    return;
+  }
+
   if (path === '/v1/chat/completions') {
     const body = JSON.parse(await readBody(req));
 
@@ -1335,5 +1355,84 @@ describe('POST /v1/messages (streaming) — thinking blocks', () => {
     // Correct stop_reason for a normal completion
     const msgDelta = events.find(e => e.event === 'message_delta');
     assert.equal(msgDelta.data.delta.stop_reason, 'end_turn');
+  });
+});
+
+describe('POST /v1/models/pull', () => {
+  test('non-streaming: returns {pulled:true,id,object} for a valid model', async () => {
+    const r = await request('POST', '/v1/models/pull', { model: 'qwen2.5:7b' });
+    assert.equal(r.status, 200);
+    const body = json(r);
+    assert.equal(body.pulled, true);
+    assert.equal(body.id, 'qwen2.5:7b');
+    assert.equal(body.object, 'model');
+    assert.ok(body.status, 'should include status from Ollama');
+  });
+
+  test('non-streaming: 422 when Ollama reports an error (bad model name)', async () => {
+    const r = await request('POST', '/v1/models/pull', { model: 'bad:model' });
+    assert.equal(r.status, 422);
+    const body = json(r);
+    assert.equal(body.error.type, 'ollama_error');
+    assert.ok(body.error.message.includes('does not exist'));
+  });
+
+  test('streaming: returns SSE with progress events and final done event', async () => {
+    const r = await request('POST', '/v1/models/pull', { model: 'qwen2.5:7b', stream: true });
+    assert.equal(r.status, 200);
+    assert.match(r.headers['content-type'], /text\/event-stream/);
+    // Parse SSE data lines
+    const dataLines = r.body.split('\n').filter(l => l.startsWith('data: '));
+    assert.ok(dataLines.length >= 2, 'should emit at least manifest + done events');
+    const events = dataLines.map(l => JSON.parse(l.slice(6)));
+    // First event should be a pull status
+    assert.ok(events[0].status, 'first event should have a status field');
+    // Last event should be the completion marker
+    const last = events[events.length - 1];
+    assert.equal(last.done, true);
+    assert.equal(last.pulled, true);
+    assert.equal(last.id, 'qwen2.5:7b');
+  });
+
+  test('non-streaming: 400 when model field is missing', async () => {
+    const r = await request('POST', '/v1/models/pull', {});
+    assert.equal(r.status, 400);
+    assert.equal(json(r).error.type, 'invalid_request_error');
+  });
+
+  test('non-streaming: 400 on malformed JSON body', async () => {
+    const r = await request('POST', '/v1/models/pull', null, { 'Content-Type': 'application/json' });
+    // null body → empty string → parse error
+    // Simulate with a raw request carrying bad JSON
+    const raw = await new Promise((resolve, reject) => {
+      const payload = 'not-json';
+      const h = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) };
+      const req = http.request({ host: '127.0.0.1', port: PROXY_PORT, method: 'POST', path: '/v1/models/pull', headers: h }, (res) => {
+        const chunks = [];
+        res.on('data', c => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() }));
+      });
+      req.on('error', reject);
+      req.write(payload);
+      req.end();
+    });
+    assert.equal(raw.status, 400);
+    assert.equal(JSON.parse(raw.body).error.type, 'invalid_request_error');
+  });
+
+  test('carries CORS headers', async () => {
+    const r = await request('POST', '/v1/models/pull', { model: 'qwen2.5:7b' });
+    assert.ok(r.headers['access-control-allow-origin']);
+  });
+
+  test('carries request-id header', async () => {
+    const r = await request('POST', '/v1/models/pull', { model: 'qwen2.5:7b' });
+    assert.ok(r.headers['request-id']?.startsWith('req_'));
+  });
+
+  test('increments request count in /metrics', async () => {
+    await request('POST', '/v1/models/pull', { model: 'qwen2.5:7b' });
+    const m = json(await request('GET', '/metrics', null));
+    assert.ok(m.requests_total['POST /v1/models/pull'] >= 1);
   });
 });
