@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {
   parseDotEnv,
   parseOllamaOptions,
+  parseOllamaError,
   OLLAMA_OPTIONS,
   resolveModel,
   resolveMaxTokens,
@@ -830,6 +831,49 @@ describe('parseOllamaOptions', () => {
   });
 });
 
+// ── parseOllamaError ──────────────────────────────────────────────────────────
+
+describe('parseOllamaError', () => {
+  test('extracts error field from Ollama JSON response', () => {
+    const msg = parseOllamaError('{"error":"model \'xyz\' not found, try pulling it first"}');
+    assert.equal(msg, "model 'xyz' not found, try pulling it first");
+  });
+
+  test('extracts message field when error field is absent', () => {
+    const msg = parseOllamaError('{"message":"context length exceeded"}');
+    assert.equal(msg, 'context length exceeded');
+  });
+
+  test('prefers error field over message field', () => {
+    const msg = parseOllamaError('{"error":"primary error","message":"secondary"}');
+    assert.equal(msg, 'primary error');
+  });
+
+  test('returns raw text when body is not JSON', () => {
+    const msg = parseOllamaError('internal server error');
+    assert.equal(msg, 'internal server error');
+  });
+
+  test('returns raw text when JSON has no error or message field', () => {
+    const msg = parseOllamaError('{"code":500,"detail":"oops"}');
+    assert.equal(msg, '{"code":500,"detail":"oops"}');
+  });
+
+  test('returns empty string for empty input', () => {
+    assert.equal(parseOllamaError(''), '');
+  });
+
+  test('returns null/undefined as-is for falsy input', () => {
+    assert.equal(parseOllamaError(null), null);
+    assert.equal(parseOllamaError(undefined), undefined);
+  });
+
+  test('ignores non-string error field', () => {
+    const msg = parseOllamaError('{"error":{"nested":"object"}}');
+    assert.equal(msg, '{"error":{"nested":"object"}}');
+  });
+});
+
 // ── MODEL_MAP alias resolution (unit-level, mirrors handleModelById logic) ────
 // handleModelById resolves aliases the same way resolveModel does, so we verify
 // the shared logic here; integration coverage lives in test-integration.js.
@@ -1452,12 +1496,30 @@ describe('handleMessages', () => {
     } finally { restore(); }
   });
 
-  test('non-streaming: Ollama 4xx proxied as 502', async () => {
-    const restore = stubFetchError(404, 'model not found');
+  test('non-streaming: Ollama 4xx proxied as 502 with structured error body', async () => {
+    const restore = stubFetchError(404, '{"error":"model \'xyz\' not found, try pulling it first"}');
     try {
       const res = mockRes();
       await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Hi' }], stream: false }), res);
       assert.equal(res._status, 502);
+      const body = JSON.parse(res._body);
+      // Error must be an object, not a raw/double-encoded string.
+      assert.equal(typeof body.error, 'object', 'error should be an object, not a raw string');
+      assert.equal(body.error.type, 'ollama_error');
+      // Inner Ollama message should be extracted, not double-JSON-encoded.
+      assert.equal(body.error.message, "model 'xyz' not found, try pulling it first");
+    } finally { restore(); }
+  });
+
+  test('non-streaming: plain-text Ollama error proxied as 502', async () => {
+    const restore = stubFetchError(500, 'CUDA out of memory');
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Hi' }], stream: false }), res);
+      assert.equal(res._status, 502);
+      const body = JSON.parse(res._body);
+      assert.equal(body.error.type, 'ollama_error');
+      assert.equal(body.error.message, 'CUDA out of memory');
     } finally { restore(); }
   });
 

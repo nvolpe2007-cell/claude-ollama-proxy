@@ -182,6 +182,20 @@ function sanitizeForLog(obj, maxChars = 200) {
   return obj;
 }
 
+// Extracts a human-readable error string from an Ollama error response body.
+// Ollama typically returns {"error":"..."} JSON; this avoids double-encoding that
+// string as the `message` field and instead surfaces the inner error text directly.
+// Falls back to the raw text if the body is not JSON or has no error/message key.
+function parseOllamaError(text) {
+  if (!text) return text;
+  try {
+    const obj = JSON.parse(text);
+    if (obj && typeof obj.error === 'string') return obj.error;
+    if (obj && typeof obj.message === 'string') return obj.message;
+  } catch { /* not JSON — use raw text */ }
+  return text;
+}
+
 // Logs obj as pretty JSON under a label when LOG_LEVEL=debug. No-op otherwise.
 function debugLog(label, obj) {
   if (LOG_LEVEL !== 'debug') return;
@@ -852,9 +866,9 @@ async function handleMessages(req, res) {
   }
 
   if (!ollamaRes.ok) {
-    const err = await ollamaRes.text();
-    res.writeHead(502);
-    res.end(JSON.stringify({ error: err }));
+    const errText = await ollamaRes.text();
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'ollama_error', message: parseOllamaError(errText) } }));
     return;
   }
 
@@ -1423,10 +1437,10 @@ async function handleDeleteModel(req, res, modelId) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Model '${modelId}' not found in Ollama` } }));
   } else {
-    const err = await ollamaRes.text().catch(() => '');
+    const errText = await ollamaRes.text().catch(() => '');
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      error: { type: 'ollama_error', message: err || `Ollama returned HTTP ${ollamaRes.status}` }
+      error: { type: 'ollama_error', message: parseOllamaError(errText) || `Ollama returned HTTP ${ollamaRes.status}` }
     }));
   }
 }
@@ -1481,9 +1495,9 @@ async function handlePullModel(req, res) {
 
   if (!ollamaRes.ok) {
     req.socket.off('close', onClientClose);
-    const err = await ollamaRes.text().catch(() => '');
+    const errText = await ollamaRes.text().catch(() => '');
     res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { type: 'ollama_error', message: err || `Ollama returned HTTP ${ollamaRes.status}` } }));
+    res.end(JSON.stringify({ error: { type: 'ollama_error', message: parseOllamaError(errText) || `Ollama returned HTTP ${ollamaRes.status}` } }));
     return;
   }
 
@@ -1619,9 +1633,9 @@ async function handleEmbeddings(req, res) {
   clearTO();
 
   if (!ollamaRes.ok) {
-    const err = await ollamaRes.text();
+    const errText = await ollamaRes.text();
     res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { type: 'ollama_error', message: err } }));
+    res.end(JSON.stringify({ error: { type: 'ollama_error', message: parseOllamaError(errText) } }));
     return;
   }
 
@@ -2710,6 +2724,7 @@ if (require.main === module) {
 module.exports = {
   parseDotEnv,
   parseOllamaOptions,
+  parseOllamaError,
   OLLAMA_OPTIONS,
   resolveModel,
   resolveMaxTokens,
