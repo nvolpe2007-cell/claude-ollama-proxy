@@ -282,7 +282,8 @@ function logRequest(req, res, path, ms, meta, fmt = LOG_FORMAT) {
     const toks = meta?.tokensIn != null
       ? ` in=${meta.tokensIn} out=${meta.tokensOut}` + (meta.model ? ` model=${meta.model}` : '')
       : '';
-    console.log(`${req.method} ${req.url} ${res.statusCode} ${ms}ms${toks}`);
+    const rid = res.getHeader('request-id') ? ` id=${res.getHeader('request-id')}` : '';
+    console.log(`${req.method} ${req.url} ${res.statusCode} ${ms}ms${toks}${rid}`);
   }
 }
 
@@ -1168,6 +1169,9 @@ async function handleMessages(req, res) {
             const oi = tc.index; // openai index
             if (!toolBlocks[oi]) {
               const ai = nextBlockIdx + oi;
+              // Bump nextBlockIdx past this tool block so any subsequent text/thinking
+              // block gets a higher index and cannot clash with tool block indices.
+              nextBlockIdx = Math.max(nextBlockIdx, ai + 1);
               toolBlocks[oi] = {
                 anthropicIndex: ai,
                 id: tc.id || `toolu_${oi}`,
@@ -2708,6 +2712,16 @@ if (require.main === module) {
       });
     }
   });
+
+  // Periodically remove rate-limit windows that have expired (older than one 60 s window).
+  // Without cleanup, per-IP windows accumulate indefinitely in long-running deployments
+  // where many unique IPs visit once and never return (dynamic IPs, crawlers, etc.).
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, w] of _rateLimitWindows) {
+      if (now - w.windowStart >= 60_000) _rateLimitWindows.delete(key);
+    }
+  }, 5 * 60_000).unref();
 
   // closeIdleConnections drops idle keep-alive connections immediately so
   // server.close() can actually reach its callback on SIGTERM.  Without this,
