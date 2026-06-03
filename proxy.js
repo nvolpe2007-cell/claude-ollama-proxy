@@ -1566,6 +1566,290 @@ async function handlePullModel(req, res) {
   res.end();
 }
 
+// ── Anthropic Messages Batch API ─────────────────────────────────────────────
+// In-memory store. Each batch: { id, status, created_at, expires_at, ended_at,
+//   cancel_initiated_at, requests, results (Map custom_id→result), cancelRequested }
+// status: 'in_progress' | 'canceling' | 'ended'
+const _batches = new Map();
+
+function newBatchId() {
+  return 'msgbatch_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function batchRequestCounts(batch) {
+  let processing = 0, succeeded = 0, errored = 0, canceled = 0, expired = 0;
+  for (const req of batch.requests) {
+    const r = batch.results.get(req.custom_id);
+    if (!r)                    { processing++; continue; }
+    if (r.type === 'succeeded') succeeded++;
+    else if (r.type === 'errored')  errored++;
+    else if (r.type === 'canceled') canceled++;
+    else if (r.type === 'expired')  expired++;
+  }
+  return { processing, succeeded, errored, canceled, expired };
+}
+
+function batchToResponse(batch, baseUrl) {
+  const counts = batchRequestCounts(batch);
+  return {
+    id:                   batch.id,
+    type:                 'message_batch',
+    processing_status:    batch.status,
+    request_counts:       counts,
+    ended_at:             batch.ended_at             || null,
+    created_at:           batch.created_at,
+    expires_at:           batch.expires_at,
+    cancel_initiated_at:  batch.cancel_initiated_at  || null,
+    results_url: batch.status === 'ended'
+      ? `${baseUrl}/v1/messages/batches/${batch.id}/results`
+      : null,
+  };
+}
+
+// Process a single batch request item — reuses the same conversion logic as
+// handleMessages but operates synchronously against Ollama (non-streaming).
+// Returns { type: 'succeeded', message } or { type: 'errored', error }.
+async function processBatchRequest(anthropicReq, ollamaBase) {
+  const effectiveModel = resolveModel(anthropicReq.model);
+  const maxTokensResult = resolveMaxTokens(anthropicReq.max_tokens);
+  if (maxTokensResult.error)
+    return { type: 'errored', error: { type: 'invalid_request_error', message: maxTokensResult.error } };
+
+  const openaiReq = {
+    model:      effectiveModel,
+    messages:   toOpenAIMessages(anthropicReq.messages, injectSystemPrompt(anthropicReq.system)),
+    stream:     false,
+    max_tokens: maxTokensResult.value,
+  };
+  const tools = toOpenAITools(anthropicReq.tools);
+  if (tools) openaiReq.tools = tools;
+  const toolChoice = toOpenAIToolChoice(anthropicReq.tool_choice);
+  if (toolChoice !== undefined) openaiReq.tool_choice = toolChoice;
+  if (anthropicReq.temperature          !== undefined) openaiReq.temperature          = anthropicReq.temperature;
+  if (anthropicReq.top_p                !== undefined) openaiReq.top_p                = anthropicReq.top_p;
+  if (anthropicReq.top_k                !== undefined) openaiReq.top_k                = anthropicReq.top_k;
+  if (anthropicReq.seed                 !== undefined) openaiReq.seed                 = anthropicReq.seed;
+  if (anthropicReq.stop_sequences?.length)             openaiReq.stop                 = anthropicReq.stop_sequences;
+  if (anthropicReq.disable_parallel_tool_use === true) openaiReq.parallel_tool_calls  = false;
+  if (anthropicReq.thinking?.type === 'enabled')       openaiReq.think                = true;
+  for (const [k, v] of Object.entries(OLLAMA_OPTIONS))
+    if (!(k in openaiReq)) openaiReq[k] = v;
+  if (OLLAMA_NUM_CTX)    openaiReq.num_ctx    = OLLAMA_NUM_CTX;
+  if (OLLAMA_KEEP_ALIVE) openaiReq.keep_alive = OLLAMA_KEEP_ALIVE;
+
+  let ollamaRes;
+  try {
+    ollamaRes = await fetchWithRetry(`${ollamaBase}/v1/chat/completions`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(openaiReq),
+    });
+  } catch (e) {
+    const isConnRefused = e.cause?.code === 'ECONNREFUSED' || e.message.includes('ECONNREFUSED');
+    return { type: 'errored', error: {
+      type: 'ollama_unreachable',
+      message: e.message + (isConnRefused ? ' — is Ollama running?' : ''),
+    }};
+  }
+
+  if (!ollamaRes.ok) {
+    const errText = await ollamaRes.text().catch(() => '');
+    return { type: 'errored', error: { type: 'ollama_error', message: parseOllamaError(errText) } };
+  }
+
+  let data;
+  try { data = await ollamaRes.json(); }
+  catch { return { type: 'errored', error: { type: 'ollama_error', message: 'Failed to parse Ollama response' } }; }
+
+  const choice = data.choices?.[0];
+  if (!choice)
+    return { type: 'errored', error: { type: 'ollama_error', message: 'Empty choices in Ollama response' } };
+
+  const msg     = choice.message;
+  const content = [];
+  if (msg.content) {
+    const thinkParts = extractThinkingParts(msg.content);
+    if (thinkParts) {
+      for (const p of thinkParts) {
+        content.push(p.type === 'thinking'
+          ? { type: 'thinking', thinking: p.thinking, signature: 'ollama-proxy-extracted' }
+          : { type: 'text', text: p.text });
+      }
+    } else {
+      content.push({ type: 'text', text: msg.content });
+    }
+  }
+  if (msg.tool_calls) {
+    for (const tc of msg.tool_calls) {
+      let input = {};
+      try { input = JSON.parse(tc.function.arguments); } catch {}
+      content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+    }
+  }
+
+  const promptTok     = data.usage?.prompt_tokens     || 0;
+  const completionTok = data.usage?.completion_tokens || 0;
+  recordTokens(promptTok, completionTok, effectiveModel);
+
+  return {
+    type: 'succeeded',
+    message: {
+      id:            newMsgId(),
+      type:          'message',
+      role:          'assistant',
+      content,
+      model:         effectiveModel,
+      stop_reason:   choice.finish_reason === 'tool_calls' ? 'tool_use'
+                   : choice.finish_reason === 'length'     ? 'max_tokens'
+                   : 'end_turn',
+      stop_sequence: null,
+      usage: {
+        input_tokens:               promptTok,
+        output_tokens:              completionTok,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens:     0,
+      },
+    },
+  };
+}
+
+// Drive a batch to completion in the background (serially to avoid GPU OOM).
+// Runs as a fire-and-forget task started with setImmediate from handleCreateBatch.
+async function processBatch(batch) {
+  const ollamaBase = getOllamaHost();
+  for (const item of batch.requests) {
+    if (batch.cancelRequested) {
+      batch.results.set(item.custom_id, { type: 'canceled' });
+      continue;
+    }
+    const result = await processBatchRequest(item.params, ollamaBase).catch(e => ({
+      type: 'errored',
+      error: { type: 'internal_error', message: e.message },
+    }));
+    batch.results.set(item.custom_id, result);
+  }
+  batch.status   = 'ended';
+  batch.ended_at = new Date().toISOString();
+}
+
+function getBatchBaseUrl(req) {
+  const proto = req.socket?.encrypted ? 'https' : 'http';
+  const host  = req.headers.host || `localhost:${PORT}`;
+  return `${proto}://${host}`;
+}
+
+async function handleCreateBatch(req, res) {
+  const body = await readBody(req);
+  let batchReq;
+  try { batchReq = JSON.parse(body); }
+  catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Request body is not valid JSON' } }));
+    return;
+  }
+
+  if (!Array.isArray(batchReq.requests) || batchReq.requests.length === 0) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`requests` must be a non-empty array' } }));
+    return;
+  }
+
+  for (const r of batchReq.requests) {
+    if (!r.custom_id || typeof r.custom_id !== 'string') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Each request must have a string `custom_id`' } }));
+      return;
+    }
+    if (!r.params || !Array.isArray(r.params.messages)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}' must have a params.messages array` } }));
+      return;
+    }
+  }
+
+  const now   = new Date();
+  const batch = {
+    id:                  newBatchId(),
+    status:              'in_progress',
+    created_at:          now.toISOString(),
+    expires_at:          new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+    ended_at:            null,
+    cancel_initiated_at: null,
+    requests:            batchReq.requests,
+    results:             new Map(),
+    cancelRequested:     false,
+  };
+
+  _batches.set(batch.id, batch);
+  setImmediate(() => processBatch(batch));
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(batchToResponse(batch, getBatchBaseUrl(req))));
+}
+
+async function handleListBatches(req, res) {
+  const baseUrl = getBatchBaseUrl(req);
+  const all     = [..._batches.values()].reverse();
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    data:     all.map(b => batchToResponse(b, baseUrl)),
+    has_more: false,
+    first_id: all[0]?.id                  || null,
+    last_id:  all[all.length - 1]?.id     || null,
+  }));
+}
+
+async function handleGetBatch(req, res, batchId) {
+  const batch = _batches.get(batchId);
+  if (!batch) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Batch '${batchId}' not found` } }));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(batchToResponse(batch, getBatchBaseUrl(req))));
+}
+
+async function handleGetBatchResults(req, res, batchId) {
+  const batch = _batches.get(batchId);
+  if (!batch) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Batch '${batchId}' not found` } }));
+    return;
+  }
+  if (batch.status !== 'ended') {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Batch '${batchId}' has not ended yet (status: ${batch.status})` } }));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/x-jsonl' });
+  for (const item of batch.requests) {
+    const result = batch.results.get(item.custom_id)
+      || { type: 'errored', error: { type: 'internal_error', message: 'No result recorded' } };
+    res.write(JSON.stringify({ custom_id: item.custom_id, result }) + '\n');
+  }
+  res.end();
+}
+
+async function handleCancelBatch(req, res, batchId) {
+  const batch = _batches.get(batchId);
+  if (!batch) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Batch '${batchId}' not found` } }));
+    return;
+  }
+  if (batch.status === 'ended') {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Batch '${batchId}' has already ended` } }));
+    return;
+  }
+  batch.cancelRequested    = true;
+  batch.cancel_initiated_at = new Date().toISOString();
+  if (batch.status !== 'ended') batch.status = 'canceling';
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(batchToResponse(batch, getBatchBaseUrl(req))));
+}
+
 async function handleEmbeddings(req, res) {
   const ollamaBase = getOllamaHost();
   const ac = new AbortController();
@@ -2574,6 +2858,21 @@ async function requestHandler(req, res) {
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
       await handleCountTokens(req, res);
+    } else if (req.method === 'POST' && path === '/v1/messages/batches') {
+      if (!checkAuth(req, res)) return;
+      await handleCreateBatch(req, res);
+    } else if (req.method === 'GET' && path === '/v1/messages/batches') {
+      if (!checkAuth(req, res)) return;
+      await handleListBatches(req, res);
+    } else if (req.method === 'GET' && path.startsWith('/v1/messages/batches/') && path.endsWith('/results')) {
+      if (!checkAuth(req, res)) return;
+      await handleGetBatchResults(req, res, path.slice('/v1/messages/batches/'.length, -'/results'.length));
+    } else if (req.method === 'POST' && path.startsWith('/v1/messages/batches/') && path.endsWith('/cancel')) {
+      if (!checkAuth(req, res)) return;
+      await handleCancelBatch(req, res, path.slice('/v1/messages/batches/'.length, -'/cancel'.length));
+    } else if (req.method === 'GET' && path.startsWith('/v1/messages/batches/')) {
+      if (!checkAuth(req, res)) return;
+      await handleGetBatch(req, res, path.slice('/v1/messages/batches/'.length));
     } else if (req.method === 'POST' && path === '/v1/embeddings') {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
@@ -2761,6 +3060,16 @@ module.exports = {
   handleEmbeddings,
   handleDeleteModel,
   handlePullModel,
+  handleCreateBatch,
+  handleListBatches,
+  handleGetBatch,
+  handleGetBatchResults,
+  handleCancelBatch,
+  processBatch,
+  processBatchRequest,
+  batchRequestCounts,
+  batchToResponse,
+  _batches,
   handleMetricsPrometheus,
   // Rate-limit internals exported for unit testing only.
   checkRateLimit,
