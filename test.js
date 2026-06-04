@@ -27,6 +27,10 @@ const {
   checkConcurrency,
   trackActiveLlmRequest,
   _metrics,
+  cleanupExpiredBatches,
+  processBatch,
+  batchRequestCounts,
+  _batches,
 } = require('./proxy');
 
 // ── resolveModel ──────────────────────────────────────────────────────────────
@@ -1957,5 +1961,117 @@ describe('PROXY_IDLE_TIMEOUT — idle stream timeout', () => {
       res._body.includes('stuck') || res._body.includes('PROXY_IDLE_TIMEOUT') || res._body.includes('60ms'),
       `expected idle-timeout message in SSE body:\n${res._body}`
     );
+  });
+});
+
+// ── cleanupExpiredBatches ─────────────────────────────────────────────────────
+
+describe('cleanupExpiredBatches', () => {
+  // Helper: create a minimal batch entry and insert it into the shared _batches Map.
+  function makeBatch(overrides = {}) {
+    const id = 'msgbatch_test_' + Math.random().toString(36).slice(2);
+    const batch = {
+      id,
+      status:              'in_progress',
+      created_at:          new Date().toISOString(),
+      expires_at:          new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 h from now
+      ended_at:            null,
+      cancel_initiated_at: null,
+      requests:            [],
+      results:             new Map(),
+      cancelRequested:     false,
+      ...overrides,
+    };
+    _batches.set(id, batch);
+    return batch;
+  }
+
+  test('does not touch a fresh in-progress batch that has not expired', () => {
+    const batch = makeBatch({ requests: [{ custom_id: 'r1' }] });
+    cleanupExpiredBatches();
+    assert.equal(batch.status, 'in_progress', 'status should remain in_progress');
+    assert.ok(_batches.has(batch.id), 'batch should still be in the Map');
+    _batches.delete(batch.id); // cleanup
+  });
+
+  test('force-expires an in-progress batch past its TTL and marks unresolved items', () => {
+    const past = new Date(Date.now() - 1000).toISOString(); // 1 second ago
+    const batch = makeBatch({
+      expires_at: past,
+      requests:   [{ custom_id: 'r1' }, { custom_id: 'r2' }],
+    });
+    // r1 already has a result; r2 does not
+    batch.results.set('r1', { type: 'succeeded', message: {} });
+
+    cleanupExpiredBatches();
+
+    assert.equal(batch.status, 'ended', 'status should be ended after expiry enforcement');
+    assert.ok(batch.ended_at, 'ended_at should be set');
+    assert.equal(batch.results.get('r1').type, 'succeeded', 'existing result should be preserved');
+    assert.equal(batch.results.get('r2').type, 'expired', 'unresolved item should be marked expired');
+    _batches.delete(batch.id); // cleanup
+  });
+
+  test('removes an ended batch whose ended_at is more than 1 hour ago', () => {
+    const longAgo = new Date(Date.now() - 61 * 60 * 1000).toISOString(); // 61 minutes ago
+    const batch = makeBatch({
+      status:   'ended',
+      ended_at: longAgo,
+    });
+
+    cleanupExpiredBatches();
+
+    assert.ok(!_batches.has(batch.id), 'old ended batch should have been removed from the Map');
+  });
+
+  test('keeps a recently ended batch (< 1 hour old) in the Map', () => {
+    const recentlyEnded = new Date(Date.now() - 30 * 60 * 1000).toISOString(); // 30 minutes ago
+    const batch = makeBatch({
+      status:   'ended',
+      ended_at: recentlyEnded,
+    });
+
+    cleanupExpiredBatches();
+
+    assert.ok(_batches.has(batch.id), 'recently ended batch should still be in the Map');
+    _batches.delete(batch.id); // cleanup
+  });
+
+  test('does not touch a canceling batch that has not yet expired', () => {
+    const batch = makeBatch({
+      status:          'canceling',
+      cancelRequested: true,
+      requests:        [{ custom_id: 'r1' }],
+    });
+
+    cleanupExpiredBatches();
+
+    assert.equal(batch.status, 'canceling', 'status should remain canceling');
+    _batches.delete(batch.id); // cleanup
+  });
+});
+
+// ── processBatch expiry enforcement ──────────────────────────────────────────
+
+describe('processBatch — expiry enforcement', () => {
+  test('marks unprocessed items as expired when batch TTL has passed', async () => {
+    const past = new Date(Date.now() - 1000).toISOString();
+    const batch = {
+      id:             'msgbatch_expiry_test',
+      status:         'in_progress',
+      expires_at:     past,
+      ended_at:       null,
+      cancelRequested: false,
+      requests:       [{ custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } }],
+      results:        new Map(),
+    };
+    _batches.set(batch.id, batch);
+
+    await processBatch(batch);
+
+    assert.equal(batch.status, 'ended');
+    assert.equal(batch.results.get('r1').type, 'expired',
+      'item should be marked expired when batch TTL has passed');
+    _batches.delete(batch.id);
   });
 });

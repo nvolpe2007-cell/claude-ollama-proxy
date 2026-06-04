@@ -1749,6 +1749,12 @@ async function processBatch(batch) {
       batch.results.set(item.custom_id, { type: 'canceled' });
       continue;
     }
+    // Honour the 24-hour expires_at TTL: mark any remaining items as expired if the
+    // batch has already outlived its window, rather than continuing to burn GPU time.
+    if (Date.now() >= new Date(batch.expires_at).getTime()) {
+      batch.results.set(item.custom_id, { type: 'expired' });
+      continue;
+    }
     const result = await processBatchRequest(item.params, ollamaBase).catch(e => ({
       type: 'errored',
       error: { type: 'internal_error', message: e.message },
@@ -1757,6 +1763,34 @@ async function processBatch(batch) {
   }
   batch.status   = 'ended';
   batch.ended_at = new Date().toISOString();
+}
+
+// Enforces batch TTLs and reclaims memory for old ended batches.
+// Called on a 5-minute interval when the server is running, and exported for unit tests.
+//   • In-progress batches past expires_at → mark unresolved items as {type:'expired'},
+//     set status to 'ended'. (Covers batches whose processBatch loop has stalled or not
+//     yet started.)
+//   • Ended batches whose ended_at is more than 1 hour ago → deleted from the Map so
+//     their result data doesn't accumulate indefinitely in long-running deployments.
+function cleanupExpiredBatches() {
+  const now = Date.now();
+  const endedCutoff = new Date(now - 60 * 60 * 1000).toISOString();
+  for (const [id, batch] of _batches) {
+    // Remove batches that ended more than 1 hour ago.
+    if (batch.status === 'ended' && batch.ended_at && batch.ended_at < endedCutoff) {
+      _batches.delete(id);
+      continue;
+    }
+    // Force-expire batches still in-progress past their TTL.
+    if (batch.status !== 'ended' && now >= new Date(batch.expires_at).getTime()) {
+      for (const item of batch.requests) {
+        if (!batch.results.has(item.custom_id))
+          batch.results.set(item.custom_id, { type: 'expired' });
+      }
+      batch.status   = 'ended';
+      batch.ended_at = new Date().toISOString();
+    }
+  }
 }
 
 function getBatchBaseUrl(req) {
@@ -3094,6 +3128,11 @@ if (require.main === module) {
     }
   }, 5 * 60_000).unref();
 
+  // Periodically enforce batch TTLs and free memory for old ended batches.
+  // cleanupExpiredBatches handles both force-expiry of stalled in-progress batches
+  // and removal of ended batches older than 1 hour.
+  setInterval(cleanupExpiredBatches, 5 * 60_000).unref();
+
   // closeIdleConnections drops idle keep-alive connections immediately so
   // server.close() can actually reach its callback on SIGTERM.  Without this,
   // any open keep-alive socket from Claude Code would prevent a clean exit.
@@ -3139,6 +3178,7 @@ module.exports = {
   handleGetBatchResults,
   handleCancelBatch,
   processBatch,
+  cleanupExpiredBatches,
   processBatchRequest,
   batchRequestCounts,
   batchToResponse,
