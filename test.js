@@ -1864,3 +1864,98 @@ describe('handleMessages — max_tokens validation', () => {
     assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
   });
 });
+
+// ── PROXY_IDLE_TIMEOUT ────────────────────────────────────────────────────────
+
+describe('PROXY_IDLE_TIMEOUT — idle stream timeout', () => {
+  test('exported constant is null when env var is not set', () => {
+    const { PROXY_IDLE_TIMEOUT } = require('./proxy');
+    assert.strictEqual(PROXY_IDLE_TIMEOUT, null);
+  });
+
+  // Verifies that a stream which stalls after the first token chunk is aborted
+  // and surfaced as a request_timeout SSE error once the idle window expires.
+  // Uses module-cache surgery so the test doesn't depend on the ambient env var.
+  test('streaming emits request_timeout SSE error when no tokens arrive within idle window', async () => {
+    const enc = new TextEncoder();
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+
+    // Load a fresh copy of the module with a short idle timeout.
+    let freshHandler;
+    try {
+      process.env.PROXY_IDLE_TIMEOUT = '60';
+      delete require.cache[modKey];
+      freshHandler = require('./proxy').handleMessages;
+    } finally {
+      // Restore the original module so subsequent tests are unaffected.
+      delete process.env.PROXY_IDLE_TIMEOUT;
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+
+    // Mock a stream: one token chunk, then hangs until the AbortSignal fires.
+    let capturedSignal = null;
+    const origFetch = global.fetch;
+    global.fetch = async (_url, opts) => {
+      capturedSignal = opts?.signal;
+      return {
+        ok: true, status: 200,
+        body: {
+          getReader() {
+            let yielded = false;
+            return {
+              async read() {
+                if (!yielded) {
+                  yielded = true;
+                  return { done: false, value: enc.encode('data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n') };
+                }
+                return new Promise((_, reject) => {
+                  const abort = () => { const e = new Error('aborted'); e.name = 'AbortError'; reject(e); };
+                  if (capturedSignal?.aborted) { abort(); return; }
+                  capturedSignal?.addEventListener('abort', abort, { once: true });
+                });
+              },
+              releaseLock() {},
+            };
+          },
+        },
+      };
+    };
+
+    const req = {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST',
+      url: '/v1/messages',
+      [Symbol.asyncIterator]: async function* () {
+        yield JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: true, max_tokens: 100 });
+      },
+    };
+    const res = {
+      headersSent: false, writableEnded: false,
+      _body: '', _status: null, _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(s) { this._status = s; this.headersSent = true; },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; },
+      on() {}, once() {},
+    };
+
+    try {
+      await freshHandler(req, res);
+    } finally {
+      global.fetch = origFetch;
+    }
+
+    // Should have started the SSE stream (200) and emitted a request_timeout error.
+    assert.equal(res._status, 200, 'expected streaming 200 response');
+    assert.ok(res._body.includes('"request_timeout"'),
+      `expected request_timeout error in SSE body:\n${res._body}`);
+    assert.ok(
+      res._body.includes('stuck') || res._body.includes('PROXY_IDLE_TIMEOUT') || res._body.includes('60ms'),
+      `expected idle-timeout message in SSE body:\n${res._body}`
+    );
+  });
+});

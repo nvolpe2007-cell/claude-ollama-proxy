@@ -89,6 +89,12 @@ const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || null;
 // Hard per-request timeout (ms). If set, the proxy aborts the Ollama request and returns
 // a 504 / SSE error after this many milliseconds. Unset by default (no timeout).
 const PROXY_TIMEOUT     = process.env.PROXY_TIMEOUT     ? Number(process.env.PROXY_TIMEOUT)     : null;
+// Idle stream timeout (ms). If set, the proxy aborts a streaming response when no new
+// tokens are received from Ollama for this many milliseconds — useful for detecting a
+// model that has stalled mid-generation without needing PROXY_TIMEOUT to be set very high.
+// Only applies during the streaming phase (after the first SSE event is sent).
+// Unset by default (no idle timeout).
+const PROXY_IDLE_TIMEOUT = process.env.PROXY_IDLE_TIMEOUT ? Number(process.env.PROXY_IDLE_TIMEOUT) : null;
 // Default max_tokens when the client does not specify one. 8192 is a safe default for most
 // Ollama models; set higher (e.g. 32768) for models with large output budgets.
 const PROXY_MAX_TOKENS  = process.env.PROXY_MAX_TOKENS  ? Number(process.env.PROXY_MAX_TOKENS)  : 8192;
@@ -1127,6 +1133,22 @@ async function handleMessages(req, res) {
   // Prevent reverse-proxy read timeouts on slow models.
   const keepAlive = setInterval(() => res.writableEnded || res.write(': keepalive\n\n'), 15_000);
 
+  // Idle-stream timeout: abort if Ollama stops sending tokens mid-generation.
+  let idleTimerId = null;
+  let idleTimedOut = false;
+  const clearIdle = () => { if (idleTimerId) { clearTimeout(idleTimerId); idleTimerId = null; } };
+  const resetIdle = () => {
+    if (!PROXY_IDLE_TIMEOUT) return;
+    clearIdle();
+    idleTimerId = setTimeout(() => {
+      idleTimedOut = true;
+      timedOut = true;
+      if (!res.writableEnded) ac.abort();
+      console.warn(`Stream idle timeout after ${PROXY_IDLE_TIMEOUT}ms — no new tokens from Ollama`);
+    }, PROXY_IDLE_TIMEOUT);
+  };
+  resetIdle();
+
   const reader = ollamaRes.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
@@ -1135,6 +1157,7 @@ async function handleMessages(req, res) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      resetIdle();
 
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n');
@@ -1263,9 +1286,12 @@ async function handleMessages(req, res) {
   } catch (e) {
     if (e.name === 'AbortError') {
       if (timedOut && !res.writableEnded) {
+        const timeoutMsg = idleTimedOut
+          ? `No tokens received for ${PROXY_IDLE_TIMEOUT}ms — stream appears stuck`
+          : `Ollama did not respond within ${PROXY_TIMEOUT}ms`;
         sendSSE(res, 'error', {
           type: 'error',
-          error: { type: 'request_timeout', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms` }
+          error: { type: 'request_timeout', message: timeoutMsg }
         });
       }
       // Client-disconnect AbortErrors are silently discarded.
@@ -1278,6 +1304,7 @@ async function handleMessages(req, res) {
   } finally {
     req.socket.off('close', onClientClose);
     clearTO();
+    clearIdle();
     clearInterval(keepAlive);
     _metrics.activeStreams--;
   }
@@ -2184,6 +2211,7 @@ function handleDashboard(req, res) {
     rateLimitPerIpRpm:  RATE_LIMIT_PER_IP_RPM,
     warmup:             PROXY_WARMUP,
     timeout:            PROXY_TIMEOUT,
+    idleTimeout:        PROXY_IDLE_TIMEOUT,
     maxBodySize:        PROXY_MAX_BODY_SIZE,
     systemPrompt:       PROXY_SYSTEM_PROMPT ? PROXY_SYSTEM_PROMPT.slice(0, 120) + (PROXY_SYSTEM_PROMPT.length > 120 ? '…' : '') : null,
     ollamaOptions:      Object.keys(OLLAMA_OPTIONS).length > 0 ? JSON.stringify(OLLAMA_OPTIONS) : null,
@@ -2273,6 +2301,7 @@ async function refresh(){
   g+=row('Context (num_ctx)',C.numCtx?fmt(C.numCtx):'model default');
   if(C.keepAlive)g+=row('Keep-alive',C.keepAlive);
   if(C.timeout)g+=row('Timeout',fmt(C.timeout)+' ms');
+  if(C.idleTimeout)g+=row('Idle timeout',fmt(C.idleTimeout)+' ms');
   if(C.rateLimitRpm)g+=row('Rate limit (global)',fmt(C.rateLimitRpm)+' req/min');
   if(C.rateLimitPerIpRpm)g+=row('Rate limit (per-IP)',fmt(C.rateLimitPerIpRpm)+' req/min');
   if(C.maxConcurrency)g+=row('Max concurrency',fmt(C.maxConcurrency)+' req');
@@ -2514,6 +2543,22 @@ async function handleOpenAIChat(req, res) {
   let inputTokens = 0;
   let outputTokens = 0;
   const keepAlive = setInterval(() => res.writableEnded || res.write(': keepalive\n\n'), 15_000);
+
+  let idleTimerId = null;
+  let idleTimedOut = false;
+  const clearIdle = () => { if (idleTimerId) { clearTimeout(idleTimerId); idleTimerId = null; } };
+  const resetIdle = () => {
+    if (!PROXY_IDLE_TIMEOUT) return;
+    clearIdle();
+    idleTimerId = setTimeout(() => {
+      idleTimedOut = true;
+      timedOut = true;
+      if (!res.writableEnded) ac.abort();
+      console.warn(`Stream idle timeout after ${PROXY_IDLE_TIMEOUT}ms — no new tokens from Ollama`);
+    }, PROXY_IDLE_TIMEOUT);
+  };
+  resetIdle();
+
   const reader = ollamaRes.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
@@ -2522,6 +2567,7 @@ async function handleOpenAIChat(req, res) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      resetIdle();
 
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n');
@@ -2544,7 +2590,10 @@ async function handleOpenAIChat(req, res) {
   } catch (e) {
     if (e.name === 'AbortError') {
       if (timedOut && !res.writableEnded) {
-        res.write(`data: ${JSON.stringify({ error: { type: 'timeout_error', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms` } })}\n\n`);
+        const timeoutMsg = idleTimedOut
+          ? `No tokens received for ${PROXY_IDLE_TIMEOUT}ms — stream appears stuck`
+          : `Ollama did not respond within ${PROXY_TIMEOUT}ms`;
+        res.write(`data: ${JSON.stringify({ error: { type: 'timeout_error', message: timeoutMsg } })}\n\n`);
       }
     } else {
       console.error('OpenAI stream error:', e.message);
@@ -2555,6 +2604,7 @@ async function handleOpenAIChat(req, res) {
   } finally {
     req.socket.off('close', onClientClose);
     clearTO();
+    clearIdle();
     clearInterval(keepAlive);
     _metrics.activeStreams--;
   }
@@ -2746,6 +2796,22 @@ async function handleOpenAICompletions(req, res) {
   let inputTokens = 0;
   let outputTokens = 0;
   const keepAlive = setInterval(() => res.writableEnded || res.write(': keepalive\n\n'), 15_000);
+
+  let idleTimerId = null;
+  let idleTimedOut = false;
+  const clearIdle = () => { if (idleTimerId) { clearTimeout(idleTimerId); idleTimerId = null; } };
+  const resetIdle = () => {
+    if (!PROXY_IDLE_TIMEOUT) return;
+    clearIdle();
+    idleTimerId = setTimeout(() => {
+      idleTimedOut = true;
+      timedOut = true;
+      if (!res.writableEnded) ac.abort();
+      console.warn(`Stream idle timeout after ${PROXY_IDLE_TIMEOUT}ms — no new tokens from Ollama`);
+    }, PROXY_IDLE_TIMEOUT);
+  };
+  resetIdle();
+
   const reader = ollamaRes.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
@@ -2754,6 +2820,7 @@ async function handleOpenAICompletions(req, res) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      resetIdle();
 
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n');
@@ -2787,7 +2854,10 @@ async function handleOpenAICompletions(req, res) {
   } catch (e) {
     if (e.name === 'AbortError') {
       if (timedOut && !res.writableEnded) {
-        res.write(`data: ${JSON.stringify({ error: { type: 'timeout_error', message: `Ollama did not respond within ${PROXY_TIMEOUT}ms` } })}\n\n`);
+        const timeoutMsg = idleTimedOut
+          ? `No tokens received for ${PROXY_IDLE_TIMEOUT}ms — stream appears stuck`
+          : `Ollama did not respond within ${PROXY_TIMEOUT}ms`;
+        res.write(`data: ${JSON.stringify({ error: { type: 'timeout_error', message: timeoutMsg } })}\n\n`);
       }
     } else {
       console.error('Completions stream error:', e.message);
@@ -2798,6 +2868,7 @@ async function handleOpenAICompletions(req, res) {
   } finally {
     req.socket.off('close', onClientClose);
     clearTO();
+    clearIdle();
     clearInterval(keepAlive);
     _metrics.activeStreams--;
   }
@@ -2962,6 +3033,7 @@ if (require.main === module) {
     console.log(`  Ctx   : ${OLLAMA_NUM_CTX ? `num_ctx=${OLLAMA_NUM_CTX}` : 'model default (set OLLAMA_NUM_CTX to override)'}`);
     if (OLLAMA_KEEP_ALIVE) console.log(`  Keep  : keep_alive=${OLLAMA_KEEP_ALIVE}`);
     console.log(`  Timeout: ${PROXY_TIMEOUT ? `${PROXY_TIMEOUT}ms per request` : 'none (set PROXY_TIMEOUT to limit)'}`);
+    console.log(`  IdleTimeout: ${PROXY_IDLE_TIMEOUT ? `${PROXY_IDLE_TIMEOUT}ms idle stream timeout` : 'none (set PROXY_IDLE_TIMEOUT to abort stuck streams)'}`);
     console.log(`  MaxTok: default max_tokens=${PROXY_MAX_TOKENS}${PROXY_HARD_MAX_TOKENS ? ` (hard cap: ${PROXY_HARD_MAX_TOKENS})` : ' (set PROXY_HARD_MAX_TOKENS to cap)'}`);
     console.log(`  MaxBody: ${PROXY_MAX_BODY_SIZE ? `${PROXY_MAX_BODY_SIZE} B per request` : 'unlimited (set PROXY_MAX_BODY_SIZE to limit)'}`);
     if (PROXY_SYSTEM_PROMPT) console.log(`  SysPrompt: ${PROXY_SYSTEM_PROMPT.slice(0, 80)}${PROXY_SYSTEM_PROMPT.length > 80 ? '…' : ''}`);
@@ -3042,6 +3114,7 @@ module.exports = {
   resolveModel,
   resolveMaxTokens,
   PROXY_HARD_MAX_TOKENS,
+  PROXY_IDLE_TIMEOUT,
   toOpenAIMessages,
   toOpenAITools,
   toOpenAIToolChoice,
