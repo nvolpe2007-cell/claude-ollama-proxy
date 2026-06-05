@@ -2075,3 +2075,173 @@ describe('processBatch — expiry enforcement', () => {
     _batches.delete(batch.id);
   });
 });
+
+// ── PROXY_FORCE_THINK ─────────────────────────────────────────────────────────
+// Verifies that PROXY_FORCE_THINK=true causes think:true to be forwarded to
+// Ollama on handleMessages and handleOpenAICompletions requests, and that it
+// is absent (false) in the default test environment.
+
+describe('PROXY_FORCE_THINK', () => {
+  const { PROXY_FORCE_THINK } = require('./proxy');
+
+  test('exported constant is false when env var is not set', () => {
+    assert.strictEqual(PROXY_FORCE_THINK, false);
+  });
+
+  // Helper: load a fresh proxy module with PROXY_FORCE_THINK=true, run a
+  // single test, then restore the module cache so other tests are unaffected.
+  function withForceThink(fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    let freshProxy;
+    try {
+      process.env.PROXY_FORCE_THINK = 'true';
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      delete process.env.PROXY_FORCE_THINK;
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  test('PROXY_FORCE_THINK=true is exported as true from a fresh module load', () => {
+    withForceThink(m => {
+      assert.strictEqual(m.PROXY_FORCE_THINK, true);
+    });
+  });
+
+  test('handleMessages sends think:true to Ollama when PROXY_FORCE_THINK=true', async () => {
+    await withForceThink(async (m) => {
+      let sentBody = null;
+      const origFetch = global.fetch;
+      global.fetch = async (_url, opts) => {
+        sentBody = JSON.parse(opts.body);
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 3, completion_tokens: 1 },
+          }),
+          body: null,
+        };
+      };
+      const req = {
+        headers: {},
+        socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+        method: 'POST', url: '/v1/messages',
+        [Symbol.asyncIterator]: async function* () {
+          yield JSON.stringify({ messages: [{ role: 'user', content: 'hello' }], stream: false });
+        },
+      };
+      const res = {
+        headersSent: false, writableEnded: false,
+        _status: null, _body: '', _headers: {},
+        setHeader(k, v) { this._headers[k] = v; },
+        getHeader(k) { return this._headers[k]; },
+        writeHead(s) { this._status = s; this.headersSent = true; },
+        write(c) { this._body += c; },
+        end(c = '') { this._body += c; this.writableEnded = true; },
+        on() {},
+      };
+      try {
+        await m.handleMessages(req, res);
+      } finally {
+        global.fetch = origFetch;
+      }
+      assert.ok(sentBody !== null, 'fetch should have been called');
+      assert.strictEqual(sentBody.think, true,
+        'think:true should be forwarded to Ollama when PROXY_FORCE_THINK=true');
+    });
+  });
+
+  test('handleMessages does NOT send think:true by default (PROXY_FORCE_THINK=false)', async () => {
+    const { handleMessages } = require('./proxy');
+    let sentBody = null;
+    const origFetch = global.fetch;
+    global.fetch = async (_url, opts) => {
+      sentBody = JSON.parse(opts.body);
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 3, completion_tokens: 1 },
+        }),
+        body: null,
+      };
+    };
+    const req = {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST', url: '/v1/messages',
+      [Symbol.asyncIterator]: async function* () {
+        yield JSON.stringify({ messages: [{ role: 'user', content: 'hello' }], stream: false });
+      },
+    };
+    const res = {
+      headersSent: false, writableEnded: false,
+      _status: null, _body: '', _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(s) { this._status = s; this.headersSent = true; },
+      write(c) { this._body += c; },
+      end(c = '') { this._body += c; this.writableEnded = true; },
+      on() {},
+    };
+    try {
+      await handleMessages(req, res);
+    } finally {
+      global.fetch = origFetch;
+    }
+    assert.ok(sentBody !== null, 'fetch should have been called');
+    assert.ok(!('think' in sentBody),
+      'think field should NOT be present when PROXY_FORCE_THINK is false and client did not request thinking');
+  });
+
+  test('handleMessages still sends think:true when client requests thinking explicitly (without PROXY_FORCE_THINK)', async () => {
+    const { handleMessages } = require('./proxy');
+    let sentBody = null;
+    const origFetch = global.fetch;
+    global.fetch = async (_url, opts) => {
+      sentBody = JSON.parse(opts.body);
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 3, completion_tokens: 1 },
+        }),
+        body: null,
+      };
+    };
+    const req = {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST', url: '/v1/messages',
+      [Symbol.asyncIterator]: async function* () {
+        yield JSON.stringify({
+          messages: [{ role: 'user', content: 'think hard' }],
+          stream: false,
+          thinking: { type: 'enabled', budget_tokens: 2048 },
+        });
+      },
+    };
+    const res = {
+      headersSent: false, writableEnded: false,
+      _status: null, _body: '', _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(s) { this._status = s; this.headersSent = true; },
+      write(c) { this._body += c; },
+      end(c = '') { this._body += c; this.writableEnded = true; },
+      on() {},
+    };
+    try {
+      await handleMessages(req, res);
+    } finally {
+      global.fetch = origFetch;
+    }
+    assert.strictEqual(sentBody.think, true,
+      'think:true should be set when client explicitly requests thinking');
+  });
+});

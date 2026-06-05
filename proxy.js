@@ -95,6 +95,13 @@ const PROXY_TIMEOUT     = process.env.PROXY_TIMEOUT     ? Number(process.env.PRO
 // Only applies during the streaming phase (after the first SSE event is sent).
 // Unset by default (no idle timeout).
 const PROXY_IDLE_TIMEOUT = process.env.PROXY_IDLE_TIMEOUT ? Number(process.env.PROXY_IDLE_TIMEOUT) : null;
+// When true, unconditionally adds think:true to every outgoing Ollama inference request,
+// enabling native chain-of-thought reasoning for thinking models (DeepSeek-R1, Qwen3-thinking,
+// etc.) without requiring the client (Claude Code, Cursor, etc.) to send
+// thinking:{type:"enabled"} on each request. Safe to set on non-thinking models — Ollama
+// ignores the parameter when the model doesn't support it. Per-request client thinking
+// parameters still apply on top of this baseline.
+const PROXY_FORCE_THINK = process.env.PROXY_FORCE_THINK === 'true';
 // Default max_tokens when the client does not specify one. 8192 is a safe default for most
 // Ollama models; set higher (e.g. 32768) for models with large output budgets.
 const PROXY_MAX_TOKENS  = process.env.PROXY_MAX_TOKENS  ? Number(process.env.PROXY_MAX_TOKENS)  : 8192;
@@ -828,7 +835,7 @@ async function handleMessages(req, res) {
   // Anthropic extended-thinking → Ollama's native think parameter.
   // Ollama 0.7+ passes think:true to supported models (Qwen3-thinking, DeepSeek-R1, etc.)
   // which makes them emit <think>…</think> blocks the proxy already handles.
-  if (anthropicReq.thinking?.type === 'enabled') openaiReq.think = true;
+  if (anthropicReq.thinking?.type === 'enabled' || PROXY_FORCE_THINK) openaiReq.think = true;
   // OLLAMA_OPTIONS: fill in Ollama-specific params not already set by the request.
   for (const [k, v] of Object.entries(OLLAMA_OPTIONS)) {
     if (!(k in openaiReq)) openaiReq[k] = v;
@@ -1658,7 +1665,7 @@ async function processBatchRequest(anthropicReq, ollamaBase) {
   if (anthropicReq.seed                 !== undefined) openaiReq.seed                 = anthropicReq.seed;
   if (anthropicReq.stop_sequences?.length)             openaiReq.stop                 = anthropicReq.stop_sequences;
   if (anthropicReq.disable_parallel_tool_use === true) openaiReq.parallel_tool_calls  = false;
-  if (anthropicReq.thinking?.type === 'enabled')       openaiReq.think                = true;
+  if (anthropicReq.thinking?.type === 'enabled' || PROXY_FORCE_THINK) openaiReq.think = true;
   for (const [k, v] of Object.entries(OLLAMA_OPTIONS))
     if (!(k in openaiReq)) openaiReq[k] = v;
   if (OLLAMA_NUM_CTX)    openaiReq.num_ctx    = OLLAMA_NUM_CTX;
@@ -2252,6 +2259,7 @@ function handleDashboard(req, res) {
     maxConcurrency:     PROXY_MAX_CONCURRENCY,
     maxQueueSize:       PROXY_MAX_QUEUE_SIZE,
     queueTimeoutMs:     PROXY_MAX_QUEUE_TIMEOUT,
+    forceThink:         PROXY_FORCE_THINK,
   });
 
   const html = `<!DOCTYPE html>
@@ -2344,6 +2352,7 @@ async function refresh(){
   g+=row('Log format',C.logFormat);
   if(C.logLevel==='debug')g+=row('Log level','<span class="warn">debug (verbose)</span>');
   if(C.systemPrompt)g+=row('System prompt',\`<span title="\${C.systemPrompt}" style="cursor:help">set ℹ</span>\`);
+  if(C.forceThink)g+=row('Force thinking','<span class="ok">Enabled (think:true on all requests)</span>');
   if(C.ollamaOptions)g+=row('Ollama options',\`<span title="\${C.ollamaOptions}" style="cursor:help;font-size:11px">\${C.ollamaOptions.length>40?C.ollamaOptions.slice(0,40)+'…':C.ollamaOptions}</span>\`);
   g+='<div class="sep"></div>';
   g+='<div class="row" style="gap:8px"><a href="/health">health</a><a href="/metrics">metrics JSON</a><a href="/metrics/prometheus">prometheus</a><a href="/v1/models">models</a></div>';
@@ -2477,6 +2486,7 @@ async function handleOpenAIChat(req, res) {
   // Dedicated env vars take highest precedence (unconditional overwrite).
   if (OLLAMA_NUM_CTX)         openaiReq.num_ctx      = OLLAMA_NUM_CTX;
   if (OLLAMA_KEEP_ALIVE)      openaiReq.keep_alive   = OLLAMA_KEEP_ALIVE;
+  if (PROXY_FORCE_THINK && !('think' in openaiReq)) openaiReq.think = true;
   const streaming = openaiReq.stream === true;
   if (streaming) openaiReq.stream_options = { include_usage: true };
 
@@ -2725,6 +2735,7 @@ async function handleOpenAICompletions(req, res) {
   }
   if (OLLAMA_NUM_CTX)    chatReq.num_ctx    = OLLAMA_NUM_CTX;
   if (OLLAMA_KEEP_ALIVE) chatReq.keep_alive = OLLAMA_KEEP_ALIVE;
+  if (PROXY_FORCE_THINK) chatReq.think = true;
 
   if (PROXY_SYSTEM_PROMPT) {
     chatReq.messages.unshift({ role: 'system', content: PROXY_SYSTEM_PROMPT });
@@ -3072,6 +3083,7 @@ if (require.main === module) {
     console.log(`  MaxBody: ${PROXY_MAX_BODY_SIZE ? `${PROXY_MAX_BODY_SIZE} B per request` : 'unlimited (set PROXY_MAX_BODY_SIZE to limit)'}`);
     if (PROXY_SYSTEM_PROMPT) console.log(`  SysPrompt: ${PROXY_SYSTEM_PROMPT.slice(0, 80)}${PROXY_SYSTEM_PROMPT.length > 80 ? '…' : ''}`);
     console.log(`  Logs  : format=${LOG_FORMAT} level=${LOG_LEVEL} (LOG_FORMAT=json for structured; LOG_LEVEL=debug for full request/response bodies)`);
+    console.log(`  Think : ${PROXY_FORCE_THINK ? 'forced (think:true on every request — set PROXY_FORCE_THINK=false to disable)' : 'client-controlled (set PROXY_FORCE_THINK=true to always enable for thinking models)'}`);
     console.log(`  Warmup: ${PROXY_WARMUP ? 'enabled — pre-loading model on startup' : 'disabled (set PROXY_WARMUP=true to pre-load model)'}`);
     const rlGlobal = RATE_LIMIT_RPM        ? `global ${RATE_LIMIT_RPM} req/min`    : 'no global limit';
     const rlIp     = RATE_LIMIT_PER_IP_RPM ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min` : 'no per-IP limit';
@@ -3154,6 +3166,7 @@ module.exports = {
   resolveMaxTokens,
   PROXY_HARD_MAX_TOKENS,
   PROXY_IDLE_TIMEOUT,
+  PROXY_FORCE_THINK,
   toOpenAIMessages,
   toOpenAITools,
   toOpenAIToolChoice,
