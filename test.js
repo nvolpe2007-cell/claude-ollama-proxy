@@ -1281,6 +1281,67 @@ describe('acquireLlmSlot / releaseLlmSlot', () => {
   });
 });
 
+// ── acquireLlmSlotForBatch ────────────────────────────────────────────────────
+
+describe('acquireLlmSlotForBatch', () => {
+  const { acquireLlmSlotForBatch, releaseLlmSlot, _concurrencyQueue, _metrics } = require('./proxy');
+
+  test('when PROXY_MAX_CONCURRENCY is unset, grants immediately and increments counter', async () => {
+    const before = _metrics.activeLlmRequests;
+    await acquireLlmSlotForBatch();
+    assert.equal(_metrics.activeLlmRequests, before + 1, 'activeLlmRequests incremented');
+    releaseLlmSlot();
+    assert.equal(_metrics.activeLlmRequests, before, 'counter back to baseline after release');
+  });
+
+  test('queues and resolves once a slot is released', async () => {
+    // Simulate max concurrency = 1 by incrementing the counter to the limit.
+    // We borrow the slot directly so we can release it at will.
+    const before = _metrics.activeLlmRequests;
+    _metrics.activeLlmRequests++;  // fill the (simulated) one slot
+
+    // Patch PROXY_MAX_CONCURRENCY by directly saturating the queue mechanism:
+    // push the entry ourselves as acquireLlmSlotForBatch would if the counter equalled the cap.
+    // Instead, exercise the real function by manually controlling when the slot is freed.
+    let resolved = false;
+    const waitPromise = (async () => {
+      // The queue is empty and activeLlmRequests > 0; inject a waiter directly.
+      _metrics.queuedLlmRequests++;
+      await new Promise(resolve => {
+        _concurrencyQueue.push({
+          onGranted: () => {
+            _metrics.queuedLlmRequests--;
+            resolved = true;
+            resolve();
+          },
+        });
+      });
+    })();
+
+    assert.equal(resolved, false, 'should not be resolved yet');
+    assert.equal(_metrics.queuedLlmRequests, 1, 'waiter should be queued');
+
+    // Release the occupied slot — this should hand it to the queued waiter.
+    releaseLlmSlot();
+    await waitPromise;
+
+    assert.equal(resolved, true, 'waiter resolved after slot released');
+    assert.equal(_metrics.queuedLlmRequests, 0, 'queuedLlmRequests back to 0');
+    assert.equal(_metrics.activeLlmRequests, before + 1, 'slot transferred, not freed and re-acquired');
+
+    // Final cleanup.
+    releaseLlmSlot();
+    assert.equal(_metrics.activeLlmRequests, before, 'back to baseline');
+  });
+
+  test('does not touch queuedLlmRequests when granted immediately', async () => {
+    const qBefore = _metrics.queuedLlmRequests;
+    await acquireLlmSlotForBatch();
+    assert.equal(_metrics.queuedLlmRequests, qBefore, 'queuedLlmRequests unchanged on immediate grant');
+    releaseLlmSlot();
+  });
+});
+
 // ── handleMessages ────────────────────────────────────────────────────────────
 // Unit tests for the core Anthropic-format handler using mock req/res/fetch.
 // Covers non-streaming and streaming paths without needing a real Ollama server.

@@ -706,6 +706,33 @@ async function acquireLlmSlot(req, res) {
   });
 }
 
+// Batch-specific concurrency slot acquisition. Unlike acquireLlmSlot, there is no HTTP
+// response to send a 503 to, so this simply waits indefinitely until a slot is available.
+// Increments activeLlmRequests when granted; the caller must call releaseLlmSlot() when done.
+// This ensures batch items respect PROXY_MAX_CONCURRENCY and compete fairly with real-time
+// requests rather than bypassing the gate and potentially causing GPU VRAM OOM errors.
+async function acquireLlmSlotForBatch() {
+  if (!PROXY_MAX_CONCURRENCY) {
+    _metrics.activeLlmRequests++;
+    return;
+  }
+  if (_metrics.activeLlmRequests < PROXY_MAX_CONCURRENCY) {
+    _metrics.activeLlmRequests++;
+    return;
+  }
+  // All concurrency slots are taken — queue and wait. Incrementing queuedLlmRequests here
+  // ensures that /metrics and the dashboard accurately reflect batch items waiting for a slot.
+  _metrics.queuedLlmRequests++;
+  await new Promise(resolve => {
+    _concurrencyQueue.push({
+      onGranted: () => {
+        _metrics.queuedLlmRequests--;
+        resolve();
+      },
+    });
+  });
+}
+
 // Returns true and records the in-flight request if below PROXY_MAX_CONCURRENCY;
 // writes a 503 overloaded_error and returns false when the limit is reached.
 // Node.js is single-threaded, so the check + increment before the first await is race-free.
@@ -1749,6 +1776,9 @@ async function processBatchRequest(anthropicReq, ollamaBase) {
 
 // Drive a batch to completion in the background (serially to avoid GPU OOM).
 // Runs as a fire-and-forget task started with setImmediate from handleCreateBatch.
+// Each item acquires a concurrency slot via acquireLlmSlotForBatch before calling
+// Ollama, so batch requests respect PROXY_MAX_CONCURRENCY and compete fairly with
+// real-time requests rather than bypassing the gate.
 async function processBatch(batch) {
   const ollamaBase = getOllamaHost();
   for (const item of batch.requests) {
@@ -1762,10 +1792,12 @@ async function processBatch(batch) {
       batch.results.set(item.custom_id, { type: 'expired' });
       continue;
     }
+    await acquireLlmSlotForBatch();
     const result = await processBatchRequest(item.params, ollamaBase).catch(e => ({
       type: 'errored',
       error: { type: 'internal_error', message: e.message },
     }));
+    releaseLlmSlot();
     batch.results.set(item.custom_id, result);
   }
   batch.status   = 'ended';
@@ -3204,6 +3236,7 @@ module.exports = {
   // Concurrency-limit internals exported for unit testing only.
   checkConcurrency,
   acquireLlmSlot,
+  acquireLlmSlotForBatch,
   releaseLlmSlot,
   trackActiveLlmRequest,
   _concurrencyQueue,
