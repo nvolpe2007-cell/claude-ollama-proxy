@@ -63,7 +63,12 @@ function getOllamaHost() {
 
 const MODEL         = process.env.OLLAMA_MODEL    || 'qwen2.5:7b';
 const PORT          = process.env.PROXY_PORT      || 4000;
-const PROXY_API_KEY = process.env.PROXY_API_KEY   || null;
+const PROXY_API_KEY    = process.env.PROXY_API_KEY    || null;
+// PROXY_LISTEN_HOST restricts the address the proxy binds to.
+// Default (unset) listens on all interfaces (0.0.0.0 / ::).
+// Set to '127.0.0.1' to accept connections only from localhost — useful when
+// running on a shared or internet-facing machine without a firewall.
+const PROXY_LISTEN_HOST = process.env.PROXY_LISTEN_HOST || null;
 const TLS_CERT      = process.env.PROXY_TLS_CERT  || null;
 const TLS_KEY       = process.env.PROXY_TLS_KEY   || null;
 // CORS_ORIGIN controls the Access-Control-Allow-Origin header.
@@ -2292,6 +2297,7 @@ function handleDashboard(req, res) {
     maxQueueSize:       PROXY_MAX_QUEUE_SIZE,
     queueTimeoutMs:     PROXY_MAX_QUEUE_TIMEOUT,
     forceThink:         PROXY_FORCE_THINK,
+    listenHost:         PROXY_LISTEN_HOST,
   });
 
   const html = `<!DOCTYPE html>
@@ -2366,6 +2372,7 @@ async function refresh(){
   g+=row('Model',C.model);
   g+=row('Version',C.version);
   g+=row('Port',C.port);
+  if(C.listenHost)g+=row('Bind address',C.listenHost);
   if(C.hosts.length===1)g+=row('Ollama host',C.hosts[0].replace(/^https?:\/\//,''));
   else g+=row('Ollama hosts',C.hosts.length+' (round-robin)');
   g+=row('Auth',badge(C.auth,'Enabled','Open — no key'));
@@ -3090,7 +3097,7 @@ if (require.main === module) {
   process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
   process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason));
 
-  server.listen(PORT, () => {
+  server.listen(PORT, PROXY_LISTEN_HOST || undefined, () => {
     console.log(`\n  Claude-Ollama proxy ready`);
     console.log(`  Model : ${MODEL}`);
     if (Object.keys(MODEL_MAP).length > 0) {
@@ -3098,6 +3105,7 @@ if (require.main === module) {
         console.log(`  Map   : ${k} → ${v}`);
     }
     console.log(`  Port  : ${PORT}`);
+    console.log(`  Bind  : ${PROXY_LISTEN_HOST || '0.0.0.0 (all interfaces — set PROXY_LISTEN_HOST=127.0.0.1 to restrict)'}`);
     if (OLLAMA_HOSTS.length === 1) {
       console.log(`  Ollama: ${OLLAMA_HOSTS[0]}`);
     } else {
@@ -3126,6 +3134,29 @@ if (require.main === module) {
     if (Object.keys(OLLAMA_OPTIONS).length > 0)
       console.log(`  Options: OLLAMA_OPTIONS=${JSON.stringify(OLLAMA_OPTIONS)}`);
     console.log('');
+
+    // Non-blocking Ollama connectivity check. Skipped when PROXY_WARMUP=true because the
+    // warmup request already verifies reachability as part of model pre-loading. Without
+    // this check, operators who skip PROXY_WARMUP wouldn't know Ollama is unreachable until
+    // the first actual request fails with an opaque 502.
+    if (!PROXY_WARMUP) {
+      setImmediate(async () => {
+        const results = await Promise.all(OLLAMA_HOSTS.map(async (url) => {
+          try {
+            const r = await fetch(`${url}/api/tags`, { signal: AbortSignal.timeout(3000) });
+            return r.ok ? null : `${url} (HTTP ${r.status})`;
+          } catch (e) {
+            return `${url} (${e.message})`;
+          }
+        }));
+        const failures = results.filter(Boolean);
+        if (failures.length > 0) {
+          console.warn(`  Warning: ${failures.length} Ollama host(s) unreachable at startup:`);
+          failures.forEach(f => console.warn(`    ${f}`));
+          console.warn('  Requests will fail until Ollama is running. Start with: ollama serve\n');
+        }
+      });
+    }
 
     if (PROXY_WARMUP) {
       // Fire warmup asynchronously so the server is already accepting connections while we load.
