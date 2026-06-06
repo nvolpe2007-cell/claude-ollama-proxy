@@ -2509,7 +2509,9 @@ async function handleOpenAIChat(req, res) {
 
   const effectiveModel = resolveModel(openaiReq.model);
   openaiReq.model = effectiveModel;
-  const chatMaxResult = resolveMaxTokens(openaiReq.max_tokens || null);
+  // Accept max_completion_tokens as an alias — newer OpenAI SDK versions (used with o1/o3 models)
+  // send this field instead of max_tokens. max_tokens takes precedence when both are present.
+  const chatMaxResult = resolveMaxTokens(openaiReq.max_tokens ?? openaiReq.max_completion_tokens ?? null);
   if (chatMaxResult.error) {
     req.socket.off('close', onClientClose);
     clearTO();
@@ -2518,6 +2520,8 @@ async function handleOpenAIChat(req, res) {
     return;
   }
   openaiReq.max_tokens = chatMaxResult.value;
+  // Remove max_completion_tokens to avoid forwarding conflicting fields to Ollama.
+  delete openaiReq.max_completion_tokens;
   // OLLAMA_OPTIONS: fill in deployment-level params not already in the client request.
   for (const [k, v] of Object.entries(OLLAMA_OPTIONS)) {
     if (!(k in openaiReq)) openaiReq[k] = v;

@@ -2137,6 +2137,275 @@ describe('processBatch — expiry enforcement', () => {
   });
 });
 
+// ── handleOpenAIChat ──────────────────────────────────────────────────────────
+// Unit tests for the OpenAI-format chat completions passthrough used by Cursor,
+// Continue, LiteLLM, and other OpenAI-compatible clients.
+
+describe('handleOpenAIChat', () => {
+  const { handleOpenAIChat } = require('./proxy');
+
+  function mockReq(body) {
+    return {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST',
+      url: '/v1/chat/completions',
+      [Symbol.asyncIterator]: async function* () { yield JSON.stringify(body); },
+    };
+  }
+
+  function mockRes() {
+    const res = {
+      headersSent: false,
+      writableEnded: false,
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(status, headers) {
+        this._status = status; this.headersSent = true;
+        if (headers) for (const [k, v] of Object.entries(headers)) this._headers[k] = v;
+      },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; },
+      on() {},
+    };
+    return res;
+  }
+
+  function stubFetch(response, status = 200) {
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: status < 400,
+      status,
+      json: async () => response,
+      text: async () => JSON.stringify(response),
+      body: null,
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  function stubStreamFetch(sseLines) {
+    const enc = new TextEncoder();
+    let pos = 0;
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      body: {
+        getReader() {
+          return {
+            async read() {
+              if (pos >= sseLines.length) return { done: true, value: undefined };
+              return { done: false, value: enc.encode(sseLines[pos++] + '\n') };
+            },
+            releaseLock() {},
+          };
+        },
+      },
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  test('400 on invalid JSON body', async () => {
+    const req = {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST', url: '/v1/chat/completions',
+      [Symbol.asyncIterator]: async function* () { yield 'NOT JSON'; },
+    };
+    const res = mockRes();
+    await handleOpenAIChat(req, res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('400 when messages field is absent', async () => {
+    const res = mockRes();
+    await handleOpenAIChat(mockReq({ model: 'llama3' }), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /messages/);
+  });
+
+  test('400 when messages is not an array', async () => {
+    const res = mockRes();
+    await handleOpenAIChat(mockReq({ messages: 'not-an-array' }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('400 when max_tokens is invalid (negative)', async () => {
+    const res = mockRes();
+    await handleOpenAIChat(mockReq({
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: -1,
+    }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('non-streaming: pipes Ollama JSON response with correct status', async () => {
+    const ollamaResp = {
+      id: 'chatcmpl-abc',
+      object: 'chat.completion',
+      model: 'qwen2.5:7b',
+      choices: [{ message: { role: 'assistant', content: 'Hi!' }, finish_reason: 'stop', index: 0 }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    };
+    const restore = stubFetch(ollamaResp);
+    try {
+      const res = mockRes();
+      await handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'Hello' }] }), res);
+      assert.equal(res._status, 200);
+      const body = JSON.parse(res._body);
+      assert.equal(body.id, 'chatcmpl-abc');
+      assert.equal(body.choices[0].message.content, 'Hi!');
+    } finally { restore(); }
+  });
+
+  test('non-streaming: resolves claude-* model names to Ollama models', async () => {
+    let capturedBody;
+    const origFetch = global.fetch;
+    global.fetch = async (_url, opts) => {
+      capturedBody = JSON.parse(opts.body);
+      return {
+        ok: true, status: 200,
+        json: async () => ({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 3, completion_tokens: 1 } }),
+      };
+    };
+    try {
+      const res = mockRes();
+      await handleOpenAIChat(mockReq({ model: 'claude-3-haiku-20240307', messages: [{ role: 'user', content: 'hi' }] }), res);
+      assert.ok(capturedBody.model, 'model should be forwarded');
+      assert.ok(!capturedBody.model.startsWith('claude-'), 'claude-* name should be resolved to a real Ollama model name');
+    } finally { global.fetch = origFetch; }
+  });
+
+  test('non-streaming: applies PROXY_MAX_TOKENS default when max_tokens is omitted', async () => {
+    let capturedBody;
+    const origFetch = global.fetch;
+    global.fetch = async (_url, opts) => {
+      capturedBody = JSON.parse(opts.body);
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: {} }) };
+    };
+    try {
+      const res = mockRes();
+      await handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'hi' }] }), res);
+      assert.ok(typeof capturedBody.max_tokens === 'number' && capturedBody.max_tokens > 0,
+        'max_tokens should default to a positive number when omitted');
+    } finally { global.fetch = origFetch; }
+  });
+
+  test('non-streaming: max_completion_tokens used as alias when max_tokens is absent', async () => {
+    let capturedBody;
+    const origFetch = global.fetch;
+    global.fetch = async (_url, opts) => {
+      capturedBody = JSON.parse(opts.body);
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: {} }) };
+    };
+    try {
+      const res = mockRes();
+      await handleOpenAIChat(mockReq({
+        messages: [{ role: 'user', content: 'hi' }],
+        max_completion_tokens: 256,
+      }), res);
+      assert.equal(capturedBody.max_tokens, 256,
+        'max_completion_tokens should be honoured as max_tokens when max_tokens is absent');
+      assert.ok(!('max_completion_tokens' in capturedBody),
+        'max_completion_tokens should be removed before forwarding to avoid conflicting fields');
+    } finally { global.fetch = origFetch; }
+  });
+
+  test('non-streaming: max_tokens takes precedence over max_completion_tokens when both present', async () => {
+    let capturedBody;
+    const origFetch = global.fetch;
+    global.fetch = async (_url, opts) => {
+      capturedBody = JSON.parse(opts.body);
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: {} }) };
+    };
+    try {
+      const res = mockRes();
+      await handleOpenAIChat(mockReq({
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 100,
+        max_completion_tokens: 999,
+      }), res);
+      assert.equal(capturedBody.max_tokens, 100, 'max_tokens should take precedence');
+      assert.ok(!('max_completion_tokens' in capturedBody), 'max_completion_tokens should be removed');
+    } finally { global.fetch = origFetch; }
+  });
+
+  test('non-streaming: proxies Ollama error status directly', async () => {
+    const restore = stubFetch('{"error":"model not found"}', 404);
+    try {
+      const res = mockRes();
+      await handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'hi' }] }), res);
+      assert.equal(res._status, 404);
+    } finally { restore(); }
+  });
+
+  test('non-streaming: records token usage in _logMeta for request logging', async () => {
+    const restore = stubFetch({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 15, completion_tokens: 7 },
+    });
+    try {
+      const res = mockRes();
+      await handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'hi' }] }), res);
+      assert.ok(res._logMeta, '_logMeta should be set for request logging');
+      assert.equal(res._logMeta.tokensIn, 15);
+      assert.equal(res._logMeta.tokensOut, 7);
+    } finally { restore(); }
+  });
+
+  test('streaming: returns 200 with text/event-stream content-type', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'hello' }], stream: true }), res);
+      assert.equal(res._status, 200);
+      assert.ok(res._headers['Content-Type']?.includes('text/event-stream'),
+        'streaming response must have SSE content-type');
+    } finally { restore(); }
+  });
+
+  test('streaming: pipes Ollama SSE lines and includes [DONE] sentinel', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}',
+      'data: {"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'hi' }], stream: true }), res);
+      assert.ok(res._body.includes('"hello"'), 'first chunk content should appear in SSE output');
+      assert.ok(res._body.includes('[DONE]'), '[DONE] sentinel should be piped through');
+    } finally { restore(); }
+  });
+
+  test('streaming: extracts token usage from trailing Ollama usage chunk into _logMeta', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'ping' }], stream: true }), res);
+      assert.ok(res._logMeta, '_logMeta should be set after streaming completes');
+      assert.equal(res._logMeta.tokensIn, 7, 'input tokens from trailing usage chunk');
+      assert.equal(res._logMeta.tokensOut, 3, 'output tokens from trailing usage chunk');
+    } finally { restore(); }
+  });
+});
+
 // ── PROXY_FORCE_THINK ─────────────────────────────────────────────────────────
 // Verifies that PROXY_FORCE_THINK=true causes think:true to be forwarded to
 // Ollama on handleMessages and handleOpenAICompletions requests, and that it
