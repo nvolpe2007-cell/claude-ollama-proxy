@@ -1001,10 +1001,11 @@ async function handleMessages(req, res) {
   }
 
   // ── Streaming ───────────────────────────────────────────────────────────────────────────────
+  res.setHeader('X-Accel-Buffering', 'no');
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
+    'Connection': 'keep-alive',
   });
   _metrics.activeStreams++;
 
@@ -1592,6 +1593,7 @@ async function handlePullModel(req, res) {
   }
 
   // Streaming: pipe Ollama's NDJSON progress as SSE so callers can watch download progress.
+  res.setHeader('X-Accel-Buffering', 'no');
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -2620,6 +2622,7 @@ async function handleOpenAIChat(req, res) {
   // Streaming: pipe SSE lines through verbatim, intercepting the usage chunk for metrics.
   // Splitting on '\n' and re-emitting 'line\n' correctly preserves SSE '\n\n' event separators
   // because blank separator lines become '\n' tokens that write as the required double-newline.
+  res.setHeader('X-Accel-Buffering', 'no');
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -2872,6 +2875,7 @@ async function handleOpenAICompletions(req, res) {
   }
 
   // ── Streaming ─────────────────────────────────────────────────────────────────
+  res.setHeader('X-Accel-Buffering', 'no');
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -2982,6 +2986,12 @@ async function requestHandler(req, res) {
   const start = Date.now();
   // Strip query string before routing so ?foo=bar variants still match.
   const path = req.url.split('?')[0];
+
+  // anthropic-version mirrors what the real Anthropic API returns on all /v1/messages* routes.
+  // Strict SDK clients (some versions of the official TypeScript SDK) validate this header.
+  if (path.startsWith('/v1/messages')) {
+    res.setHeader('anthropic-version', '2023-06-01');
+  }
   // handleMessages sets this before res ends so the finish handler can log token counts.
   res._logMeta = null;
   res.on('finish', () => {

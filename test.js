@@ -1800,6 +1800,132 @@ describe('handleMessages', () => {
       assert.equal(end, 'end', 'text block 3 should contain "end"');
     } finally { restore(); }
   });
+
+  test('streaming: sets X-Accel-Buffering: no header to prevent nginx buffering', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'ping' }], stream: true }), res);
+      assert.equal(res._headers['X-Accel-Buffering'], 'no',
+        'streaming response must include X-Accel-Buffering: no for nginx deployments');
+    } finally { restore(); }
+  });
+
+  test('non-streaming: does not set X-Accel-Buffering header', async () => {
+    const restore = stubFetch({
+      choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    });
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'ping' }], stream: false }), res);
+      assert.ok(!res._headers['X-Accel-Buffering'],
+        'non-streaming response must not include X-Accel-Buffering');
+    } finally { restore(); }
+  });
+});
+
+// ── anthropic-version response header ────────────────────────────────────────
+
+describe('anthropic-version response header', () => {
+  const { requestHandler } = require('./proxy');
+
+  function mockReq(method, path, body = null) {
+    return {
+      method,
+      url: path,
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1', encrypted: false },
+      [Symbol.asyncIterator]: async function* () { if (body) yield JSON.stringify(body); },
+    };
+  }
+
+  function mockRes() {
+    const listeners = {};
+    const res = {
+      headersSent: false,
+      writableEnded: false,
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k.toLowerCase()] = v; },
+      getHeader(k) { return this._headers[k.toLowerCase()]; },
+      writeHead(status) { this._status = status; this.headersSent = true; },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; if (listeners.finish) listeners.finish(); },
+      on(event, fn) { listeners[event] = fn; },
+      once(event, fn) { listeners[event] = fn; },
+      off() {},
+    };
+    return res;
+  }
+
+  function stubFetch(chatResponse) {
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      json: async () => chatResponse,
+      text: async () => JSON.stringify(chatResponse),
+      body: null,
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  test('POST /v1/messages response includes anthropic-version: 2023-06-01', async () => {
+    const restore = stubFetch({
+      choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    });
+    try {
+      const res = mockRes();
+      await requestHandler(
+        mockReq('POST', '/v1/messages', { messages: [{ role: 'user', content: 'ping' }], stream: false }),
+        res,
+      );
+      assert.equal(res._headers['anthropic-version'], '2023-06-01',
+        'POST /v1/messages must return anthropic-version: 2023-06-01');
+    } finally { restore(); }
+  });
+
+  test('POST /v1/messages/count_tokens response includes anthropic-version: 2023-06-01', async () => {
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: false, status: 404 }); // fallback to char estimate
+    try {
+      const res = mockRes();
+      await requestHandler(
+        mockReq('POST', '/v1/messages/count_tokens', { messages: [{ role: 'user', content: 'hello' }] }),
+        res,
+      );
+      assert.equal(res._headers['anthropic-version'], '2023-06-01',
+        'POST /v1/messages/count_tokens must return anthropic-version: 2023-06-01');
+    } finally { global.fetch = origFetch; }
+  });
+
+  test('GET /health does NOT include anthropic-version header', async () => {
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ models: [] }) });
+    try {
+      const res = mockRes();
+      await requestHandler(mockReq('GET', '/health'), res);
+      assert.ok(!res._headers['anthropic-version'],
+        'GET /health must not include anthropic-version header');
+    } finally { global.fetch = origFetch; }
+  });
+
+  test('GET /v1/models does NOT include anthropic-version header', async () => {
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ models: [] }) });
+    try {
+      const res = mockRes();
+      await requestHandler(mockReq('GET', '/v1/models'), res);
+      assert.ok(!res._headers['anthropic-version'],
+        'GET /v1/models must not include anthropic-version header');
+    } finally { global.fetch = origFetch; }
+  });
 });
 
 // ── resolveMaxTokens ──────────────────────────────────────────────────────────
@@ -2402,6 +2528,19 @@ describe('handleOpenAIChat', () => {
       assert.ok(res._logMeta, '_logMeta should be set after streaming completes');
       assert.equal(res._logMeta.tokensIn, 7, 'input tokens from trailing usage chunk');
       assert.equal(res._logMeta.tokensOut, 3, 'output tokens from trailing usage chunk');
+    } finally { restore(); }
+  });
+
+  test('streaming: sets X-Accel-Buffering: no to prevent nginx buffering', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'ping' }], stream: true }), res);
+      assert.equal(res._headers['X-Accel-Buffering'], 'no',
+        'streaming OpenAI passthrough must include X-Accel-Buffering: no');
     } finally { restore(); }
   });
 });
