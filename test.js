@@ -1652,6 +1652,28 @@ describe('handleMessages', () => {
     } finally { restore(); }
   });
 
+  test('streaming: message_start.usage.input_tokens is a non-zero estimate from the request body', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":15,"completion_tokens":1}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(
+        mockReq({ messages: [{ role: 'user', content: 'Hello, how are you today?' }], stream: true }),
+        res,
+      );
+      const start = parseSse(res._body).find(e => e.event === 'message_start');
+      // Should be a positive integer (chars/4 estimate), not 0.
+      assert.ok(
+        Number.isInteger(start.data.message.usage.input_tokens) &&
+        start.data.message.usage.input_tokens > 0,
+        `expected message_start.usage.input_tokens to be a positive integer, got ${start.data.message.usage.input_tokens}`,
+      );
+    } finally { restore(); }
+  });
+
   test('streaming: message_delta carries stop_reason and correct token counts', async () => {
     const restore = stubStreamFetch([
       'data: {"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}]}',

@@ -80,6 +80,7 @@ Then point Claude Code at http://localhost:4000 instead of the Anthropic API.
 - top_k forwarding — passed through to Ollama's OpenAI-compat endpoint
 - POST /v1/messages/count_tokens — uses Ollama /api/tokenize for accuracy, falls back to chars/4
 - Streaming message_delta includes both input_tokens and output_tokens from trailing Ollama usage chunk
+- Streaming message_start.usage.input_tokens — populated with a chars/4 heuristic estimate computed from the serialised OpenAI messages before the stream begins, so SDK clients that read input_tokens from message_start (the Anthropic-specified location) see a meaningful non-zero count rather than 0; the accurate Ollama-reported value is still provided in message_delta.usage.input_tokens for clients that read it there
 - Router-level try/catch prevents handler throws from becoming unhandled promise rejections (crash)
 - Process-level uncaughtException/unhandledRejection handlers keep server alive on stray async errors
 - URL routing strips query params (?foo=bar variants no longer 404)

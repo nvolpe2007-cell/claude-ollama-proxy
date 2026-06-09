@@ -1010,12 +1010,19 @@ async function handleMessages(req, res) {
   _metrics.activeStreams++;
 
   const id = newMsgId();
+  // Estimate input tokens from the serialised messages we're about to send.
+  // The accurate count arrives in Ollama's trailing usage chunk and is reported in
+  // message_delta, but the Anthropic SDK reads input_tokens from message_start —
+  // sending 0 there means all SDK clients report 0 input tokens for the session.
+  // chars/4 is the standard rough estimate; it gives a plausible non-zero value
+  // with zero added latency since openaiReq is already built.
+  const approxInputTokens = Math.ceil(JSON.stringify(openaiReq.messages).length / 4);
   sendSSE(res, 'message_start', {
     type: 'message_start',
     message: {
       id, type: 'message', role: 'assistant', content: [],
       model: effectiveModel, stop_reason: null, stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+      usage: { input_tokens: approxInputTokens, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     }
   });
 
