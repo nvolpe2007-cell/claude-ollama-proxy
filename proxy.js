@@ -158,6 +158,12 @@ const PROXY_MAX_BODY_SIZE = (() => {
   }
   return n;
 })();
+// When true AND OLLAMA_NUM_CTX is set, the proxy automatically drops the oldest
+// user/assistant turns from the message history whenever the estimated input token
+// count would exceed OLLAMA_NUM_CTX. Prevents "context length exceeded" 400 errors
+// from Ollama without requiring callers to manage history length themselves.
+// Opt-in (default false) so existing deployments see no behaviour change.
+const PROXY_AUTO_TRUNCATE = process.env.PROXY_AUTO_TRUNCATE === 'true';
 
 // Optional JSON object of arbitrary Ollama model parameters to include in every request.
 // Useful for deployment-level tuning (repeat_penalty, mirostat, num_gpu, tfs_z, etc.)
@@ -352,6 +358,44 @@ function injectSystemPrompt(system) {
   if (typeof system === 'string') return `${PROXY_SYSTEM_PROMPT}\n\n${system}`;
   // Array of Anthropic content blocks — prepend a text block.
   return [{ type: 'text', text: PROXY_SYSTEM_PROMPT }, ...system];
+}
+
+// Trims a messages array to stay within maxInputTokens (estimated via chars/4).
+// Strategy: preserves the system message, always keeps at least the last KEEP_LAST
+// non-system messages, and removes complete turns from the oldest part of history.
+// After each removal it skips past any orphaned tool/assistant messages at the new
+// head so the remaining history always starts with a user role (valid OpenAI format).
+// Returns { messages, droppedCount } — exported for unit testing.
+function truncateToContext(messages, maxInputTokens) {
+  const estimate = (arr) => Math.ceil(JSON.stringify(arr).length / 4);
+  if (estimate(messages) <= maxInputTokens) return { messages, droppedCount: 0 };
+
+  const sysMsg    = messages.find(m => m.role === 'system') || null;
+  let   history   = messages.filter(m => m.role !== 'system');
+  const KEEP_LAST = 2;
+  let   droppedCount = 0;
+
+  while (history.length > KEEP_LAST) {
+    const current = sysMsg ? [sysMsg, ...history] : history;
+    if (estimate(current) <= maxInputTokens) break;
+    history.shift();
+    droppedCount++;
+    // Skip orphaned non-user messages at the head (maintains valid OpenAI format).
+    while (history.length > KEEP_LAST && history[0]?.role !== 'user') {
+      history.shift();
+      droppedCount++;
+    }
+  }
+
+  // Post-loop cleanup: if the outer while stopped at KEEP_LAST but the head is still
+  // not a user message (e.g. last 2 are [assistant, user]), drop orphaned non-user
+  // messages until we reach a user or only 1 message remains.
+  while (history.length > 1 && history[0]?.role !== 'user') {
+    history.shift();
+    droppedCount++;
+  }
+
+  return { messages: sysMsg ? [sysMsg, ...history] : history, droppedCount };
 }
 
 // Anthropic messages/tools → OpenAI format
@@ -875,6 +919,19 @@ async function handleMessages(req, res) {
   // Dedicated env vars take highest precedence (unconditional overwrite).
   if (OLLAMA_NUM_CTX)    openaiReq.num_ctx    = OLLAMA_NUM_CTX;
   if (OLLAMA_KEEP_ALIVE) openaiReq.keep_alive = OLLAMA_KEEP_ALIVE;
+
+  // Auto-truncate message history to prevent "context length exceeded" errors.
+  // Only active when PROXY_AUTO_TRUNCATE=true and OLLAMA_NUM_CTX is set.
+  if (PROXY_AUTO_TRUNCATE && OLLAMA_NUM_CTX) {
+    const origEst = Math.ceil(JSON.stringify(openaiReq.messages).length / 4);
+    const { messages: trimmed, droppedCount } = truncateToContext(openaiReq.messages, OLLAMA_NUM_CTX);
+    if (droppedCount > 0) {
+      openaiReq.messages = trimmed;
+      const newEst = Math.ceil(JSON.stringify(trimmed).length / 4);
+      console.warn(`[auto-truncate] Dropped ${droppedCount} message(s): ~${origEst} → ~${newEst} est. tokens (OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX})`);
+      res.setHeader('x-context-truncated', String(droppedCount));
+    }
+  }
 
   debugLog(`→ Ollama [${ollamaBase}]`, openaiReq);
 
@@ -1712,6 +1769,14 @@ async function processBatchRequest(anthropicReq, ollamaBase) {
   if (OLLAMA_NUM_CTX)    openaiReq.num_ctx    = OLLAMA_NUM_CTX;
   if (OLLAMA_KEEP_ALIVE) openaiReq.keep_alive = OLLAMA_KEEP_ALIVE;
 
+  if (PROXY_AUTO_TRUNCATE && OLLAMA_NUM_CTX) {
+    const { messages: trimmed, droppedCount } = truncateToContext(openaiReq.messages, OLLAMA_NUM_CTX);
+    if (droppedCount > 0) {
+      openaiReq.messages = trimmed;
+      console.warn(`[auto-truncate/batch] Dropped ${droppedCount} message(s) to fit OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX}`);
+    }
+  }
+
   let ollamaRes;
   try {
     ollamaRes = await fetchWithRetry(`${ollamaBase}/v1/chat/completions`, {
@@ -2306,6 +2371,7 @@ function handleDashboard(req, res) {
     maxQueueSize:       PROXY_MAX_QUEUE_SIZE,
     queueTimeoutMs:     PROXY_MAX_QUEUE_TIMEOUT,
     forceThink:         PROXY_FORCE_THINK,
+    autoTruncate:       PROXY_AUTO_TRUNCATE,
     listenHost:         PROXY_LISTEN_HOST,
   });
 
@@ -2401,6 +2467,7 @@ async function refresh(){
   if(C.logLevel==='debug')g+=row('Log level','<span class="warn">debug (verbose)</span>');
   if(C.systemPrompt)g+=row('System prompt',\`<span title="\${C.systemPrompt}" style="cursor:help">set ℹ</span>\`);
   if(C.forceThink)g+=row('Force thinking','<span class="ok">Enabled (think:true on all requests)</span>');
+  if(C.autoTruncate)g+=row('Auto-truncate','<span class="ok">Enabled'+(C.numCtx?' (limit: '+C.numCtx.toLocaleString()+' tok)':' (set OLLAMA_NUM_CTX)')+'</span>');
   if(C.ollamaOptions)g+=row('Ollama options',\`<span title="\${C.ollamaOptions}" style="cursor:help;font-size:11px">\${C.ollamaOptions.length>40?C.ollamaOptions.slice(0,40)+'…':C.ollamaOptions}</span>\`);
   g+='<div class="sep"></div>';
   g+='<div class="row" style="gap:8px"><a href="/health">health</a><a href="/metrics">metrics JSON</a><a href="/metrics/prometheus">prometheus</a><a href="/v1/models">models</a></div>';
@@ -2555,6 +2622,17 @@ async function handleOpenAIChat(req, res) {
       };
     } else {
       openaiReq.messages.unshift({ role: 'system', content: PROXY_SYSTEM_PROMPT });
+    }
+  }
+
+  if (PROXY_AUTO_TRUNCATE && OLLAMA_NUM_CTX) {
+    const origEst = Math.ceil(JSON.stringify(openaiReq.messages).length / 4);
+    const { messages: trimmed, droppedCount } = truncateToContext(openaiReq.messages, OLLAMA_NUM_CTX);
+    if (droppedCount > 0) {
+      openaiReq.messages = trimmed;
+      const newEst = Math.ceil(JSON.stringify(trimmed).length / 4);
+      console.warn(`[auto-truncate] Dropped ${droppedCount} message(s): ~${origEst} → ~${newEst} est. tokens (OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX})`);
+      res.setHeader('x-context-truncated', String(droppedCount));
     }
   }
 
@@ -3146,6 +3224,9 @@ if (require.main === module) {
     console.log(`  Logs  : format=${LOG_FORMAT} level=${LOG_LEVEL} (LOG_FORMAT=json for structured; LOG_LEVEL=debug for full request/response bodies)`);
     console.log(`  Think : ${PROXY_FORCE_THINK ? 'forced (think:true on every request — set PROXY_FORCE_THINK=false to disable)' : 'client-controlled (set PROXY_FORCE_THINK=true to always enable for thinking models)'}`);
     console.log(`  Warmup: ${PROXY_WARMUP ? 'enabled — pre-loading model on startup' : 'disabled (set PROXY_WARMUP=true to pre-load model)'}`);
+    if (PROXY_AUTO_TRUNCATE) {
+      console.log(`  AutoTruncate: enabled — drops oldest turns when est. input > ${OLLAMA_NUM_CTX ? OLLAMA_NUM_CTX + ' tokens' : 'OLLAMA_NUM_CTX (not set — truncation inactive until OLLAMA_NUM_CTX is configured)'}`);
+    }
     const rlGlobal = RATE_LIMIT_RPM        ? `global ${RATE_LIMIT_RPM} req/min`    : 'no global limit';
     const rlIp     = RATE_LIMIT_PER_IP_RPM ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min` : 'no per-IP limit';
     console.log(`  RateLimit: ${rlGlobal}; ${rlIp} (set RATE_LIMIT_RPM / RATE_LIMIT_PER_IP_RPM)`);
@@ -3251,6 +3332,8 @@ module.exports = {
   PROXY_HARD_MAX_TOKENS,
   PROXY_IDLE_TIMEOUT,
   PROXY_FORCE_THINK,
+  PROXY_AUTO_TRUNCATE,
+  truncateToContext,
   toOpenAIMessages,
   toOpenAITools,
   toOpenAIToolChoice,

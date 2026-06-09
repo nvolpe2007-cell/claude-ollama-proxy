@@ -31,6 +31,7 @@ const {
   processBatch,
   batchRequestCounts,
   _batches,
+  truncateToContext,
 } = require('./proxy');
 
 // ── resolveModel ──────────────────────────────────────────────────────────────
@@ -2734,5 +2735,95 @@ describe('PROXY_FORCE_THINK', () => {
     }
     assert.strictEqual(sentBody.think, true,
       'think:true should be set when client explicitly requests thinking');
+  });
+});
+
+// ── truncateToContext ─────────────────────────────────────────────────────────
+
+describe('truncateToContext', () => {
+  function msgs(...roles) {
+    return roles.map((role, i) => ({ role, content: 'x'.repeat(20) + i }));
+  }
+
+  test('returns messages unchanged when within budget', () => {
+    const m = msgs('user', 'assistant');
+    const { messages, droppedCount } = truncateToContext(m, 100_000);
+    assert.deepEqual(messages, m);
+    assert.equal(droppedCount, 0);
+  });
+
+  test('drops oldest messages when over budget', () => {
+    // Build a long history that exceeds a tiny budget.
+    const m = [
+      { role: 'user',      content: 'A'.repeat(500) },
+      { role: 'assistant', content: 'B'.repeat(500) },
+      { role: 'user',      content: 'C'.repeat(50)  },
+      { role: 'assistant', content: 'D'.repeat(50)  },
+    ];
+    const budget = Math.ceil(JSON.stringify(m.slice(2)).length / 4) + 10;
+    const { messages, droppedCount } = truncateToContext(m, budget);
+    // First two (long) messages should have been dropped.
+    assert.ok(droppedCount >= 2, `expected >=2 dropped, got ${droppedCount}`);
+    // Result should start with a user role.
+    assert.equal(messages[0].role, 'user');
+    // Estimate of result should now be within budget.
+    const est = Math.ceil(JSON.stringify(messages).length / 4);
+    assert.ok(est <= budget, `estimate ${est} exceeds budget ${budget}`);
+  });
+
+  test('always keeps system message', () => {
+    const m = [
+      { role: 'system',    content: 'sys' },
+      { role: 'user',      content: 'A'.repeat(600) },
+      { role: 'assistant', content: 'B'.repeat(600) },
+      { role: 'user',      content: 'short' },
+      { role: 'assistant', content: 'reply' },
+    ];
+    const budget = 50;
+    const { messages } = truncateToContext(m, budget);
+    assert.equal(messages[0].role, 'system');
+    assert.equal(messages[0].content, 'sys');
+  });
+
+  test('always keeps at least KEEP_LAST (2) non-system messages', () => {
+    const m = [
+      { role: 'user',      content: 'A'.repeat(5000) },
+      { role: 'assistant', content: 'B'.repeat(5000) },
+      { role: 'user',      content: 'final question' },
+      { role: 'assistant', content: 'final answer'   },
+    ];
+    const { messages, droppedCount } = truncateToContext(m, 1);
+    // The last 2 messages must be kept even if over budget.
+    const nonSys = messages.filter(msg => msg.role !== 'system');
+    assert.ok(nonSys.length >= 2, `expected >=2 non-system messages, got ${nonSys.length}`);
+    assert.ok(droppedCount >= 2, `expected >=2 dropped, got ${droppedCount}`);
+  });
+
+  test('result starts with user role after dropping orphaned assistant messages', () => {
+    const m = [
+      { role: 'user',      content: 'X'.repeat(400) },
+      { role: 'assistant', content: 'Y'.repeat(400) },
+      { role: 'user',      content: 'u2' },
+      { role: 'assistant', content: 'a2' },
+    ];
+    const budget = Math.ceil(JSON.stringify(m.slice(2)).length / 4) + 5;
+    const { messages } = truncateToContext(m, budget);
+    // The first non-system message in the result must be a user turn.
+    const first = messages.find(msg => msg.role !== 'system');
+    assert.equal(first?.role, 'user', `expected first non-system role to be 'user', got '${first?.role}'`);
+  });
+
+  test('droppedCount reflects all messages removed including orphaned ones', () => {
+    // After dropping user(A400), assistant(B400) becomes an orphaned head; the function
+    // should also drop it, giving droppedCount=2, not 1.
+    const m = [
+      { role: 'user',      content: 'A'.repeat(400) },
+      { role: 'assistant', content: 'B'.repeat(400) },
+      { role: 'user',      content: 'short' },
+    ];
+    const budget = Math.ceil(JSON.stringify([{ role: 'user', content: 'short' }]).length / 4) + 5;
+    const { droppedCount, messages } = truncateToContext(m, budget);
+    assert.ok(droppedCount >= 2, `expected droppedCount >=2, got ${droppedCount}`);
+    assert.equal(messages[0].role, 'user');
   });
 });
