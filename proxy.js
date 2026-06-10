@@ -221,6 +221,21 @@ function parseOllamaError(text) {
   return text;
 }
 
+// Maps an Ollama HTTP error response to an Anthropic-style error envelope.
+// Ollama 4xx errors (unknown model, bad request, etc.) are surfaced with their
+// real status and a matching Anthropic error type instead of a blanket 502, so
+// SDK clients — which retry 5xx/overloaded errors — don't burn through retries
+// on something a retry can never fix, like a typo'd model name.
+function mapOllamaError(status, errText) {
+  const message = parseOllamaError(errText);
+  switch (status) {
+    case 400: return { status: 400, type: 'invalid_request_error', message };
+    case 404: return { status: 404, type: 'not_found_error', message };
+    case 429: return { status: 429, type: 'rate_limit_error', message };
+    default:  return { status: 502, type: 'ollama_error', message };
+  }
+}
+
 // Logs obj as pretty JSON under a label when LOG_LEVEL=debug. No-op otherwise.
 function debugLog(label, obj) {
   if (LOG_LEVEL !== 'debug') return;
@@ -985,8 +1000,9 @@ async function handleMessages(req, res) {
 
   if (!ollamaRes.ok) {
     const errText = await ollamaRes.text();
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { type: 'ollama_error', message: parseOllamaError(errText) } }));
+    const { status, type, message } = mapOllamaError(ollamaRes.status, errText);
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type, message } }));
     return;
   }
 
@@ -1809,7 +1825,8 @@ async function processBatchRequest(anthropicReq, ollamaBase) {
 
   if (!ollamaRes.ok) {
     const errText = await ollamaRes.text().catch(() => '');
-    return { type: 'errored', error: { type: 'ollama_error', message: parseOllamaError(errText) } };
+    const { type, message } = mapOllamaError(ollamaRes.status, errText);
+    return { type: 'errored', error: { type, message } };
   }
 
   let data;
@@ -2116,8 +2133,9 @@ async function handleEmbeddings(req, res) {
 
   if (!ollamaRes.ok) {
     const errText = await ollamaRes.text();
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { type: 'ollama_error', message: parseOllamaError(errText) } }));
+    const { status, type, message } = mapOllamaError(ollamaRes.status, errText);
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type, message } }));
     return;
   }
 
@@ -3341,6 +3359,7 @@ module.exports = {
   parseDotEnv,
   parseOllamaOptions,
   parseOllamaError,
+  mapOllamaError,
   OLLAMA_OPTIONS,
   resolveModel,
   resolveMaxTokens,

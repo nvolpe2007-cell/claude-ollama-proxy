@@ -6,6 +6,7 @@ const {
   parseDotEnv,
   parseOllamaOptions,
   parseOllamaError,
+  mapOllamaError,
   OLLAMA_OPTIONS,
   resolveModel,
   resolveMaxTokens,
@@ -990,6 +991,30 @@ describe('parseOllamaError', () => {
   });
 });
 
+// ── mapOllamaError ──────────────────────────────────────────────────────────
+
+describe('mapOllamaError', () => {
+  test('maps 404 to not_found_error', () => {
+    const result = mapOllamaError(404, '{"error":"model \'xyz\' not found, try pulling it first"}');
+    assert.deepEqual(result, { status: 404, type: 'not_found_error', message: "model 'xyz' not found, try pulling it first" });
+  });
+
+  test('maps 400 to invalid_request_error', () => {
+    const result = mapOllamaError(400, '{"error":"context length exceeded"}');
+    assert.deepEqual(result, { status: 400, type: 'invalid_request_error', message: 'context length exceeded' });
+  });
+
+  test('maps 429 to rate_limit_error', () => {
+    const result = mapOllamaError(429, '{"error":"too many requests"}');
+    assert.deepEqual(result, { status: 429, type: 'rate_limit_error', message: 'too many requests' });
+  });
+
+  test('maps unrecognised status (e.g. 500) to 502 ollama_error', () => {
+    const result = mapOllamaError(500, 'CUDA out of memory');
+    assert.deepEqual(result, { status: 502, type: 'ollama_error', message: 'CUDA out of memory' });
+  });
+});
+
 // ── MODEL_MAP alias resolution (unit-level, mirrors handleModelById logic) ────
 // handleModelById resolves aliases the same way resolveModel does, so we verify
 // the shared logic here; integration coverage lives in test-integration.js.
@@ -1502,7 +1527,7 @@ describe('handleMessages', () => {
     return () => { global.fetch = orig; };
   }
 
-  // Stubs global.fetch to return a non-ok 4xx response so the proxy returns 502.
+  // Stubs global.fetch to return a non-ok response.
   // 4xx is below the 500 threshold so fetchWithRetry returns immediately (no retry delay).
   function stubFetchError(status = 400, text = 'bad request') {
     const orig = global.fetch;
@@ -1673,18 +1698,30 @@ describe('handleMessages', () => {
     } finally { restore(); }
   });
 
-  test('non-streaming: Ollama 4xx proxied as 502 with structured error body', async () => {
+  test('non-streaming: Ollama 404 (unknown model) proxied as 404 not_found_error', async () => {
     const restore = stubFetchError(404, '{"error":"model \'xyz\' not found, try pulling it first"}');
     try {
       const res = mockRes();
       await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Hi' }], stream: false }), res);
-      assert.equal(res._status, 502);
+      assert.equal(res._status, 404);
       const body = JSON.parse(res._body);
       // Error must be an object, not a raw/double-encoded string.
       assert.equal(typeof body.error, 'object', 'error should be an object, not a raw string');
-      assert.equal(body.error.type, 'ollama_error');
+      assert.equal(body.error.type, 'not_found_error');
       // Inner Ollama message should be extracted, not double-JSON-encoded.
       assert.equal(body.error.message, "model 'xyz' not found, try pulling it first");
+    } finally { restore(); }
+  });
+
+  test('non-streaming: Ollama 400 proxied as 400 invalid_request_error', async () => {
+    const restore = stubFetchError(400, '{"error":"invalid options"}');
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Hi' }], stream: false }), res);
+      assert.equal(res._status, 400);
+      const body = JSON.parse(res._body);
+      assert.equal(body.error.type, 'invalid_request_error');
+      assert.equal(body.error.message, 'invalid options');
     } finally { restore(); }
   });
 
