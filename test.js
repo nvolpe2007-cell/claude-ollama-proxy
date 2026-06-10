@@ -24,6 +24,8 @@ const {
   checkRateLimit,
   getClientIp,
   _rateLimitWindows,
+  timingSafeEqual,
+  checkAuth,
   checkConcurrency,
   trackActiveLlmRequest,
   _metrics,
@@ -716,6 +718,115 @@ describe('getClientIp', () => {
   test('falls back to "unknown" when socket has no remoteAddress', () => {
     const req = { headers: {}, socket: {} };
     assert.equal(getClientIp(req), 'unknown');
+  });
+});
+
+// ── timingSafeEqual / checkAuth ──────────────────────────────────────────────
+
+describe('timingSafeEqual', () => {
+  test('returns true for identical strings', () => {
+    assert.equal(timingSafeEqual('s3cret-key', 's3cret-key'), true);
+  });
+
+  test('returns false for different strings of the same length', () => {
+    assert.equal(timingSafeEqual('s3cret-key', 's3cret-kex'), false);
+  });
+
+  test('returns false for strings of different lengths', () => {
+    assert.equal(timingSafeEqual('short', 'a-much-longer-string'), false);
+    assert.equal(timingSafeEqual('', 'nonempty'), false);
+  });
+
+  test('returns false when comparing against an empty string', () => {
+    assert.equal(timingSafeEqual('', ''), true);
+    assert.equal(timingSafeEqual('nonempty', ''), false);
+  });
+});
+
+describe('checkAuth', () => {
+  function mockRes() {
+    const headers = {};
+    return {
+      headers,
+      headersSent: false,
+      writableEnded: false,
+      statusCode: null,
+      body: null,
+      setHeader(k, v) { headers[k.toLowerCase()] = v; },
+      writeHead(code) { this.statusCode = code; this.headersSent = true; },
+      end(b) { this.body = b; this.writableEnded = true; },
+    };
+  }
+
+  test('allows any request when PROXY_API_KEY is not set', () => {
+    const req = { headers: {} };
+    const res = mockRes();
+    assert.equal(checkAuth(req, res), true);
+    assert.equal(res.statusCode, null);
+  });
+
+  // Helper: load a fresh proxy module with PROXY_API_KEY set, run a single
+  // test, then restore the module cache so other tests are unaffected.
+  function withApiKey(key, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    let freshProxy;
+    try {
+      process.env.PROXY_API_KEY = key;
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      delete process.env.PROXY_API_KEY;
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  test('accepts the correct key via x-api-key header', () => {
+    withApiKey('s3cret-key', (m) => {
+      const req = { headers: { 'x-api-key': 's3cret-key' } };
+      const res = mockRes();
+      assert.equal(m.checkAuth(req, res), true);
+      assert.equal(res.statusCode, null);
+    });
+  });
+
+  test('accepts the correct key via Authorization: Bearer header', () => {
+    withApiKey('s3cret-key', (m) => {
+      const req = { headers: { authorization: 'Bearer s3cret-key' } };
+      const res = mockRes();
+      assert.equal(m.checkAuth(req, res), true);
+    });
+  });
+
+  test('rejects a missing key with 401 authentication_error', () => {
+    withApiKey('s3cret-key', (m) => {
+      const req = { headers: {} };
+      const res = mockRes();
+      assert.equal(m.checkAuth(req, res), false);
+      assert.equal(res.statusCode, 401);
+      const body = JSON.parse(res.body);
+      assert.equal(body.error.type, 'authentication_error');
+    });
+  });
+
+  test('rejects an incorrect key of the same length', () => {
+    withApiKey('s3cret-key', (m) => {
+      const req = { headers: { 'x-api-key': 's3cret-kex' } };
+      const res = mockRes();
+      assert.equal(m.checkAuth(req, res), false);
+      assert.equal(res.statusCode, 401);
+    });
+  });
+
+  test('rejects an incorrect key of a different length', () => {
+    withApiKey('s3cret-key', (m) => {
+      const req = { headers: { 'x-api-key': 'wrong' } };
+      const res = mockRes();
+      assert.equal(m.checkAuth(req, res), false);
+      assert.equal(res.statusCode, 401);
+    });
   });
 });
 

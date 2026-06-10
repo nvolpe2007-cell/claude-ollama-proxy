@@ -1,7 +1,8 @@
-const http  = require('http');
-const https = require('https');
-const fs    = require('fs');
-const path  = require('path');
+const http   = require('http');
+const https  = require('https');
+const fs     = require('fs');
+const path   = require('path');
+const crypto = require('crypto');
 
 let PROXY_VERSION = 'unknown';
 try { PROXY_VERSION = require('./package.json').version; } catch {}
@@ -590,11 +591,25 @@ function setCORSHeaders(res) {
 
 // Returns true if the request is authorised (or auth is disabled).
 // Writes a 401 and returns false if the key is wrong.
+// Constant-time string comparison so an invalid API key can't be brute-forced
+// by measuring response-time differences. crypto.timingSafeEqual throws if the
+// two buffers differ in length, so a same-length dummy comparison is performed
+// first to keep the running time independent of the candidate's length too.
+function timingSafeEqual(a, b) {
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) {
+    crypto.timingSafeEqual(aBuf, aBuf);
+    return false;
+  }
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
 function checkAuth(req, res) {
   if (!PROXY_API_KEY) return true;
   const fromHeader = req.headers['x-api-key']
     || (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
-  if (fromHeader === PROXY_API_KEY) return true;
+  if (timingSafeEqual(fromHeader, PROXY_API_KEY)) return true;
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'Invalid or missing API key' } }));
   return false;
@@ -3376,4 +3391,7 @@ module.exports = {
   trackActiveLlmRequest,
   _concurrencyQueue,
   _metrics,
+  // Auth internals exported for unit testing only.
+  checkAuth,
+  timingSafeEqual,
 };
