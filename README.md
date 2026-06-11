@@ -59,7 +59,8 @@ You should see:
 | `OLLAMA_MODEL` | `qwen2.5:7b` | Ollama model to use for all requests |
 | `PROXY_PORT` | `4000` | Port the proxy listens on |
 | `OLLAMA_HOST` | `http://localhost:11434` | Base URL of your Ollama instance. Accepts a comma-separated list of URLs for round-robin load distribution across multiple Ollama instances/GPUs |
-| `PROXY_API_KEY` | *(unset)* | If set, require this key on every API request |
+| `PROXY_API_KEY` | *(unset)* | If set, require this key on every API request. Tracked under the key name `default` in `/metrics` |
+| `PROXY_API_KEYS` | *(unset)* | Comma-separated list of additional named keys for multi-caller setups, e.g. `nick:sk-abc,family:sk-def`. Combines with `PROXY_API_KEY`. Bare entries without a `name:` prefix are auto-named `key1`, `key2`, ... Each key's usage is tracked separately in `/metrics` and the dashboard |
 | `MODEL_MAP` | *(unset)* | JSON map of `claude-*` names/prefixes to Ollama models (see below) |
 | `PROXY_TLS_CERT` | *(unset)* | Path to PEM certificate file — enables HTTPS when set |
 | `PROXY_TLS_KEY` | *(unset)* | Path to PEM private key file — required when cert is set |
@@ -107,6 +108,18 @@ curl http://localhost:4000/v1/messages \
 ```
 
 When using Claude Code, set `ANTHROPIC_API_KEY=mysecret` and it will automatically send it as `x-api-key`.
+
+### Multiple API keys (per-device / per-user)
+
+If you share the proxy with other devices, family members, or apps, set `PROXY_API_KEYS` to a comma-separated list of `name:key` pairs so each caller gets its own key:
+
+```bash
+PROXY_API_KEYS="nick-laptop:sk-abc123,family-pc:sk-def456,homeassistant:sk-ghi789" node proxy.js
+```
+
+This combines with `PROXY_API_KEY` if both are set (the latter is tracked under the name `default`). Bare entries without a `name:` prefix (e.g. `PROXY_API_KEYS=sk-abc123,sk-def456`) are auto-named `key1`, `key2`, etc.
+
+Each caller authenticates the same way (`x-api-key` or `Authorization: Bearer`), but with their own key. Per-key request counts and token usage are broken out separately in `GET /metrics` (`api_keys_usage`), `GET /metrics/prometheus` (`proxy_api_key_requests_total` / `proxy_api_key_tokens_total`), and the live dashboard — so you can see who's using how much, and revoke a single caller's key (by removing it from `PROXY_API_KEYS` and restarting) without rotating everyone else's.
 
 The `/health` and `/metrics` endpoints are always unauthenticated so monitoring tools can reach them freely.
 

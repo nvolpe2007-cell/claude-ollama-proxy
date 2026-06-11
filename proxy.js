@@ -186,6 +186,32 @@ function parseOllamaOptions(str) {
 }
 const OLLAMA_OPTIONS = parseOllamaOptions(process.env.OLLAMA_OPTIONS);
 
+// Parses the optional PROXY_API_KEYS env var into a list of { name, key } pairs for
+// multi-caller deployments. Format: comma-separated "name:key" entries, e.g.
+// "nick:sk-abc123,family:sk-def456,laptop:sk-ghi789". Entries without a colon are
+// auto-named key1, key2, ... in declaration order. PROXY_API_KEY (if set) is always
+// included first, labeled "default", so existing single-key deployments are unaffected.
+// Lets an operator hand out separate keys per device/user, see per-key usage in
+// /metrics, and revoke a single key without rotating the shared secret.
+// Exported for unit testing.
+function parseApiKeys(singleKey, listStr) {
+  const keys = [];
+  if (singleKey) keys.push({ name: 'default', key: singleKey });
+  if (listStr) {
+    let n = 0;
+    for (const entry of listStr.split(',')) {
+      const trimmed = entry.trim();
+      if (!trimmed) continue;
+      n++;
+      const ci = trimmed.indexOf(':');
+      if (ci > 0) keys.push({ name: trimmed.slice(0, ci).trim(), key: trimmed.slice(ci + 1).trim() });
+      else keys.push({ name: `key${n}`, key: trimmed });
+    }
+  }
+  return keys;
+}
+const _apiKeys = parseApiKeys(PROXY_API_KEY, process.env.PROXY_API_KEYS);
+
 // Returns a sanitized deep copy of obj with long base64 strings replaced by a short
 // placeholder so debug log lines stay human-readable even when requests contain images.
 // Matches: the `data` key for Anthropic base64 source blocks, and the `url` key when
@@ -274,6 +300,7 @@ const _metrics = {
   queuedLlmRequests: 0,  // requests waiting for a concurrency slot
   errors:            0,
   modelsUsed:   {},   // 'model-name' → { requests, tokensIn, tokensOut }
+  apiKeysUsed:  {},   // 'key-name' → { requests, tokensIn, tokensOut }
 };
 
 // Queue of { onGranted } entries waiting for a concurrency slot.
@@ -289,7 +316,7 @@ function recordRequest(method, path, status, ms) {
   _metrics.latencies.push(ms);
 }
 
-function recordTokens(input, output, model) {
+function recordTokens(input, output, model, apiKeyName) {
   _metrics.tokensIn  += input;
   _metrics.tokensOut += output;
   if (model) {
@@ -298,6 +325,13 @@ function recordTokens(input, output, model) {
     _metrics.modelsUsed[model].requests  += 1;
     _metrics.modelsUsed[model].tokensIn  += input;
     _metrics.modelsUsed[model].tokensOut += output;
+  }
+  if (apiKeyName) {
+    if (!_metrics.apiKeysUsed[apiKeyName])
+      _metrics.apiKeysUsed[apiKeyName] = { requests: 0, tokensIn: 0, tokensOut: 0 };
+    _metrics.apiKeysUsed[apiKeyName].requests  += 1;
+    _metrics.apiKeysUsed[apiKeyName].tokensIn  += input;
+    _metrics.apiKeysUsed[apiKeyName].tokensOut += output;
   }
 }
 
@@ -620,11 +654,22 @@ function timingSafeEqual(a, b) {
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
 
+// Checks the request's key against every configured key (PROXY_API_KEY +
+// PROXY_API_KEYS). Iterates the full list rather than returning early so the
+// response time doesn't leak which entry (if any) matched. On success, stashes
+// the matched key's name on req._apiKeyName for per-key usage tracking.
 function checkAuth(req, res) {
-  if (!PROXY_API_KEY) return true;
+  if (_apiKeys.length === 0) return true;
   const fromHeader = req.headers['x-api-key']
     || (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
-  if (timingSafeEqual(fromHeader, PROXY_API_KEY)) return true;
+  let matchedName = null;
+  for (const { name, key } of _apiKeys) {
+    if (timingSafeEqual(fromHeader, key)) matchedName = name;
+  }
+  if (matchedName) {
+    req._apiKeyName = matchedName;
+    return true;
+  }
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'Invalid or missing API key' } }));
   return false;
@@ -1065,7 +1110,7 @@ async function handleMessages(req, res) {
 
     const promptTok = data.usage?.prompt_tokens || 0;
     const completionTok = data.usage?.completion_tokens || 0;
-    recordTokens(promptTok, completionTok, effectiveModel);
+    recordTokens(promptTok, completionTok, effectiveModel, req._apiKeyName);
     res._logMeta = { model: effectiveModel, tokensIn: promptTok, tokensOut: completionTok };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -1444,7 +1489,7 @@ async function handleMessages(req, res) {
     _metrics.activeStreams--;
   }
 
-  recordTokens(inputTokens, outputTokens, effectiveModel);
+  recordTokens(inputTokens, outputTokens, effectiveModel, req._apiKeyName);
   res._logMeta = { model: effectiveModel, tokensIn: inputTokens, tokensOut: outputTokens };
   res.end();
 }
@@ -2234,6 +2279,10 @@ async function handleMetrics(req, res) {
   for (const [model, m] of Object.entries(_metrics.modelsUsed)) {
     modelsUsage[model] = { requests: m.requests, tokens_in: m.tokensIn, tokens_out: m.tokensOut };
   }
+  const apiKeysUsage = {};
+  for (const [name, m] of Object.entries(_metrics.apiKeysUsed)) {
+    apiKeysUsage[name] = { requests: m.requests, tokens_in: m.tokensIn, tokens_out: m.tokensOut };
+  }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     uptime_seconds:      Math.floor((Date.now() - _metrics.startTime) / 1000),
@@ -2254,6 +2303,7 @@ async function handleMetrics(req, res) {
     queue_limit:         PROXY_MAX_QUEUE_SIZE,
     errors_total:        _metrics.errors,
     models_usage:        modelsUsage,
+    api_keys_usage:      apiKeysUsage,
   }, null, 2));
 }
 
@@ -2350,6 +2400,21 @@ async function handleMetricsPrometheus(req, res) {
   }
   out.push('');
 
+  out.push('# HELP proxy_api_key_requests_total Total completed LLM requests per named API key (PROXY_API_KEY/PROXY_API_KEYS)');
+  out.push('# TYPE proxy_api_key_requests_total counter');
+  for (const [name, m] of Object.entries(_metrics.apiKeysUsed)) {
+    out.push(`proxy_api_key_requests_total{key_name="${lv(name)}"} ${m.requests}`);
+  }
+  out.push('');
+
+  out.push('# HELP proxy_api_key_tokens_total Cumulative LLM tokens per named API key partitioned by direction');
+  out.push('# TYPE proxy_api_key_tokens_total counter');
+  for (const [name, m] of Object.entries(_metrics.apiKeysUsed)) {
+    out.push(`proxy_api_key_tokens_total{key_name="${lv(name)}",direction="input"} ${m.tokensIn}`);
+    out.push(`proxy_api_key_tokens_total{key_name="${lv(name)}",direction="output"} ${m.tokensOut}`);
+  }
+  out.push('');
+
   out.push('# HELP proxy_errors_total Total 5xx responses (server-side errors)');
   out.push('# TYPE proxy_errors_total counter');
   out.push(`proxy_errors_total ${_metrics.errors}`);
@@ -2384,7 +2449,8 @@ function handleDashboard(req, res) {
     version:            PROXY_VERSION,
     port:               Number(PORT),
     hosts:              OLLAMA_HOSTS,
-    auth:               !!PROXY_API_KEY,
+    auth:               _apiKeys.length > 0,
+    apiKeyNames:        _apiKeys.map(k => k.name),
     tls:                !!TLS_CERT,
     logFormat:          LOG_FORMAT,
     logLevel:           LOG_LEVEL,
@@ -2483,7 +2549,7 @@ async function refresh(){
   if(C.listenHost)g+=row('Bind address',C.listenHost);
   if(C.hosts.length===1)g+=row('Ollama host',C.hosts[0].replace(/^https?:\/\//,''));
   else g+=row('Ollama hosts',C.hosts.length+' (round-robin)');
-  g+=row('Auth',badge(C.auth,'Enabled','Open — no key'));
+  g+=row('Auth',badge(C.auth,C.apiKeyNames.length>1?'Enabled ('+C.apiKeyNames.length+' keys)':'Enabled','Open — no key'));
   g+=row('TLS',badge(C.tls,'HTTPS','HTTP'));
   g+=row('Default max_tokens',fmt(C.maxTokens));
   if(C.hardMaxTokens)g+=row('Hard max_tokens cap',fmt(C.hardMaxTokens));
@@ -2557,6 +2623,22 @@ async function refresh(){
     models.forEach(([model,v],i)=>{
       if(i>0)g+='<div class="sep"></div>';
       g+='<div style="color:#e6edf3;font-size:12px;font-family:monospace;padding:4px 0">'+model+'</div>';
+      g+=row('Requests',fmt(v.requests));
+      g+=row('Tokens in',fmt(v.tokens_in));
+      g+=row('Tokens out',fmt(v.tokens_out));
+    });
+    g+='</div>';
+  }
+
+  // ── Per-API-key usage card ──────────────────────────────────────────────────────
+  // Only shown for multi-key deployments (PROXY_API_KEYS) — a single key's totals
+  // would just duplicate the Tokens card above.
+  const apiKeys=m&&m.api_keys_usage?Object.entries(m.api_keys_usage):[];
+  if(C.apiKeyNames.length>1&&apiKeys.length){
+    g+='<div class="card"><h2>API Key Usage</h2>';
+    apiKeys.forEach(([name,v],i)=>{
+      if(i>0)g+='<div class="sep"></div>';
+      g+='<div style="color:#e6edf3;font-size:12px;font-family:monospace;padding:4px 0">'+name+'</div>';
       g+=row('Requests',fmt(v.requests));
       g+=row('Tokens in',fmt(v.tokens_in));
       g+=row('Tokens out',fmt(v.tokens_out));
@@ -2730,7 +2812,7 @@ async function handleOpenAIChat(req, res) {
     clearTO();
     const promptTok     = data.usage?.prompt_tokens     || 0;
     const completionTok = data.usage?.completion_tokens || 0;
-    recordTokens(promptTok, completionTok, effectiveModel);
+    recordTokens(promptTok, completionTok, effectiveModel, req._apiKeyName);
     res._logMeta = { model: effectiveModel, tokensIn: promptTok, tokensOut: completionTok };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(data));
@@ -2817,7 +2899,7 @@ async function handleOpenAIChat(req, res) {
     _metrics.activeStreams--;
   }
 
-  recordTokens(inputTokens, outputTokens, effectiveModel);
+  recordTokens(inputTokens, outputTokens, effectiveModel, req._apiKeyName);
   res._logMeta = { model: effectiveModel, tokensIn: inputTokens, tokensOut: outputTokens };
   res.end();
 }
@@ -2969,7 +3051,7 @@ async function handleOpenAICompletions(req, res) {
     const choice = data.choices?.[0];
     const promptTok     = data.usage?.prompt_tokens     || 0;
     const completionTok = data.usage?.completion_tokens || 0;
-    recordTokens(promptTok, completionTok, effectiveModel);
+    recordTokens(promptTok, completionTok, effectiveModel, req._apiKeyName);
     res._logMeta = { model: effectiveModel, tokensIn: promptTok, tokensOut: completionTok };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -3083,7 +3165,7 @@ async function handleOpenAICompletions(req, res) {
     _metrics.activeStreams--;
   }
 
-  recordTokens(inputTokens, outputTokens, effectiveModel);
+  recordTokens(inputTokens, outputTokens, effectiveModel, req._apiKeyName);
   res._logMeta = { model: effectiveModel, tokensIn: inputTokens, tokensOut: outputTokens };
   res.end();
 }
@@ -3244,7 +3326,11 @@ if (require.main === module) {
       console.log(`  Ollama: round-robin across ${OLLAMA_HOSTS.length} hosts:`);
       for (const h of OLLAMA_HOSTS) console.log(`    - ${h}`);
     }
-    console.log(`  Auth  : ${PROXY_API_KEY ? 'enabled (PROXY_API_KEY set)' : 'disabled (open access)'}`);
+    if (_apiKeys.length === 0) {
+      console.log(`  Auth  : disabled (open access)`);
+    } else {
+      console.log(`  Auth  : enabled (${_apiKeys.length} key${_apiKeys.length > 1 ? 's' : ''}: ${_apiKeys.map(k => k.name).join(', ')})`);
+    }
     console.log(`  TLS   : ${TLS_CERT ? `enabled (cert: ${TLS_CERT})` : 'disabled (HTTP)'}`);
     console.log(`  CORS  : Access-Control-Allow-Origin: ${CORS_ORIGIN}`);
     console.log(`  Ctx   : ${OLLAMA_NUM_CTX ? `num_ctx=${OLLAMA_NUM_CTX}` : 'model default (set OLLAMA_NUM_CTX to override)'}`);
@@ -3410,7 +3496,10 @@ module.exports = {
   trackActiveLlmRequest,
   _concurrencyQueue,
   _metrics,
+  recordTokens,
   // Auth internals exported for unit testing only.
   checkAuth,
   timingSafeEqual,
+  parseApiKeys,
+  _apiKeys,
 };

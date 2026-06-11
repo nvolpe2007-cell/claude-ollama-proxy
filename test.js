@@ -27,6 +27,8 @@ const {
   _rateLimitWindows,
   timingSafeEqual,
   checkAuth,
+  parseApiKeys,
+  recordTokens,
   checkConcurrency,
   trackActiveLlmRequest,
   _metrics,
@@ -828,6 +830,140 @@ describe('checkAuth', () => {
       assert.equal(m.checkAuth(req, res), false);
       assert.equal(res.statusCode, 401);
     });
+  });
+
+  // Helper: load a fresh proxy module with PROXY_API_KEY and/or PROXY_API_KEYS set,
+  // run a single test, then restore the module cache so other tests are unaffected.
+  function withApiKeyEnv(env, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    const savedEnv = {};
+    let freshProxy;
+    try {
+      for (const k of ['PROXY_API_KEY', 'PROXY_API_KEYS']) {
+        savedEnv[k] = process.env[k];
+        if (env[k] !== undefined) process.env[k] = env[k];
+        else delete process.env[k];
+      }
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      for (const k of ['PROXY_API_KEY', 'PROXY_API_KEYS']) {
+        if (savedEnv[k] !== undefined) process.env[k] = savedEnv[k];
+        else delete process.env[k];
+      }
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  test('PROXY_API_KEYS: accepts any configured key and tags req._apiKeyName', () => {
+    withApiKeyEnv({ PROXY_API_KEYS: 'nick:nick-key,family:family-key' }, (m) => {
+      const reqNick = { headers: { 'x-api-key': 'nick-key' } };
+      assert.equal(m.checkAuth(reqNick, mockRes()), true);
+      assert.equal(reqNick._apiKeyName, 'nick');
+
+      const reqFamily = { headers: { 'x-api-key': 'family-key' } };
+      assert.equal(m.checkAuth(reqFamily, mockRes()), true);
+      assert.equal(reqFamily._apiKeyName, 'family');
+    });
+  });
+
+  test('PROXY_API_KEYS: rejects a key not in the list', () => {
+    withApiKeyEnv({ PROXY_API_KEYS: 'nick:nick-key,family:family-key' }, (m) => {
+      const req = { headers: { 'x-api-key': 'someone-elses-key' } };
+      const res = mockRes();
+      assert.equal(m.checkAuth(req, res), false);
+      assert.equal(res.statusCode, 401);
+    });
+  });
+
+  test('PROXY_API_KEY and PROXY_API_KEYS combine — both are accepted', () => {
+    withApiKeyEnv({ PROXY_API_KEY: 'shared-secret', PROXY_API_KEYS: 'laptop:laptop-key' }, (m) => {
+      const reqDefault = { headers: { 'x-api-key': 'shared-secret' } };
+      assert.equal(m.checkAuth(reqDefault, mockRes()), true);
+      assert.equal(reqDefault._apiKeyName, 'default');
+
+      const reqLaptop = { headers: { 'x-api-key': 'laptop-key' } };
+      assert.equal(m.checkAuth(reqLaptop, mockRes()), true);
+      assert.equal(reqLaptop._apiKeyName, 'laptop');
+    });
+  });
+});
+
+// ── parseApiKeys ──────────────────────────────────────────────────────────────
+
+describe('parseApiKeys', () => {
+  test('returns empty array when neither env var is set', () => {
+    assert.deepEqual(parseApiKeys(null, undefined), []);
+  });
+
+  test('PROXY_API_KEY alone becomes a single "default" entry', () => {
+    assert.deepEqual(parseApiKeys('mysecret', undefined), [{ name: 'default', key: 'mysecret' }]);
+  });
+
+  test('parses "name:key" pairs from PROXY_API_KEYS', () => {
+    assert.deepEqual(parseApiKeys(null, 'nick:abc123,family:def456'), [
+      { name: 'nick', key: 'abc123' },
+      { name: 'family', key: 'def456' },
+    ]);
+  });
+
+  test('auto-names bare keys without a colon as key1, key2, ...', () => {
+    assert.deepEqual(parseApiKeys(null, 'abc123,def456'), [
+      { name: 'key1', key: 'abc123' },
+      { name: 'key2', key: 'def456' },
+    ]);
+  });
+
+  test('trims whitespace around names, keys, and entries', () => {
+    assert.deepEqual(parseApiKeys(null, ' nick : abc123 , family:def456 '), [
+      { name: 'nick', key: 'abc123' },
+      { name: 'family', key: 'def456' },
+    ]);
+  });
+
+  test('skips empty entries from trailing/double commas', () => {
+    assert.deepEqual(parseApiKeys(null, 'nick:abc123,,family:def456,'), [
+      { name: 'nick', key: 'abc123' },
+      { name: 'family', key: 'def456' },
+    ]);
+  });
+
+  test('PROXY_API_KEY is prepended as "default" before PROXY_API_KEYS entries', () => {
+    assert.deepEqual(parseApiKeys('shared-secret', 'laptop:laptop-key'), [
+      { name: 'default', key: 'shared-secret' },
+      { name: 'laptop', key: 'laptop-key' },
+    ]);
+  });
+});
+
+// ── recordTokens / per-API-key metrics ────────────────────────────────────────
+
+describe('recordTokens', () => {
+  test('aggregates tokens and request counts under apiKeysUsed by key name', () => {
+    const before = JSON.parse(JSON.stringify(_metrics.apiKeysUsed));
+    recordTokens(100, 50, 'qwen2.5:7b', 'nick');
+    recordTokens(200, 75, 'qwen2.5:7b', 'nick');
+    recordTokens(10, 5, 'qwen2.5:7b', 'family');
+
+    assert.deepEqual(_metrics.apiKeysUsed.nick, {
+      requests:  (before.nick?.requests  || 0) + 2,
+      tokensIn:  (before.nick?.tokensIn  || 0) + 300,
+      tokensOut: (before.nick?.tokensOut || 0) + 125,
+    });
+    assert.deepEqual(_metrics.apiKeysUsed.family, {
+      requests:  (before.family?.requests  || 0) + 1,
+      tokensIn:  (before.family?.tokensIn  || 0) + 10,
+      tokensOut: (before.family?.tokensOut || 0) + 5,
+    });
+  });
+
+  test('does not create an apiKeysUsed entry when apiKeyName is omitted', () => {
+    const before = Object.keys(_metrics.apiKeysUsed).length;
+    recordTokens(10, 5, 'qwen2.5:7b');
+    assert.equal(Object.keys(_metrics.apiKeysUsed).length, before);
   });
 });
 
