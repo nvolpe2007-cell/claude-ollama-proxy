@@ -1,5 +1,7 @@
 # claude-ollama-proxy
 
+[![Test](https://github.com/nvolpe2007-cell/claude-ollama-proxy/actions/workflows/test.yml/badge.svg)](https://github.com/nvolpe2007-cell/claude-ollama-proxy/actions/workflows/test.yml)
+
 A lightweight Node.js proxy that translates Anthropic API requests (Claude format) into Ollama's OpenAI-compatible format. This lets you point **Claude Code** — or any tool that speaks the Anthropic `messages` API — at a local Ollama model instead of the real Claude API.
 
 Also accepts native **OpenAI chat format** directly, making it a drop-in proxy for OpenAI-compatible clients (Cursor, Continue, LiteLLM, etc.).
