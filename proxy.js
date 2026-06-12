@@ -54,12 +54,64 @@ function parseDotEnv(content) {
 const OLLAMA_HOSTS = (process.env.OLLAMA_HOST || 'http://localhost:11434')
   .split(',').map(h => h.trim()).filter(Boolean);
 
+// Tracks per-host health so getOllamaHost() can route around a host that is
+// down (crashed Ollama instance, unplugged GPU box, etc.) instead of sending
+// every Nth request into retries that are guaranteed to fail. A host is
+// marked unhealthy after HOST_UNHEALTHY_THRESHOLD consecutive failed checks
+// and becomes eligible again as soon as a single check succeeds.
+const HOST_UNHEALTHY_THRESHOLD = 2;
+const _hostHealth = new Map(OLLAMA_HOSTS.map(h =>
+  [h, { healthy: true, consecutiveFailures: 0, lastError: null, lastCheckedAt: null }]));
+
+function recordHostHealth(host, ok, error) {
+  const h = _hostHealth.get(host);
+  if (!h) return;
+  h.lastCheckedAt = new Date().toISOString();
+  if (ok) {
+    h.healthy = true;
+    h.consecutiveFailures = 0;
+    h.lastError = null;
+  } else {
+    h.consecutiveFailures++;
+    h.lastError = error;
+    if (h.consecutiveFailures >= HOST_UNHEALTHY_THRESHOLD) h.healthy = false;
+  }
+}
+
+// Pings a single Ollama host's /api/tags endpoint and records the result in
+// _hostHealth. Used by the periodic background health checker and by
+// GET /health (which performs a live check on every call).
+async function checkHostHealth(url) {
+  try {
+    const r = await fetch(`${url}/api/tags`, { signal: AbortSignal.timeout(3000) });
+    recordHostHealth(url, r.ok, r.ok ? null : `HTTP ${r.status}`);
+    return r.ok;
+  } catch (e) {
+    recordHostHealth(url, false, e.message);
+    return false;
+  }
+}
+
 // Round-robin index. Node.js is single-threaded so no lock is needed.
 let _hostIdx = 0;
 function getOllamaHost() {
-  const host = OLLAMA_HOSTS[_hostIdx];
-  _hostIdx = (_hostIdx + 1) % OLLAMA_HOSTS.length;
-  return host;
+  // Skip hosts currently marked unhealthy. If every host is unhealthy, fail
+  // open and return the next host in rotation anyway — existing per-request
+  // retry/error handling still applies, and this avoids a total outage just
+  // because the health checker hasn't caught up with a recovery yet.
+  const start = _hostIdx;
+  let fallback = null;
+  for (let i = 0; i < OLLAMA_HOSTS.length; i++) {
+    const idx = (start + i) % OLLAMA_HOSTS.length;
+    const host = OLLAMA_HOSTS[idx];
+    if (fallback === null) fallback = host;
+    if (_hostHealth.get(host)?.healthy !== false) {
+      _hostIdx = (idx + 1) % OLLAMA_HOSTS.length;
+      return host;
+    }
+  }
+  _hostIdx = (start + 1) % OLLAMA_HOSTS.length;
+  return fallback;
 }
 
 const MODEL         = process.env.OLLAMA_MODEL    || 'qwen2.5:7b';
@@ -2326,12 +2378,16 @@ async function handleCountTokens(req, res) {
 
 async function handleHealth(req, res) {
   const hostResults = await Promise.all(OLLAMA_HOSTS.map(async url => {
-    try {
-      const check = await fetch(`${url}/api/tags`, { signal: AbortSignal.timeout(3000) });
-      return { url, status: check.ok ? 'ok' : 'unreachable', error: check.ok ? undefined : `HTTP ${check.status}` };
-    } catch (e) {
-      return { url, status: 'unreachable', error: e.message };
-    }
+    const ok = await checkHostHealth(url);
+    const h = _hostHealth.get(url);
+    return {
+      url,
+      status: ok ? 'ok' : 'unreachable',
+      error: ok ? undefined : h?.lastError,
+      // 'active' = eligible for round-robin selection; 'skipped' = currently
+      // routed around by getOllamaHost() after repeated failures.
+      routing: h?.healthy !== false ? 'active' : 'skipped',
+    };
   }));
   const anyOk = hostResults.some(h => h.status === 'ok');
   const allOk = hostResults.every(h => h.status === 'ok');
@@ -2612,7 +2668,9 @@ async function refresh(){
   if(h&&h.hosts&&h.hosts.length>1){
     h.hosts.forEach(hh=>{
       const ok2=hh.status==='ok';
-      g+=row(hh.url.replace(/^https?:\/\//,''),badge(ok2,'OK',hh.error||'Err'));
+      let v=badge(ok2,'OK',hh.error||'Err');
+      if(hh.routing==='skipped')v+=' <span class="err" title="repeated failures — skipped by round-robin until it recovers">skipped</span>';
+      g+=row(hh.url.replace(/^https?:\/\//,''),v);
     });
   } else if(h&&h.ollamaError){
     g+=row('Error','<span class="err">'+h.ollamaError+'</span>');
@@ -3522,6 +3580,15 @@ if (require.main === module) {
   // and removal of ended batches older than 1 hour.
   setInterval(cleanupExpiredBatches, 5 * 60_000).unref();
 
+  // In multi-host deployments, periodically probe each Ollama host so
+  // getOllamaHost() can route around one that has gone down without waiting
+  // for a live request to fail first. Single-host setups have nowhere else
+  // to route, so this is skipped to avoid needless background traffic.
+  if (OLLAMA_HOSTS.length > 1) {
+    OLLAMA_HOSTS.forEach(checkHostHealth); // seed initial state immediately
+    setInterval(() => OLLAMA_HOSTS.forEach(checkHostHealth), 15_000).unref();
+  }
+
   // closeIdleConnections drops idle keep-alive connections immediately so
   // server.close() can actually reach its callback on SIGTERM.  Without this,
   // any open keep-alive socket from Claude Code would prevent a clean exit.
@@ -3558,6 +3625,11 @@ module.exports = {
   sanitizeForLog,
   getOllamaHost,
   OLLAMA_HOSTS,
+  // Host-health internals exported for unit testing only.
+  checkHostHealth,
+  recordHostHealth,
+  _hostHealth,
+  HOST_UNHEALTHY_THRESHOLD,
   requestHandler,
   handleMessages,
   handleOpenAIChat,

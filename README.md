@@ -398,6 +398,10 @@ OLLAMA_HOST=http://gpu1:11434,http://gpu2:11434,http://gpu3:11434 node proxy.js
 
 Requests are distributed round-robin across all listed hosts. `GET /health` checks all hosts in parallel and reports per-host status in a `hosts` array. `PROXY_WARMUP=true` pre-loads the model on every host in parallel.
 
+### Automatic failover
+
+The proxy tracks each host's health and routes around one that's down. After 2 consecutive failed checks a host is marked unhealthy and skipped by round-robin (so a crashed Ollama instance or unplugged GPU box doesn't keep eating every Nth request); a single successful check immediately restores it. In multi-host setups a background check pings every host's `/api/tags` every 15 seconds, and `GET /health` performs a live check on every call. Each entry in the `hosts` array includes a `routing` field — `"active"` or `"skipped"` — showing whether that host is currently eligible for selection. If every host is unhealthy, the proxy fails open and keeps rotating normally so existing per-request retry/error handling still applies.
+
 ## Model mapping (MODEL_MAP)
 
 Map `claude-*` model names to specific Ollama models so Claude Code's model selection works naturally:

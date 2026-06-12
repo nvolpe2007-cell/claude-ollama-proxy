@@ -21,7 +21,7 @@ delete process.env.PROXY_API_KEY;  // most tests run without auth
 const { describe, test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const http   = require('http');
-const { requestHandler } = require('./proxy');
+const { requestHandler, HOST_UNHEALTHY_THRESHOLD } = require('./proxy');
 
 // ── Mock Ollama server ────────────────────────────────────────────────────────
 
@@ -286,6 +286,7 @@ describe('GET /health', () => {
     assert.ok(typeof b.model === 'string' && b.model.length > 0);
     assert.ok(typeof b.port === 'number');
     assert.ok(typeof b.timestamp === 'string');
+    assert.equal(b.hosts[0].routing, 'active');
   });
 
   test('503 with status:degraded when Ollama returns an error', async () => {
@@ -295,6 +296,20 @@ describe('GET /health', () => {
     const b = json(r);
     assert.equal(b.status, 'degraded');
     assert.equal(b.ollama, 'unreachable');
+  });
+
+  test('routing flips to skipped after repeated failures, back to active on recovery', async () => {
+    mockBehavior = 'ollama-error';
+    let b;
+    for (let i = 0; i < HOST_UNHEALTHY_THRESHOLD; i++) {
+      b = json(await request('GET', '/health'));
+    }
+    assert.equal(b.hosts[0].routing, 'skipped');
+
+    mockBehavior = 'default';
+    b = json(await request('GET', '/health'));
+    assert.equal(b.hosts[0].status, 'ok');
+    assert.equal(b.hosts[0].routing, 'active');
   });
 });
 

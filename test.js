@@ -25,6 +25,10 @@ const {
   sanitizeForLog,
   getOllamaHost,
   OLLAMA_HOSTS,
+  checkHostHealth,
+  recordHostHealth,
+  _hostHealth,
+  HOST_UNHEALTHY_THRESHOLD,
   checkRateLimit,
   getClientIp,
   _rateLimitWindows,
@@ -622,6 +626,135 @@ describe('getOllamaHost', () => {
       const h = getOllamaHost();
       assert.ok(OLLAMA_HOSTS.includes(h), `unexpected host returned: ${h}`);
     }
+  });
+});
+
+// ── Host health tracking ─────────────────────────────────────────────────────
+
+describe('recordHostHealth / getOllamaHost failover', () => {
+  const host = OLLAMA_HOSTS[0];
+
+  test('host starts out healthy', () => {
+    const h = _hostHealth.get(host);
+    assert.equal(h.healthy, true);
+    assert.equal(h.consecutiveFailures, 0);
+  });
+
+  test('marks unhealthy only after HOST_UNHEALTHY_THRESHOLD consecutive failures', () => {
+    for (let i = 1; i < HOST_UNHEALTHY_THRESHOLD; i++) {
+      recordHostHealth(host, false, 'boom');
+      assert.equal(_hostHealth.get(host).healthy, true, `should still be healthy after ${i} failure(s)`);
+    }
+    recordHostHealth(host, false, 'boom');
+    assert.equal(_hostHealth.get(host).healthy, false);
+    assert.equal(_hostHealth.get(host).lastError, 'boom');
+  });
+
+  test('a single success immediately restores health', () => {
+    recordHostHealth(host, true, null);
+    const h = _hostHealth.get(host);
+    assert.equal(h.healthy, true);
+    assert.equal(h.consecutiveFailures, 0);
+    assert.equal(h.lastError, null);
+  });
+
+  test('getOllamaHost fails open when the only host is unhealthy', () => {
+    for (let i = 0; i < HOST_UNHEALTHY_THRESHOLD; i++) recordHostHealth(host, false, 'down');
+    assert.equal(_hostHealth.get(host).healthy, false);
+    // With a single configured host there's nowhere else to route — must still
+    // return that host rather than failing with no result.
+    assert.equal(getOllamaHost(), host);
+    recordHostHealth(host, true, null); // restore for other tests
+  });
+});
+
+describe('checkHostHealth', () => {
+  const host = OLLAMA_HOSTS[0];
+
+  test('records success when /api/tags responds ok', async () => {
+    const orig = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200 });
+    try {
+      const ok = await checkHostHealth(host);
+      assert.equal(ok, true);
+      assert.equal(_hostHealth.get(host).healthy, true);
+      assert.equal(_hostHealth.get(host).consecutiveFailures, 0);
+    } finally {
+      global.fetch = orig;
+    }
+  });
+
+  test('records failure when fetch throws', async () => {
+    const orig = global.fetch;
+    global.fetch = async () => { throw new Error('ECONNREFUSED'); };
+    try {
+      for (let i = 0; i < HOST_UNHEALTHY_THRESHOLD; i++) {
+        const ok = await checkHostHealth(host);
+        assert.equal(ok, false);
+      }
+      const h = _hostHealth.get(host);
+      assert.equal(h.healthy, false);
+      assert.equal(h.lastError, 'ECONNREFUSED');
+    } finally {
+      global.fetch = orig;
+      recordHostHealth(host, true, null); // restore for other tests
+    }
+  });
+});
+
+// withHosts() loads a fresh proxy module with a multi-host OLLAMA_HOST so
+// round-robin/failover behavior can be tested in isolation, then restores
+// the original module cache so other tests are unaffected.
+function withHosts(hostsCsv, fn) {
+  const modKey = require.resolve('./proxy');
+  const savedMod = require.cache[modKey];
+  let freshProxy;
+  try {
+    process.env.OLLAMA_HOST = hostsCsv;
+    delete require.cache[modKey];
+    freshProxy = require('./proxy');
+  } finally {
+    delete process.env.OLLAMA_HOST;
+    delete require.cache[modKey];
+    require.cache[modKey] = savedMod;
+  }
+  return fn(freshProxy);
+}
+
+describe('multi-host failover', () => {
+  test('round-robins across all healthy hosts', () => {
+    withHosts('http://host-a:11434,http://host-b:11434', (mod) => {
+      const seen = new Set();
+      for (let i = 0; i < mod.OLLAMA_HOSTS.length; i++) seen.add(mod.getOllamaHost());
+      assert.deepEqual(seen, new Set(mod.OLLAMA_HOSTS));
+    });
+  });
+
+  test('skips a host marked unhealthy until it recovers', () => {
+    withHosts('http://host-a:11434,http://host-b:11434', (mod) => {
+      const [hostA, hostB] = mod.OLLAMA_HOSTS;
+      for (let i = 0; i < mod.HOST_UNHEALTHY_THRESHOLD; i++) mod.recordHostHealth(hostA, false, 'down');
+
+      for (let i = 0; i < 5; i++) assert.equal(mod.getOllamaHost(), hostB);
+
+      mod.recordHostHealth(hostA, true, null);
+      const seen = new Set();
+      for (let i = 0; i < mod.OLLAMA_HOSTS.length; i++) seen.add(mod.getOllamaHost());
+      assert.deepEqual(seen, new Set([hostA, hostB]));
+    });
+  });
+
+  test('fails open and keeps rotating when every host is unhealthy', () => {
+    withHosts('http://host-a:11434,http://host-b:11434', (mod) => {
+      const [hostA, hostB] = mod.OLLAMA_HOSTS;
+      for (let i = 0; i < mod.HOST_UNHEALTHY_THRESHOLD; i++) {
+        mod.recordHostHealth(hostA, false, 'down');
+        mod.recordHostHealth(hostB, false, 'down');
+      }
+      const seen = new Set();
+      for (let i = 0; i < mod.OLLAMA_HOSTS.length * 2; i++) seen.add(mod.getOllamaHost());
+      assert.deepEqual(seen, new Set([hostA, hostB]));
+    });
   });
 });
 
