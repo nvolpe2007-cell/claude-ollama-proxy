@@ -166,6 +166,13 @@ const PROXY_MAX_BODY_SIZE = (() => {
 // Opt-in (default false) so existing deployments see no behaviour change.
 const PROXY_AUTO_TRUNCATE = process.env.PROXY_AUTO_TRUNCATE === 'true';
 
+// Optional path to a JSON file where the Messages Batch API state (requests + results)
+// is persisted after every change and reloaded at startup. Without this, batches and
+// their results live only in memory and are silently lost if the proxy restarts —
+// a real problem for batches that can take hours to process. Opt-in (default null,
+// in-memory only) so existing deployments see no behaviour change.
+const PROXY_BATCH_PERSIST_PATH = process.env.PROXY_BATCH_PERSIST_PATH || null;
+
 // Optional JSON object of arbitrary Ollama model parameters to include in every request.
 // Useful for deployment-level tuning (repeat_penalty, mirostat, num_gpu, tfs_z, etc.)
 // without adding individual env vars for each knob. Per-request client params take
@@ -1784,6 +1791,56 @@ function newBatchId() {
   return 'msgbatch_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
+// ── Batch persistence (PROXY_BATCH_PERSIST_PATH) ──────────────────────────────
+// Serializes _batches (a Map of batches, each holding a Map of results) to JSON.
+// Writes are serialized: if a save is already in flight when another is requested,
+// a pending flag triggers exactly one more save afterwards so the file always
+// converges on the latest state without overlapping writes corrupting it.
+let _batchSaveInProgress = false;
+let _batchSavePending    = false;
+
+async function saveBatchesToDisk(filePath = PROXY_BATCH_PERSIST_PATH) {
+  if (!filePath) return;
+  if (_batchSaveInProgress) { _batchSavePending = true; return; }
+  _batchSaveInProgress = true;
+  try {
+    const data = [..._batches.values()].map(b => ({ ...b, results: [...b.results.entries()] }));
+    await fs.promises.writeFile(filePath, JSON.stringify(data));
+  } catch (e) {
+    console.warn(`[batches] Failed to persist batches to ${filePath}: ${e.message}`);
+  } finally {
+    _batchSaveInProgress = false;
+    if (_batchSavePending) {
+      _batchSavePending = false;
+      await saveBatchesToDisk(filePath);
+    }
+  }
+}
+
+// Loads previously-persisted batches at startup. Batches that had not reached
+// 'ended' status when the proxy last stopped are resumed via processBatch, which
+// skips any item that already has a result — so partially-completed batches
+// continue from where they left off rather than reprocessing finished items.
+function loadBatchesFromDisk(filePath = PROXY_BATCH_PERSIST_PATH) {
+  if (!filePath) return;
+  if (!fs.existsSync(filePath)) return;
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    console.warn(`[batches] Failed to load persisted batches from ${filePath}: ${e.message}`);
+    return;
+  }
+  for (const b of data) {
+    b.results = new Map(b.results);
+    _batches.set(b.id, b);
+  }
+  console.log(`[batches] Loaded ${data.length} batch(es) from ${filePath}`);
+  for (const b of _batches.values()) {
+    if (b.status !== 'ended') setImmediate(() => processBatch(b));
+  }
+}
+
 function batchRequestCounts(batch) {
   let processing = 0, succeeded = 0, errored = 0, canceled = 0, expired = 0;
   for (const req of batch.requests) {
@@ -1938,14 +1995,18 @@ async function processBatchRequest(anthropicReq, ollamaBase) {
 async function processBatch(batch) {
   const ollamaBase = getOllamaHost();
   for (const item of batch.requests) {
+    // Already processed — happens when a persisted batch is resumed after a restart.
+    if (batch.results.has(item.custom_id)) continue;
     if (batch.cancelRequested) {
       batch.results.set(item.custom_id, { type: 'canceled' });
+      saveBatchesToDisk();
       continue;
     }
     // Honour the 24-hour expires_at TTL: mark any remaining items as expired if the
     // batch has already outlived its window, rather than continuing to burn GPU time.
     if (Date.now() >= new Date(batch.expires_at).getTime()) {
       batch.results.set(item.custom_id, { type: 'expired' });
+      saveBatchesToDisk();
       continue;
     }
     await acquireLlmSlotForBatch();
@@ -1955,9 +2016,11 @@ async function processBatch(batch) {
     }));
     releaseLlmSlot();
     batch.results.set(item.custom_id, result);
+    saveBatchesToDisk();
   }
   batch.status   = 'ended';
   batch.ended_at = new Date().toISOString();
+  saveBatchesToDisk();
 }
 
 // Enforces batch TTLs and reclaims memory for old ended batches.
@@ -1970,10 +2033,12 @@ async function processBatch(batch) {
 function cleanupExpiredBatches() {
   const now = Date.now();
   const endedCutoff = new Date(now - 60 * 60 * 1000).toISOString();
+  let changed = false;
   for (const [id, batch] of _batches) {
     // Remove batches that ended more than 1 hour ago.
     if (batch.status === 'ended' && batch.ended_at && batch.ended_at < endedCutoff) {
       _batches.delete(id);
+      changed = true;
       continue;
     }
     // Force-expire batches still in-progress past their TTL.
@@ -1984,8 +2049,10 @@ function cleanupExpiredBatches() {
       }
       batch.status   = 'ended';
       batch.ended_at = new Date().toISOString();
+      changed = true;
     }
   }
+  if (changed) saveBatchesToDisk();
 }
 
 function getBatchBaseUrl(req) {
@@ -2037,6 +2104,7 @@ async function handleCreateBatch(req, res) {
   };
 
   _batches.set(batch.id, batch);
+  saveBatchesToDisk();
   setImmediate(() => processBatch(batch));
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -2102,6 +2170,7 @@ async function handleCancelBatch(req, res, batchId) {
   batch.cancelRequested    = true;
   batch.cancel_initiated_at = new Date().toISOString();
   if (batch.status !== 'ended') batch.status = 'canceling';
+  saveBatchesToDisk();
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(batchToResponse(batch, getBatchBaseUrl(req))));
 }
@@ -2472,6 +2541,7 @@ function handleDashboard(req, res) {
     forceThink:         PROXY_FORCE_THINK,
     autoTruncate:       PROXY_AUTO_TRUNCATE,
     listenHost:         PROXY_LISTEN_HOST,
+    batchPersistPath:   PROXY_BATCH_PERSIST_PATH,
   });
 
   const html = `<!DOCTYPE html>
@@ -2567,6 +2637,7 @@ async function refresh(){
   if(C.systemPrompt)g+=row('System prompt',\`<span title="\${C.systemPrompt}" style="cursor:help">set ℹ</span>\`);
   if(C.forceThink)g+=row('Force thinking','<span class="ok">Enabled (think:true on all requests)</span>');
   if(C.autoTruncate)g+=row('Auto-truncate','<span class="ok">Enabled'+(C.numCtx?' (limit: '+C.numCtx.toLocaleString()+' tok)':' (set OLLAMA_NUM_CTX)')+'</span>');
+  if(C.batchPersistPath)g+=row('Batch persistence',\`<span title="\${C.batchPersistPath}" style="cursor:help">enabled ℹ</span>\`);
   if(C.ollamaOptions)g+=row('Ollama options',\`<span title="\${C.ollamaOptions}" style="cursor:help;font-size:11px">\${C.ollamaOptions.length>40?C.ollamaOptions.slice(0,40)+'…':C.ollamaOptions}</span>\`);
   g+='<div class="sep"></div>';
   g+='<div class="row" style="gap:8px"><a href="/health">health</a><a href="/metrics">metrics JSON</a><a href="/metrics/prometheus">prometheus</a><a href="/v1/models">models</a></div>';
@@ -3292,6 +3363,8 @@ async function requestHandler(req, res) {
 }
 
 if (require.main === module) {
+  loadBatchesFromDisk();
+
   let server;
   if (TLS_CERT && TLS_KEY) {
     let tlsOpts;
@@ -3346,6 +3419,7 @@ if (require.main === module) {
     if (PROXY_AUTO_TRUNCATE) {
       console.log(`  AutoTruncate: enabled — drops oldest turns when est. input > ${OLLAMA_NUM_CTX ? OLLAMA_NUM_CTX + ' tokens' : 'OLLAMA_NUM_CTX (not set — truncation inactive until OLLAMA_NUM_CTX is configured)'}`);
     }
+    console.log(`  Batches: ${PROXY_BATCH_PERSIST_PATH ? `persisted to ${PROXY_BATCH_PERSIST_PATH}` : 'in-memory only (set PROXY_BATCH_PERSIST_PATH to survive restarts)'}`);
     const rlGlobal = RATE_LIMIT_RPM        ? `global ${RATE_LIMIT_RPM} req/min`    : 'no global limit';
     const rlIp     = RATE_LIMIT_PER_IP_RPM ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min` : 'no per-IP limit';
     console.log(`  RateLimit: ${rlGlobal}; ${rlIp} (set RATE_LIMIT_RPM / RATE_LIMIT_PER_IP_RPM)`);
@@ -3482,6 +3556,9 @@ module.exports = {
   processBatchRequest,
   batchRequestCounts,
   batchToResponse,
+  saveBatchesToDisk,
+  loadBatchesFromDisk,
+  PROXY_BATCH_PERSIST_PATH,
   _batches,
   handleMetricsPrometheus,
   // Rate-limit internals exported for unit testing only.

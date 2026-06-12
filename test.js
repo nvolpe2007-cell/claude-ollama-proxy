@@ -1,6 +1,9 @@
 'use strict';
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
+const fs   = require('fs');
+const os   = require('os');
+const path = require('path');
 
 const {
   parseDotEnv,
@@ -35,6 +38,8 @@ const {
   cleanupExpiredBatches,
   processBatch,
   batchRequestCounts,
+  saveBatchesToDisk,
+  loadBatchesFromDisk,
   _batches,
   truncateToContext,
 } = require('./proxy');
@@ -2567,6 +2572,129 @@ describe('processBatch — expiry enforcement', () => {
     assert.equal(batch.results.get('r1').type, 'expired',
       'item should be marked expired when batch TTL has passed');
     _batches.delete(batch.id);
+  });
+});
+
+// ── processBatch — resume skips already-processed items ───────────────────────
+
+describe('processBatch — resume', () => {
+  test('skips items that already have a recorded result and only processes the rest', async () => {
+    const batch = {
+      id:              'msgbatch_skip_test',
+      status:          'in_progress',
+      expires_at:      new Date(Date.now() + 60_000).toISOString(),
+      ended_at:        null,
+      cancelRequested: false,
+      requests: [
+        { custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } },
+        { custom_id: 'r2', params: { messages: [], model: 'test', max_tokens: 1 } },
+      ],
+      results: new Map([['r1', { type: 'succeeded', message: { id: 'msg_already_done' } }]]),
+    };
+    _batches.set(batch.id, batch);
+
+    const orig = global.fetch;
+    let fetchCalls = 0;
+    global.fetch = async () => {
+      fetchCalls++;
+      return {
+        ok: true, status: 200,
+        json: async () => ({ choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }], usage: {} }),
+      };
+    };
+
+    try {
+      await processBatch(batch);
+      assert.equal(fetchCalls, 1, 'only the unresolved item (r2) should hit Ollama');
+      assert.equal(batch.results.get('r1').message.id, 'msg_already_done', 'existing result must not be overwritten');
+      assert.equal(batch.results.get('r2').type, 'succeeded');
+      assert.equal(batch.status, 'ended');
+    } finally {
+      global.fetch = orig;
+      _batches.delete(batch.id);
+    }
+  });
+});
+
+// ── Batch persistence (saveBatchesToDisk / loadBatchesFromDisk) ───────────────
+
+describe('Batch persistence', () => {
+  function tmpFile() {
+    return path.join(os.tmpdir(), `batches-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  }
+
+  test('saveBatchesToDisk is a no-op when no path is configured', async () => {
+    await assert.doesNotReject(() => saveBatchesToDisk(null));
+  });
+
+  test('loadBatchesFromDisk is a no-op when the file does not exist', () => {
+    assert.doesNotThrow(() => loadBatchesFromDisk(tmpFile()));
+  });
+
+  test('round-trips an ended batch through save and load', async () => {
+    const file = tmpFile();
+    const batch = {
+      id:                  'msgbatch_persist_test',
+      status:              'ended',
+      created_at:          new Date().toISOString(),
+      expires_at:          new Date(Date.now() + 60_000).toISOString(),
+      ended_at:            new Date().toISOString(),
+      cancel_initiated_at: null,
+      requests:            [{ custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } }],
+      results:             new Map([['r1', { type: 'succeeded', message: { id: 'msg_1' } }]]),
+      cancelRequested:     false,
+    };
+    _batches.set(batch.id, batch);
+
+    try {
+      await saveBatchesToDisk(file);
+      assert.ok(fs.existsSync(file), 'persisted file should exist');
+
+      _batches.delete(batch.id);
+      loadBatchesFromDisk(file);
+
+      const loaded = _batches.get(batch.id);
+      assert.ok(loaded, 'batch should be reloaded from disk');
+      assert.equal(loaded.status, 'ended');
+      assert.ok(loaded.results instanceof Map, 'results should be reconstructed as a Map');
+      assert.deepEqual(loaded.results.get('r1'), { type: 'succeeded', message: { id: 'msg_1' } });
+    } finally {
+      _batches.delete(batch.id);
+      fs.rmSync(file, { force: true });
+    }
+  });
+
+  test('resumes a persisted in-progress batch and marks it ended once all items already have results', async () => {
+    const file = tmpFile();
+    const batch = {
+      id:                  'msgbatch_resume_test',
+      status:              'in_progress',
+      created_at:          new Date().toISOString(),
+      expires_at:          new Date(Date.now() + 60_000).toISOString(),
+      ended_at:            null,
+      cancel_initiated_at: null,
+      requests:            [{ custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } }],
+      results:             new Map([['r1', { type: 'succeeded', message: { id: 'msg_1' } }]]),
+      cancelRequested:     false,
+    };
+    _batches.set(batch.id, batch);
+
+    try {
+      await saveBatchesToDisk(file);
+      _batches.delete(batch.id);
+
+      loadBatchesFromDisk(file);
+      // loadBatchesFromDisk schedules processBatch via setImmediate for non-ended batches.
+      await new Promise(r => setImmediate(r));
+
+      const loaded = _batches.get(batch.id);
+      assert.ok(loaded, 'batch should be reloaded from disk');
+      assert.equal(loaded.status, 'ended', 'resumed batch with all items already resolved should be marked ended');
+      assert.equal(loaded.results.get('r1').type, 'succeeded', 'existing result should be preserved, not reprocessed');
+    } finally {
+      _batches.delete(batch.id);
+      fs.rmSync(file, { force: true });
+    }
   });
 });
 

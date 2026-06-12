@@ -93,6 +93,7 @@ The proxy also loads a `.env` file from the current working directory (or its ow
 | `PROXY_MAX_QUEUE_TIMEOUT` | *(none)* | Milliseconds a queued request waits before giving up with `503`. Only meaningful with `PROXY_MAX_QUEUE_SIZE` |
 | `LOG_FORMAT` | `text` | Log format for request lines. `text` writes human-readable lines; `json` writes a single JSON object per request — useful for log aggregation tools like Grafana Loki, Datadog, or AWS CloudWatch |
 | `LOG_LEVEL` | `info` | `info` logs one summary line per request. `debug` additionally logs the full translated OpenAI-format request sent to Ollama and the raw Ollama response (non-streaming) — invaluable for diagnosing message/tool conversion issues. Large base64 image payloads are truncated in debug logs |
+| `PROXY_BATCH_PERSIST_PATH` | *(unset)* | Path to a JSON file where Messages Batch API state (requests + results) is saved after every change and reloaded at startup. Without this, batches and their results live only in memory and are lost on restart. Batches that hadn't finished are resumed, skipping any items already completed |
 
 Examples:
 
@@ -640,4 +641,4 @@ When the estimated input would exceed `OLLAMA_NUM_CTX`, the proxy drops the olde
 - `thinking` block signatures are synthetic placeholders — they are not cryptographically signed by Ollama
 - `think: true` forwarding requires Ollama 0.7+ and a model that supports native thinking (DeepSeek-R1, Qwen3-thinking)
 - PDF and binary document blocks are converted to a placeholder note; only text-source documents are passed through
-- The Messages Batch API is in-memory only — batches and results do not survive a proxy restart
+- The Messages Batch API is in-memory by default — set `PROXY_BATCH_PERSIST_PATH` to persist batches and results across restarts
