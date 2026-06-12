@@ -1172,6 +1172,7 @@ async function handleMessages(req, res) {
   let inputTokens   = 0;
   let outputTokens  = 0;
   let stopReason    = null;    // set on finish_reason; message_delta deferred until after loop
+  let streamErrored = false;   // set when Ollama sends a mid-stream {"error":...} chunk
 
   // State machine for routing <think>…</think> content to Anthropic thinking blocks.
   // Supports interleaved thinking: multiple alternating think/text blocks in one response
@@ -1317,6 +1318,28 @@ async function handleMessages(req, res) {
     }
   }
 
+  // Flushes any pending thinking text and closes every currently-open content block
+  // (thinking, text, tool_use). Shared by the normal finish_reason path, the
+  // no-finish_reason fallback, and the mid-stream error path below so all three
+  // leave the SSE stream in a valid state before the terminal event is sent.
+  function closeAllBlocks() {
+    routeThinkChunk(true);
+    if (thinkState === 'thinking') {
+      sendSSE(res, 'content_block_delta', {
+        type: 'content_block_delta', index: thinkIdx,
+        delta: { type: 'signature_delta', signature: 'ollama-proxy-extracted' }
+      });
+      sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkIdx });
+      thinkCount++;
+    }
+    if (textBlockOpen) {
+      sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
+    }
+    for (const tb of Object.values(toolBlocks)) {
+      sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: tb.anthropicIndex });
+    }
+  }
+
   // Prevent reverse-proxy read timeouts on slow models.
   const keepAlive = setInterval(() => res.writableEnded || res.write(': keepalive\n\n'), 15_000);
 
@@ -1361,6 +1384,21 @@ async function handleMessages(req, res) {
         if (chunk.usage) {
           inputTokens  = chunk.usage.prompt_tokens     || inputTokens;
           outputTokens = chunk.usage.completion_tokens || outputTokens;
+        }
+
+        // Ollama can send a {"error": ...} chunk mid-stream (e.g. the model crashes
+        // or runs out of VRAM after generation has already started). Without this
+        // check the chunk has no `choices`, so it was silently skipped and the
+        // stream ended as if it had completed normally — stop_reason: 'end_turn' —
+        // hiding the failure from the client.
+        if (chunk.error) {
+          const message = typeof chunk.error === 'string'
+            ? chunk.error
+            : (chunk.error.message || JSON.stringify(chunk.error));
+          closeAllBlocks();
+          sendSSE(res, 'error', { type: 'error', error: { type: 'api_error', message } });
+          streamErrored = true;
+          break;
         }
 
         const choice = chunk.choices?.[0];
@@ -1421,54 +1459,28 @@ async function handleMessages(req, res) {
           stopReason = choice.finish_reason === 'tool_calls' ? 'tool_use'
                      : choice.finish_reason === 'length'     ? 'max_tokens'
                      : 'end_turn';
-
-          routeThinkChunk(true);
-          if (thinkState === 'thinking') {
-            sendSSE(res, 'content_block_delta', {
-              type: 'content_block_delta', index: thinkIdx,
-              delta: { type: 'signature_delta', signature: 'ollama-proxy-extracted' }
-            });
-            sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkIdx });
-            thinkCount++;
-          }
-          if (textBlockOpen) {
-            sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
-          }
-          for (const tb of Object.values(toolBlocks)) {
-            sendSSE(res, 'content_block_stop', {
-              type: 'content_block_stop', index: tb.anthropicIndex
-            });
-          }
+          closeAllBlocks();
         }
       }
+      if (streamErrored) break;
     }
     // All chunks consumed — emit terminal events with correct token counts.
-    // Guard against streams that end without an explicit finish_reason.
-    if (!stopReason) {
-      stopReason = 'end_turn';
-      routeThinkChunk(true);
-      if (thinkState === 'thinking') {
-        sendSSE(res, 'content_block_delta', {
-          type: 'content_block_delta', index: thinkIdx,
-          delta: { type: 'signature_delta', signature: 'ollama-proxy-extracted' }
+    // Skipped when a mid-stream error chunk already closed the blocks and sent an
+    // 'error' event above; real Anthropic streams don't send message_stop after an error.
+    if (!streamErrored) {
+      // Guard against streams that end without an explicit finish_reason.
+      if (!stopReason) {
+        stopReason = 'end_turn';
+        closeAllBlocks();
+      }
+      if (!res.writableEnded) {
+        sendSSE(res, 'message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: stopReason, stop_sequence: null },
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
         });
-        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkIdx });
-        thinkCount++;
+        sendSSE(res, 'message_stop', { type: 'message_stop' });
       }
-      if (textBlockOpen) {
-        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
-      }
-      for (const tb of Object.values(toolBlocks)) {
-        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: tb.anthropicIndex });
-      }
-    }
-    if (!res.writableEnded) {
-      sendSSE(res, 'message_delta', {
-        type: 'message_delta',
-        delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { input_tokens: inputTokens, output_tokens: outputTokens, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
-      });
-      sendSSE(res, 'message_stop', { type: 'message_stop' });
     }
   } catch (e) {
     if (e.name === 'AbortError') {
@@ -3199,6 +3211,13 @@ async function handleOpenAICompletions(req, res) {
         if (chunk.usage) {
           inputTokens  = chunk.usage.prompt_tokens     || inputTokens;
           outputTokens = chunk.usage.completion_tokens || outputTokens;
+        }
+
+        // Pass a mid-stream {"error":...} chunk straight through (no `choices` to
+        // convert) so callers see why generation stopped instead of a silent cutoff.
+        if (chunk.error) {
+          res.write(`data: ${JSON.stringify({ error: chunk.error })}\n\n`);
+          continue;
         }
 
         const choice = chunk.choices?.[0];

@@ -1420,6 +1420,44 @@ describe('handleOpenAICompletions', () => {
       global.fetch = origFetch;
     }
   });
+
+  // Stubs global.fetch to return a streaming SSE response, one chunk per element.
+  function stubStreamFetch(sseLines) {
+    const enc = new TextEncoder();
+    let pos = 0;
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      body: {
+        getReader() {
+          return {
+            async read() {
+              if (pos >= sseLines.length) return { done: true, value: undefined };
+              return { done: false, value: enc.encode(sseLines[pos++] + '\n') };
+            },
+            releaseLock() {},
+          };
+        },
+      },
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  test('streaming: passes through a mid-stream {"error":...} chunk', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}',
+      'data: {"error":{"message":"model crashed","type":"server_error"}}',
+    ]);
+    try {
+      const req = mockReq({ prompt: 'hi', stream: true });
+      const res = mockRes();
+      await handleOpenAICompletions(req, res);
+      const errLine = res._body.split('\n').find(l => l.startsWith('data: ') && l.includes('"error"'));
+      assert.ok(errLine, 'should write an error data line');
+      const parsed = JSON.parse(errLine.slice(6));
+      assert.equal(parsed.error.message, 'model crashed');
+    } finally { restore(); }
+  });
 });
 
 // ── checkConcurrency / trackActiveLlmRequest ──────────────────────────────────
@@ -1993,6 +2031,62 @@ describe('handleMessages', () => {
       await handleMessages(mockReq({ messages: [{ role: 'user', content: 'ok' }], stream: true }), res);
       const events = parseSse(res._body);
       assert.equal(events[events.length - 1].event, 'message_stop');
+    } finally { restore(); }
+  });
+
+  // ── Mid-stream error chunks ──────────────────────────────────────────────────
+  // Ollama can emit a {"error": ...} chunk after generation has already started
+  // (e.g. the model crashes or runs out of VRAM mid-response). Without explicit
+  // handling, such a chunk has no `choices` and was silently skipped, so the
+  // stream ended as if it had completed normally (stop_reason: 'end_turn'),
+  // hiding the failure from the client.
+
+  test('streaming: mid-stream {"error":...} chunk emits an Anthropic error event', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}',
+      'data: {"error":{"message":"model crashed","type":"server_error"}}',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'hi' }], stream: true }), res);
+      const events = parseSse(res._body);
+      const errEvent = events.find(e => e.event === 'error');
+      assert.ok(errEvent, 'should emit an error SSE event');
+      assert.equal(errEvent.data.error.type, 'api_error');
+      assert.equal(errEvent.data.error.message, 'model crashed');
+    } finally { restore(); }
+  });
+
+  test('streaming: mid-stream error does not send a misleading message_stop', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}',
+      'data: {"error":{"message":"model crashed","type":"server_error"}}',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'hi' }], stream: true }), res);
+      const events = parseSse(res._body);
+      assert.ok(!events.some(e => e.event === 'message_stop'), 'should not send message_stop after a mid-stream error');
+      assert.ok(!events.some(e => e.event === 'message_delta'), 'should not send message_delta after a mid-stream error');
+    } finally { restore(); }
+  });
+
+  test('streaming: mid-stream error closes the open text content block first', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}',
+      'data: {"error":"plain string error"}',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'hi' }], stream: true }), res);
+      const events = parseSse(res._body);
+      const stopIdx  = events.findIndex(e => e.event === 'content_block_stop');
+      const errIdx   = events.findIndex(e => e.event === 'error');
+      assert.ok(stopIdx !== -1, 'should close the open text block');
+      assert.ok(errIdx !== -1, 'should emit an error event');
+      assert.ok(stopIdx < errIdx, 'content_block_stop should come before the error event');
+      const errEvent = events[errIdx];
+      assert.equal(errEvent.data.error.message, 'plain string error');
     } finally { restore(); }
   });
 
