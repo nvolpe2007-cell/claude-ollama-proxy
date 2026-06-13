@@ -2499,6 +2499,63 @@ describe('anthropic-version response header', () => {
         'GET /v1/models must not include anthropic-version header');
     } finally { global.fetch = origFetch; }
   });
+
+  // ── GET /health — model availability ────────────────────────────────────────
+  const MODEL_NAME = process.env.OLLAMA_MODEL || 'qwen2.5:7b';
+  const host = OLLAMA_HOSTS[0];
+
+  function withTagsFetch(modelNames) {
+    const orig = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ models: modelNames.map(name => ({ name })) }) });
+    return () => { global.fetch = orig; };
+  }
+
+  test('GET /health reports model_available: true and status "ok" when the configured model is pulled', async () => {
+    const restore = withTagsFetch([MODEL_NAME, 'llava:latest']);
+    try {
+      const res = mockRes();
+      await requestHandler(mockReq('GET', '/health'), res);
+      const body = JSON.parse(res._body);
+      assert.equal(body.model_available, true);
+      assert.equal(body.status, 'ok');
+      assert.equal(body.warning, undefined);
+    } finally {
+      restore();
+      delete _hostHealth.get(host).models;
+    }
+  });
+
+  test('GET /health reports model_available: false, status "degraded", and a warning when the configured model is missing', async () => {
+    const restore = withTagsFetch(['some-other-model:latest']);
+    try {
+      const res = mockRes();
+      await requestHandler(mockReq('GET', '/health'), res);
+      const body = JSON.parse(res._body);
+      assert.equal(body.model_available, false);
+      assert.equal(body.status, 'degraded');
+      assert.ok(body.warning.includes(MODEL_NAME));
+      assert.ok(body.warning.includes('ollama pull'));
+    } finally {
+      restore();
+      delete _hostHealth.get(host).models;
+    }
+  });
+
+  test('GET /health reports model_available: null when Ollama is unreachable (cannot check)', async () => {
+    const origFetch = global.fetch;
+    global.fetch = async () => { throw new Error('ECONNREFUSED'); };
+    try {
+      const res = mockRes();
+      await requestHandler(mockReq('GET', '/health'), res);
+      const body = JSON.parse(res._body);
+      assert.equal(body.model_available, null);
+      assert.equal(body.warning, undefined);
+    } finally {
+      global.fetch = origFetch;
+      recordHostHealth(host, true, null);
+      delete _hostHealth.get(host).models;
+    }
+  });
 });
 
 // ── resolveMaxTokens ──────────────────────────────────────────────────────────

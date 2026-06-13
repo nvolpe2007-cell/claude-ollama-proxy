@@ -242,12 +242,23 @@ Returns `200 OK` when at least one Ollama host is reachable:
   "hosts": [{ "url": "http://localhost:11434", "status": "ok" }],
   "ollama": "reachable",
   "model": "qwen2.5:7b",
+  "model_available": true,
   "port": 4000,
   "timestamp": "2026-04-27T12:00:00.000Z"
 }
 ```
 
 Returns `503` with `"status": "degraded"` if any configured Ollama host is unreachable (`"status": "ok"` only when *all* hosts are reachable).
+
+### Model availability check
+
+Every `/health` call also checks whether the configured model(s) have actually been pulled into Ollama, by cross-referencing `OLLAMA_MODEL` (and every `MODEL_MAP` target) against each reachable host's `/api/tags` model list:
+
+- `model_available` — `true`/`false` for `OLLAMA_MODEL`, or `null` if no host could be checked (e.g. all hosts unreachable)
+- `models_status` — present when more than one distinct model is configured (via `MODEL_MAP`); maps each model name to `true`/`false`
+- `warning` — present when one or more configured models are missing, e.g. `"Models not found on any reachable Ollama host: qwen2.5:14b — run 'ollama pull <model>'"`
+
+If any configured model is missing, `status` becomes `"degraded"` even though Ollama itself is reachable — this catches the common misconfiguration of pointing `OLLAMA_MODEL`/`MODEL_MAP` at a model that hasn't been pulled yet, which otherwise only surfaces as a confusing error on the first real request. The live dashboard (`GET /`) also shows a "Model — not pulled ⚠" warning in the Status card when this happens.
 
 ## Metrics
 

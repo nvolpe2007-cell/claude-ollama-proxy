@@ -81,15 +81,32 @@ function recordHostHealth(host, ok, error) {
 // Pings a single Ollama host's /api/tags endpoint and records the result in
 // _hostHealth. Used by the periodic background health checker and by
 // GET /health (which performs a live check on every call).
+// On success, also stashes the host's available model names in
+// _hostHealth[url].models so GET /health can warn when the configured
+// model hasn't been pulled yet.
 async function checkHostHealth(url) {
   try {
     const r = await fetch(`${url}/api/tags`, { signal: AbortSignal.timeout(3000) });
     recordHostHealth(url, r.ok, r.ok ? null : `HTTP ${r.status}`);
+    if (r.ok) {
+      try {
+        const data = await r.json();
+        const h = _hostHealth.get(url);
+        if (h) h.models = Array.isArray(data.models) ? data.models.map(m => m.name) : [];
+      } catch { /* leave previously known models in place on parse error */ }
+    }
     return r.ok;
   } catch (e) {
     recordHostHealth(url, false, e.message);
     return false;
   }
+}
+
+// Returns the distinct Ollama model names the proxy may route requests to:
+// the default OLLAMA_MODEL plus every MODEL_MAP target. Used by GET /health
+// to warn when a configured model hasn't been pulled into Ollama yet.
+function getConfiguredModelNames() {
+  return [...new Set([MODEL, ...Object.values(MODEL_MAP)])];
 }
 
 // Round-robin index. Node.js is single-threaded so no lock is needed.
@@ -2404,15 +2421,43 @@ async function handleHealth(req, res) {
   // Backward-compat fields derived from the first host (single-host deployments unchanged).
   const first = hostResults[0];
 
+  // Check whether the configured model(s) have actually been pulled into Ollama.
+  // Union the model lists from every host that returned one (multi-host
+  // deployments may have different models pulled on different GPUs).
+  const availableModels = new Set();
+  let modelsKnown = false;
+  for (const url of OLLAMA_HOSTS) {
+    const models = _hostHealth.get(url)?.models;
+    if (Array.isArray(models)) {
+      modelsKnown = true;
+      for (const m of models) availableModels.add(m);
+    }
+  }
+  const modelsStatus = {};
+  if (modelsKnown) {
+    for (const name of getConfiguredModelNames()) modelsStatus[name] = availableModels.has(name);
+  }
+  const modelAvailable = modelsKnown ? (modelsStatus[MODEL] ?? false) : null;
+  const missingModels = modelsKnown
+    ? Object.entries(modelsStatus).filter(([, ok]) => !ok).map(([name]) => name)
+    : [];
+
+  const status = !allOk ? 'degraded' : (modelAvailable === false ? 'degraded' : 'ok');
+
   res.writeHead(anyOk ? 200 : 503, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    status: allOk ? 'ok' : 'degraded',
+    status,
     proxy: 'running',
     version: PROXY_VERSION,
     hosts: hostResults,
     ollama: first.status === 'ok' ? 'reachable' : 'unreachable',
     ollamaError: first.error || undefined,
     model: MODEL,
+    model_available: modelAvailable,
+    ...(modelsKnown && Object.keys(modelsStatus).length > 1 ? { models_status: modelsStatus } : {}),
+    ...(missingModels.length > 0 ? {
+      warning: `Model${missingModels.length > 1 ? 's' : ''} not found on any reachable Ollama host: ${missingModels.join(', ')} — run 'ollama pull <model>'`
+    } : {}),
     port: Number(PORT),
     timestamp: new Date().toISOString()
   }));
@@ -2684,6 +2729,11 @@ async function refresh(){
     });
   } else if(h&&h.ollamaError){
     g+=row('Error','<span class="err">'+h.ollamaError+'</span>');
+  }
+  if(h&&h.model_available===false){
+    g+=row('Model','<span class="err" title="Run: ollama pull '+C.model+'">'+C.model+' — not pulled ⚠</span>');
+  }else if(h&&h.model_available===true){
+    g+=row('Model','<span class="ok">'+C.model+'</span>');
   }
   g+=row('Active streams','<span class="'+(m&&m.active_streams>0?'ok':'val')+'">'+(m?m.active_streams:0)+'</span>');
   if(C.maxConcurrency){const cur=m?m.active_llm_requests:0;const cls=cur>=C.maxConcurrency?'warn':cur>0?'ok':'val';g+=row('In-flight requests','<span class="'+cls+'">'+cur+'/'+C.maxConcurrency+'</span>');}
@@ -3640,6 +3690,7 @@ module.exports = {
   recordHostHealth,
   _hostHealth,
   HOST_UNHEALTHY_THRESHOLD,
+  getConfiguredModelNames,
   requestHandler,
   handleMessages,
   handleOpenAIChat,
