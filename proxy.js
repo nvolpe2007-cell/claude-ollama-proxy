@@ -586,6 +586,10 @@ function toOpenAIMessages(messages, system) {
           const converted = imageBlockToOpenAI(img);
           if (converted) content.push(converted);
         }
+        // All image blocks had an unsupported/missing source (e.g. Files API
+        // references) — fall back to a plain string so Ollama doesn't receive
+        // a message with an empty content array.
+        if (content.length === 0) content = '';
       } else {
         content = text || '';
       }
@@ -2343,12 +2347,18 @@ async function handleCountTokens(req, res) {
   try { anthropicReq = JSON.parse(body); }
   catch { res.writeHead(400); res.end('{"error":"bad json"}'); return; }
 
+  if (!Array.isArray(anthropicReq.messages)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`messages` is required and must be an array' } }));
+    return;
+  }
+
   const effectiveModel = resolveModel(anthropicReq.model);
   const ollamaBase = getOllamaHost();
 
   // Flatten messages + system to a single string for tokenization.
   // Tool schemas are appended as JSON since they consume context.
-  const messages = toOpenAIMessages(anthropicReq.messages || [], injectSystemPrompt(anthropicReq.system));
+  const messages = toOpenAIMessages(anthropicReq.messages, injectSystemPrompt(anthropicReq.system));
   let prompt = messages.map(m => {
     if (typeof m.content === 'string') return m.content;
     if (Array.isArray(m.content)) return m.content.map(p => p.text || '').join('');

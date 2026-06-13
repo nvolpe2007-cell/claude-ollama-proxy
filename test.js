@@ -505,6 +505,18 @@ describe('toOpenAIMessages', () => {
     assert.equal(imgPart?.image_url.url, 'data:image/png;base64,abc');
   });
 
+  test('falls back to empty string content when image source is unsupported and no text', () => {
+    const messages = [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'file', file_id: 'file_abc' } },
+      ],
+    }];
+    const result = toOpenAIMessages(messages, null);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].content, '');
+  });
+
   test('document block in user message is converted to text', () => {
     const messages = [{
       role: 'user',
@@ -2442,6 +2454,28 @@ describe('anthropic-version response header', () => {
       assert.equal(res._headers['anthropic-version'], '2023-06-01',
         'POST /v1/messages/count_tokens must return anthropic-version: 2023-06-01');
     } finally { global.fetch = origFetch; }
+  });
+
+  test('POST /v1/messages/count_tokens rejects non-array messages with 400', async () => {
+    const res = mockRes();
+    await requestHandler(
+      mockReq('POST', '/v1/messages/count_tokens', { messages: 'not-an-array' }),
+      res,
+    );
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+  });
+
+  test('POST /v1/messages/count_tokens rejects missing messages with 400', async () => {
+    const res = mockRes();
+    await requestHandler(
+      mockReq('POST', '/v1/messages/count_tokens', {}),
+      res,
+    );
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
   });
 
   test('GET /health does NOT include anthropic-version header', async () => {
