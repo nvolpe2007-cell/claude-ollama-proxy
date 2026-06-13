@@ -88,8 +88,9 @@ The proxy also loads a `.env` file from the current working directory (or its ow
 | `PROXY_WARMUP` | `false` | When `true`, sends a minimal preflight request to Ollama after startup to pre-load the configured model into GPU memory (all hosts in `OLLAMA_HOST`, in parallel), eliminating cold-start latency on the first real request |
 | `PROXY_FORCE_THINK` | `false` | When `true`, unconditionally adds `think:true` to every outgoing Ollama request, enabling chain-of-thought reasoning for thinking models (DeepSeek-R1, Qwen3-thinking) without the client opting in. Safe for non-thinking models — Ollama ignores the field |
 | `PROXY_AUTO_TRUNCATE` | `false` | When `true` and `OLLAMA_NUM_CTX` is set, automatically drops the oldest user/assistant turns when the estimated input would exceed `OLLAMA_NUM_CTX`, preventing "context length exceeded" errors in long sessions. Sets `x-context-truncated` response header when it triggers |
-| `RATE_LIMIT_RPM` | *(none)* | Global request rate limit in requests per minute across all callers. Applies to `POST /v1/messages` and `POST /v1/messages/count_tokens`. Returns `429` with `retry-after` header when exceeded |
-| `RATE_LIMIT_PER_IP_RPM` | *(none)* | Per-client-IP rate limit in requests per minute. Uses `x-forwarded-for` when behind a reverse proxy. Both global and per-IP limits can be active simultaneously |
+| `RATE_LIMIT_RPM` | *(none)* | Global request rate limit in requests per minute across all callers. Applies to `POST /v1/messages`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages/count_tokens`, and `/v1/embeddings`. Returns `429` with `retry-after` header when exceeded |
+| `RATE_LIMIT_PER_IP_RPM` | *(none)* | Per-client-IP rate limit in requests per minute. Uses `x-forwarded-for` when behind a reverse proxy |
+| `RATE_LIMIT_PER_KEY_RPM` | *(none)* | Per-API-key rate limit in requests per minute. Buckets by the caller's matched `PROXY_API_KEYS` name (or `"default"` when no API keys are configured). Lets each device/user in a multi-key deployment have its own budget regardless of shared IPs. All three rate limits can be active simultaneously |
 | `PROXY_MAX_CONCURRENCY` | *(none)* | Maximum simultaneous in-flight Ollama inference requests. When reached, new requests get `503 overloaded_error` (or queue — see `PROXY_MAX_QUEUE_SIZE`). Prevents GPU VRAM OOM on single-GPU setups |
 | `PROXY_MAX_QUEUE_SIZE` | *(none)* | Number of requests that may wait in a queue when all concurrency slots are taken, instead of immediately returning `503`. Pairs with `PROXY_MAX_CONCURRENCY` |
 | `PROXY_MAX_QUEUE_TIMEOUT` | *(none)* | Milliseconds a queued request waits before giving up with `503`. Only meaningful with `PROXY_MAX_QUEUE_SIZE` |
@@ -358,7 +359,7 @@ Notes:
 
 ## Rate limiting
 
-Two independent rate limits can be set simultaneously. Both apply to `POST /v1/messages` and `POST /v1/messages/count_tokens`.
+Three independent rate limits can be set simultaneously. All apply to `POST /v1/messages`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages/count_tokens`, and `/v1/embeddings`.
 
 ```bash
 # Global cap: 60 requests/min across all callers
@@ -367,9 +368,14 @@ RATE_LIMIT_RPM=60 node proxy.js
 # Per-IP cap: 10 requests/min per client
 RATE_LIMIT_PER_IP_RPM=10 node proxy.js
 
-# Both active at once
-RATE_LIMIT_RPM=100 RATE_LIMIT_PER_IP_RPM=20 node proxy.js
+# Per-API-key cap: 20 requests/min per caller (see PROXY_API_KEYS)
+RATE_LIMIT_PER_KEY_RPM=20 node proxy.js
+
+# All three active at once
+RATE_LIMIT_RPM=100 RATE_LIMIT_PER_IP_RPM=20 RATE_LIMIT_PER_KEY_RPM=20 node proxy.js
 ```
+
+`RATE_LIMIT_PER_KEY_RPM` buckets requests by the caller's matched `PROXY_API_KEYS` name (falling back to a shared `"default"` bucket when no API keys are configured, or when `PROXY_API_KEY` is used). This is the right knob for multi-caller deployments — e.g. give `nick` and `family` each their own 20 req/min budget even though they may share an IP behind the same router.
 
 When a limit is exceeded the proxy responds with `429 rate_limit_error` and sets `retry-after`, `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, and `x-ratelimit-reset-requests` headers — matching Anthropic's own API header naming.
 

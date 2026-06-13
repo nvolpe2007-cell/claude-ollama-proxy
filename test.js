@@ -31,6 +31,7 @@ const {
   HOST_UNHEALTHY_THRESHOLD,
   checkRateLimit,
   getClientIp,
+  rateLimitKeyForRequest,
   _rateLimitWindows,
   timingSafeEqual,
   checkAuth,
@@ -871,6 +872,26 @@ describe('getClientIp', () => {
   test('falls back to "unknown" when socket has no remoteAddress', () => {
     const req = { headers: {}, socket: {} };
     assert.equal(getClientIp(req), 'unknown');
+  });
+});
+
+// ── rateLimitKeyForRequest ───────────────────────────────────────────────────
+
+describe('rateLimitKeyForRequest', () => {
+  test('buckets by the matched API key name', () => {
+    const req = { _apiKeyName: 'nick' };
+    assert.equal(rateLimitKeyForRequest(req), 'key:nick');
+  });
+
+  test('falls back to "key:default" when no API key matched', () => {
+    const req = {};
+    assert.equal(rateLimitKeyForRequest(req), 'key:default');
+  });
+
+  test('different key names produce different buckets', () => {
+    const reqA = { _apiKeyName: 'nick' };
+    const reqB = { _apiKeyName: 'family' };
+    assert.notEqual(rateLimitKeyForRequest(reqA), rateLimitKeyForRequest(reqB));
   });
 });
 

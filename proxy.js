@@ -344,13 +344,19 @@ function debugLog(label, obj) {
   console.log(`[DEBUG] ${label}:\n${JSON.stringify(sanitizeForLog(obj), null, 2)}`);
 }
 
-// Optional request rate limits. Both apply only to POST /v1/messages and
-// POST /v1/messages/count_tokens. Unset (disabled) by default.
-// RATE_LIMIT_RPM        — global cap across all callers (requests / minute).
-// RATE_LIMIT_PER_IP_RPM — per-client-IP cap (requests / minute); uses
-//                         x-forwarded-for when behind a reverse proxy.
-const RATE_LIMIT_RPM        = process.env.RATE_LIMIT_RPM        ? Number(process.env.RATE_LIMIT_RPM)        : null;
-const RATE_LIMIT_PER_IP_RPM = process.env.RATE_LIMIT_PER_IP_RPM ? Number(process.env.RATE_LIMIT_PER_IP_RPM) : null;
+// Optional request rate limits. All apply to POST /v1/messages, /v1/chat/completions,
+// /v1/completions, /v1/messages/count_tokens, and /v1/embeddings. Unset (disabled) by default.
+// RATE_LIMIT_RPM         — global cap across all callers (requests / minute).
+// RATE_LIMIT_PER_IP_RPM  — per-client-IP cap (requests / minute); uses
+//                          x-forwarded-for when behind a reverse proxy.
+// RATE_LIMIT_PER_KEY_RPM — per-API-key cap (requests / minute); buckets by the
+//                          caller's matched PROXY_API_KEYS name (or 'default' when
+//                          no API keys are configured, or PROXY_API_KEY is used),
+//                          so one caller in a multi-key deployment can't exhaust the
+//                          shared budget even from behind a NAT shared with other callers.
+const RATE_LIMIT_RPM         = process.env.RATE_LIMIT_RPM         ? Number(process.env.RATE_LIMIT_RPM)         : null;
+const RATE_LIMIT_PER_IP_RPM  = process.env.RATE_LIMIT_PER_IP_RPM  ? Number(process.env.RATE_LIMIT_PER_IP_RPM)  : null;
+const RATE_LIMIT_PER_KEY_RPM = process.env.RATE_LIMIT_PER_KEY_RPM ? Number(process.env.RATE_LIMIT_PER_KEY_RPM) : null;
 
 // Optional JSON map: claude-* model name (or prefix) → Ollama model name.
 // Exact match wins; then prefix match (e.g. "claude-3-haiku" matches any claude-3-haiku-*).
@@ -791,6 +797,13 @@ function getClientIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (xff) return xff.split(',')[0].trim();
   return req.socket.remoteAddress || 'unknown';
+}
+
+// Builds the RATE_LIMIT_PER_KEY_RPM bucket key from the caller's matched API key name
+// (set by checkAuth on req._apiKeyName). Callers without a matched key — including all
+// callers when no PROXY_API_KEY(S) are configured — share a single 'key:default' bucket.
+function rateLimitKeyForRequest(req) {
+  return `key:${req._apiKeyName || 'default'}`;
 }
 
 // Checks the given key against the limit. Attaches x-ratelimit-* headers to res.
@@ -2652,6 +2665,7 @@ function handleDashboard(req, res) {
     keepAlive:          OLLAMA_KEEP_ALIVE,
     rateLimitRpm:       RATE_LIMIT_RPM,
     rateLimitPerIpRpm:  RATE_LIMIT_PER_IP_RPM,
+    rateLimitPerKeyRpm: RATE_LIMIT_PER_KEY_RPM,
     warmup:             PROXY_WARMUP,
     timeout:            PROXY_TIMEOUT,
     idleTimeout:        PROXY_IDLE_TIMEOUT,
@@ -2759,6 +2773,7 @@ async function refresh(){
   if(C.idleTimeout)g+=row('Idle timeout',fmt(C.idleTimeout)+' ms');
   if(C.rateLimitRpm)g+=row('Rate limit (global)',fmt(C.rateLimitRpm)+' req/min');
   if(C.rateLimitPerIpRpm)g+=row('Rate limit (per-IP)',fmt(C.rateLimitPerIpRpm)+' req/min');
+  if(C.rateLimitPerKeyRpm)g+=row('Rate limit (per-key)',fmt(C.rateLimitPerKeyRpm)+' req/min');
   if(C.maxConcurrency)g+=row('Max concurrency',fmt(C.maxConcurrency)+' req');
   if(C.maxQueueSize)g+=row('Queue depth',fmt(C.maxQueueSize)+' req'+(C.queueTimeoutMs?', '+fmt(C.queueTimeoutMs)+'ms timeout':''));
   if(C.maxBodySize)g+=row('Max body',fmt(C.maxBodySize)+' B');
@@ -3413,6 +3428,7 @@ async function requestHandler(req, res) {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       if (!await acquireLlmSlot(req, res)) return;
       trackActiveLlmRequest(res);
       await handleMessages(req, res);
@@ -3420,6 +3436,7 @@ async function requestHandler(req, res) {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       if (!await acquireLlmSlot(req, res)) return;
       trackActiveLlmRequest(res);
       await handleOpenAIChat(req, res);
@@ -3427,6 +3444,7 @@ async function requestHandler(req, res) {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       if (!await acquireLlmSlot(req, res)) return;
       trackActiveLlmRequest(res);
       await handleOpenAICompletions(req, res);
@@ -3434,6 +3452,7 @@ async function requestHandler(req, res) {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       await handleCountTokens(req, res);
     } else if (req.method === 'POST' && path === '/v1/messages/batches') {
       if (!checkAuth(req, res)) return;
@@ -3454,6 +3473,7 @@ async function requestHandler(req, res) {
       if (!checkAuth(req, res)) return;
       if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
       if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       await handleEmbeddings(req, res);
     } else if (req.method === 'GET' && path === '/v1/models') {
       if (!checkAuth(req, res)) return;
@@ -3557,9 +3577,10 @@ if (require.main === module) {
       console.log(`  AutoTruncate: enabled — drops oldest turns when est. input > ${OLLAMA_NUM_CTX ? OLLAMA_NUM_CTX + ' tokens' : 'OLLAMA_NUM_CTX (not set — truncation inactive until OLLAMA_NUM_CTX is configured)'}`);
     }
     console.log(`  Batches: ${PROXY_BATCH_PERSIST_PATH ? `persisted to ${PROXY_BATCH_PERSIST_PATH}` : 'in-memory only (set PROXY_BATCH_PERSIST_PATH to survive restarts)'}`);
-    const rlGlobal = RATE_LIMIT_RPM        ? `global ${RATE_LIMIT_RPM} req/min`    : 'no global limit';
-    const rlIp     = RATE_LIMIT_PER_IP_RPM ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min` : 'no per-IP limit';
-    console.log(`  RateLimit: ${rlGlobal}; ${rlIp} (set RATE_LIMIT_RPM / RATE_LIMIT_PER_IP_RPM)`);
+    const rlGlobal = RATE_LIMIT_RPM         ? `global ${RATE_LIMIT_RPM} req/min`     : 'no global limit';
+    const rlIp     = RATE_LIMIT_PER_IP_RPM  ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min`  : 'no per-IP limit';
+    const rlKey    = RATE_LIMIT_PER_KEY_RPM ? `per-key ${RATE_LIMIT_PER_KEY_RPM} req/min` : 'no per-key limit';
+    console.log(`  RateLimit: ${rlGlobal}; ${rlIp}; ${rlKey} (set RATE_LIMIT_RPM / RATE_LIMIT_PER_IP_RPM / RATE_LIMIT_PER_KEY_RPM)`);
     console.log(`  Concurrency: ${PROXY_MAX_CONCURRENCY ? `max ${PROXY_MAX_CONCURRENCY} simultaneous LLM requests (503 when exceeded)` : 'unlimited (set PROXY_MAX_CONCURRENCY to prevent GPU OOM)'}`);
     if (PROXY_MAX_QUEUE_SIZE)
       console.log(`  Queue    : up to ${PROXY_MAX_QUEUE_SIZE} requests queued${PROXY_MAX_QUEUE_TIMEOUT ? ` (${PROXY_MAX_QUEUE_TIMEOUT}ms timeout)` : ' (no timeout)'}`);
@@ -3716,6 +3737,7 @@ module.exports = {
   // Rate-limit internals exported for unit testing only.
   checkRateLimit,
   getClientIp,
+  rateLimitKeyForRequest,
   _rateLimitWindows,
   // Concurrency-limit internals exported for unit testing only.
   checkConcurrency,
