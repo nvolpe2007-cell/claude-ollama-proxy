@@ -473,6 +473,22 @@ function validateModelField(model) {
   return {};
 }
 
+// Validates a request's optional `tools` field. toOpenAITools() calls `.map()` on this
+// value and reads `.name` off each entry, so a non-array value (string, object) or a
+// malformed entry (null, missing/non-string name) would otherwise throw a TypeError that
+// surfaces as an opaque 500 internal_error instead of a clear 400. Returns { error } when
+// invalid, or {} when tools is absent/null or a well-formed array. Exported for unit testing.
+function validateTools(tools) {
+  if (tools === undefined || tools === null) return {};
+  if (!Array.isArray(tools)) return { error: '`tools` must be an array' };
+  for (const t of tools) {
+    if (!t || typeof t !== 'object' || Array.isArray(t) || typeof t.name !== 'string' || !t.name) {
+      return { error: 'each item in `tools` must be an object with a non-empty string `name`' };
+    }
+  }
+  return {};
+}
+
 // Resolves the effective max_tokens for a request:
 //   1. Uses the client's value if provided and valid.
 //   2. Falls back to PROXY_MAX_TOKENS when client omits it.
@@ -1068,6 +1084,15 @@ async function handleMessages(req, res) {
     clearTO();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: modelResult.error } }));
+    return;
+  }
+
+  const toolsResult = validateTools(anthropicReq.tools);
+  if (toolsResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: toolsResult.error } }));
     return;
   }
 
@@ -2212,6 +2237,12 @@ async function handleCreateBatch(req, res) {
     if (batchModelResult.error) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchModelResult.error}` } }));
+      return;
+    }
+    const batchToolsResult = validateTools(r.params.tools);
+    if (batchToolsResult.error) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchToolsResult.error}` } }));
       return;
     }
   }
@@ -3753,6 +3784,7 @@ module.exports = {
   resolveModel,
   resolveMaxTokens,
   validateModelField,
+  validateTools,
   PROXY_HARD_MAX_TOKENS,
   PROXY_IDLE_TIMEOUT,
   PROXY_FORCE_THINK,

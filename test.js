@@ -14,6 +14,7 @@ const {
   resolveModel,
   resolveMaxTokens,
   validateModelField,
+  validateTools,
   PROXY_HARD_MAX_TOKENS,
   toOpenAIMessages,
   toOpenAITools,
@@ -99,6 +100,36 @@ describe('validateModelField', () => {
     assert.match(validateModelField(true).error, /must be a string/);
     assert.match(validateModelField({}).error, /must be a string/);
     assert.match(validateModelField(['claude-3-opus']).error, /must be a string/);
+  });
+});
+
+// ── validateTools ────────────────────────────────────────────────────────────
+
+describe('validateTools', () => {
+  test('accepts absent or null tools', () => {
+    assert.deepEqual(validateTools(undefined), {});
+    assert.deepEqual(validateTools(null), {});
+  });
+
+  test('accepts a well-formed tools array', () => {
+    assert.deepEqual(validateTools([]), {});
+    assert.deepEqual(validateTools([
+      { name: 'get_weather', description: 'Get weather', input_schema: { type: 'object' } },
+    ]), {});
+  });
+
+  test('rejects a non-array tools value', () => {
+    assert.match(validateTools('get_weather').error, /must be an array/);
+    assert.match(validateTools({ name: 'get_weather' }).error, /must be an array/);
+    assert.match(validateTools(42).error, /must be an array/);
+  });
+
+  test('rejects malformed entries that would crash toOpenAITools', () => {
+    assert.match(validateTools([null]).error, /non-empty string `name`/);
+    assert.match(validateTools(['get_weather']).error, /non-empty string `name`/);
+    assert.match(validateTools([{}]).error, /non-empty string `name`/);
+    assert.match(validateTools([{ name: '' }]).error, /non-empty string `name`/);
+    assert.match(validateTools([{ name: 123 }]).error, /non-empty string `name`/);
   });
 });
 

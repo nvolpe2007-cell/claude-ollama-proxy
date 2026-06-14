@@ -635,6 +635,34 @@ describe('POST /v1/messages — input validation', () => {
     assert.equal(b.error.type, 'invalid_request_error');
   });
 
+  test('400 when tools is not an array', async () => {
+    const r = await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'Hi' }],
+      max_tokens: 100,
+      stream: false,
+      tools: 'not-an-array',
+    });
+    assert.equal(r.status, 400);
+    const b = json(r);
+    assert.equal(b.error.type, 'invalid_request_error');
+    assert.ok(b.error.message.includes('tools'));
+  });
+
+  test('400 when a tool entry is missing a name', async () => {
+    const r = await request('POST', '/v1/messages', {
+      model: 'claude-3-haiku',
+      messages: [{ role: 'user', content: 'Hi' }],
+      max_tokens: 100,
+      stream: false,
+      tools: [{ description: 'no name here', input_schema: { type: 'object' } }],
+    });
+    assert.equal(r.status, 400);
+    const b = json(r);
+    assert.equal(b.error.type, 'invalid_request_error');
+    assert.ok(b.error.message.includes('name'));
+  });
+
   test('400 when max_tokens is zero', async () => {
     const r = await request('POST', '/v1/messages', {
       model: 'claude-3-haiku',
