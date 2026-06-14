@@ -288,6 +288,44 @@ function parseApiKeys(singleKey, listStr) {
 }
 const _apiKeys = parseApiKeys(PROXY_API_KEY, process.env.PROXY_API_KEYS);
 
+// Parses the optional PROXY_API_KEY_MODELS env var into a Map of key-name → Set(allowed
+// Ollama model names) for multi-caller deployments. Format: comma-separated
+// "name:model1|model2|..." entries, e.g. "family:qwen2.5:7b,kids:llama3.2:1b". The name
+// matches a PROXY_API_KEYS/PROXY_API_KEY name (or "default" when no named keys are
+// configured). Models are pipe-separated since model names themselves contain colons
+// (e.g. "qwen2.5:7b"). Keys with no entry here have unrestricted model access — this is
+// purely an opt-in allow-list. Lets an operator give e.g. a "family" key access to only a
+// small model while "nick" gets the full lineup, without running separate proxy instances.
+// Exported for unit testing.
+function parseApiKeyModels(str) {
+  const map = new Map();
+  if (!str) return map;
+  for (const entry of str.split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const ci = trimmed.indexOf(':');
+    if (ci <= 0) continue; // malformed entry — skip
+    const name = trimmed.slice(0, ci).trim();
+    const models = trimmed.slice(ci + 1).split('|').map(m => m.trim()).filter(Boolean);
+    if (name && models.length) map.set(name, new Set(models));
+  }
+  return map;
+}
+const _apiKeyModels = parseApiKeyModels(process.env.PROXY_API_KEY_MODELS);
+
+// Returns null if the caller (identified by req._apiKeyName, or "default" when no named
+// key matched) is allowed to use effectiveModel, or a descriptive error message string
+// if not. No restriction applies when the caller's key has no entry in
+// PROXY_API_KEY_MODELS — this check is purely additive on top of existing auth.
+// Exported for unit testing.
+function checkModelAccess(req, effectiveModel) {
+  const keyName = req._apiKeyName || 'default';
+  const allowed = _apiKeyModels.get(keyName);
+  if (!allowed) return null;
+  if (allowed.has(effectiveModel)) return null;
+  return `API key '${keyName}' is not permitted to use model '${effectiveModel}'. Allowed: ${[...allowed].join(', ')}`;
+}
+
 // Returns a sanitized deep copy of obj with long base64 strings replaced by a short
 // placeholder so debug log lines stay human-readable even when requests contain images.
 // Matches: the `data` key for Anthropic base64 source blocks, and the `url` key when
@@ -1102,6 +1140,15 @@ async function handleMessages(req, res) {
   // Use request model if it looks like an Ollama model name (not a claude-* alias).
   // This lets callers switch models per-request without restarting the proxy.
   const effectiveModel = resolveModel(anthropicReq.model);
+
+  const accessError = checkModelAccess(req, effectiveModel);
+  if (accessError) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'permission_error', message: accessError } }));
+    return;
+  }
 
   const openaiReq = {
     model: effectiveModel,
@@ -2245,6 +2292,12 @@ async function handleCreateBatch(req, res) {
       res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchToolsResult.error}` } }));
       return;
     }
+    const batchAccessError = checkModelAccess(req, resolveModel(r.params.model));
+    if (batchAccessError) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'permission_error', message: `Request '${r.custom_id}': ${batchAccessError}` } }));
+      return;
+    }
   }
 
   const now   = new Date();
@@ -2379,6 +2432,15 @@ async function handleEmbeddings(req, res) {
   }
 
   const effectiveModel = resolveModel(embedReq.model);
+
+  const embedAccessError = checkModelAccess(req, effectiveModel);
+  if (embedAccessError) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'permission_error', message: embedAccessError } }));
+    return;
+  }
 
   let ollamaRes;
   try {
@@ -2731,6 +2793,7 @@ function handleDashboard(req, res) {
     hosts:              OLLAMA_HOSTS,
     auth:               _apiKeys.length > 0,
     apiKeyNames:        _apiKeys.map(k => k.name),
+    apiKeyModels:       Object.fromEntries([..._apiKeyModels].map(([k, v]) => [k, [...v]])),
     tls:                !!TLS_CERT,
     logFormat:          LOG_FORMAT,
     logLevel:           LOG_LEVEL,
@@ -2793,7 +2856,7 @@ a{color:#58a6ff;text-decoration:none;font-size:12px}a:hover{text-decoration:unde
 const C=${cfg};
 function fmt(n){return n==null?'—':typeof n==='number'?n.toLocaleString():n}
 function ms(n){return n==null?'—':n.toLocaleString()+'&thinsp;ms'}
-function row(l,v,cls){return'<div class="row"><span class="lbl">'+l+'</span><span class="val '+(cls||'")>'+v+'</span></div>'}
+function row(l,v,cls){return'<div class="row"><span class="lbl">'+l+'</span><span class="val '+(cls||'')+'">'+v+'</span></div>'}
 function badge(ok,okT,errT){return'<span class="badge '+(ok?'ok':'err')+'">'+(ok?okT:errT)+'</span>'}
 async function refresh(){
   const [h,m]=await Promise.all([
@@ -2814,7 +2877,7 @@ async function refresh(){
       const ok2=hh.status==='ok';
       let v=badge(ok2,'OK',hh.error||'Err');
       if(hh.routing==='skipped')v+=' <span class="err" title="repeated failures — skipped by round-robin until it recovers">skipped</span>';
-      g+=row(hh.url.replace(/^https?:\/\//,''),v);
+      g+=row(hh.url.replace(/^https?:\\/\\//,''),v);
     });
   } else if(h&&h.ollamaError){
     g+=row('Error','<span class="err">'+h.ollamaError+'</span>');
@@ -2836,9 +2899,12 @@ async function refresh(){
   g+=row('Version',C.version);
   g+=row('Port',C.port);
   if(C.listenHost)g+=row('Bind address',C.listenHost);
-  if(C.hosts.length===1)g+=row('Ollama host',C.hosts[0].replace(/^https?:\/\//,''));
+  if(C.hosts.length===1)g+=row('Ollama host',C.hosts[0].replace(/^https?:\\/\\//,''));
   else g+=row('Ollama hosts',C.hosts.length+' (round-robin)');
   g+=row('Auth',badge(C.auth,C.apiKeyNames.length>1?'Enabled ('+C.apiKeyNames.length+' keys)':'Enabled','Open — no key'));
+  Object.entries(C.apiKeyModels).forEach(([name,models])=>{
+    g+=row('Models for '+name,\`<span title="\${models.join(', ')}" style="cursor:help">\${models.length} allowed ℹ</span>\`);
+  });
   g+=row('TLS',badge(C.tls,'HTTPS','HTTP'));
   g+=row('Default max_tokens',fmt(C.maxTokens));
   if(C.hardMaxTokens)g+=row('Hard max_tokens cap',fmt(C.hardMaxTokens));
@@ -2999,6 +3065,16 @@ async function handleOpenAIChat(req, res) {
   }
 
   const effectiveModel = resolveModel(openaiReq.model);
+
+  const chatAccessError = checkModelAccess(req, effectiveModel);
+  if (chatAccessError) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'permission_error', message: chatAccessError } }));
+    return;
+  }
+
   openaiReq.model = effectiveModel;
   // Accept max_completion_tokens as an alias — newer OpenAI SDK versions (used with o1/o3 models)
   // send this field instead of max_tokens. max_tokens takes precedence when both are present.
@@ -3257,6 +3333,16 @@ async function handleOpenAICompletions(req, res) {
   }
 
   const effectiveModel = resolveModel(completionReq.model);
+
+  const compAccessError = checkModelAccess(req, effectiveModel);
+  if (compAccessError) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'permission_error', message: compAccessError } }));
+    return;
+  }
+
   const streaming = completionReq.stream === true;
 
   const compMaxResult = resolveMaxTokens(completionReq.max_tokens ?? null);
@@ -3654,6 +3740,10 @@ if (require.main === module) {
     } else {
       console.log(`  Auth  : enabled (${_apiKeys.length} key${_apiKeys.length > 1 ? 's' : ''}: ${_apiKeys.map(k => k.name).join(', ')})`);
     }
+    if (_apiKeyModels.size > 0) {
+      for (const [name, models] of _apiKeyModels)
+        console.log(`  Models: key '${name}' restricted to: ${[...models].join(', ')}`);
+    }
     console.log(`  TLS   : ${TLS_CERT ? `enabled (cert: ${TLS_CERT})` : 'disabled (HTTP)'}`);
     console.log(`  CORS  : Access-Control-Allow-Origin: ${CORS_ORIGIN}`);
     console.log(`  Ctx   : ${OLLAMA_NUM_CTX ? `num_ctx=${OLLAMA_NUM_CTX}` : 'model default (set OLLAMA_NUM_CTX to override)'}`);
@@ -3848,4 +3938,7 @@ module.exports = {
   timingSafeEqual,
   parseApiKeys,
   _apiKeys,
+  parseApiKeyModels,
+  checkModelAccess,
+  _apiKeyModels,
 };

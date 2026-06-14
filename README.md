@@ -72,6 +72,7 @@ The proxy also loads a `.env` file from the current working directory (or its ow
 | `OLLAMA_HOST` | `http://localhost:11434` | Base URL of your Ollama instance. Accepts a comma-separated list of URLs for round-robin load distribution across multiple Ollama instances/GPUs |
 | `PROXY_API_KEY` | *(unset)* | If set, require this key on every API request (`x-api-key` or `Authorization: Bearer`). Tracked under the key name `default` in `/metrics` |
 | `PROXY_API_KEYS` | *(unset)* | Comma-separated list of additional named keys for multi-caller setups, e.g. `nick:sk-abc,family:sk-def`. Combines with `PROXY_API_KEY`. Bare entries without a `name:` prefix are auto-named `key1`, `key2`, ... Each key's usage is tracked separately in `/metrics` and the dashboard |
+| `PROXY_API_KEY_MODELS` | *(unset)* | Per-key model allow-list, e.g. `family:llama3.2:1b,kids:llama3.2:1b\|qwen2.5:7b`. Restricts the named key (matching a `PROXY_API_KEYS`/`PROXY_API_KEY` name, or `default`) to only the listed Ollama models; multiple models for one key are `\|`-separated. Keys with no entry here are unrestricted. Returns `403 permission_error` on disallowed models |
 | `MODEL_MAP` | *(unset)* | JSON map of `claude-*` names/prefixes to Ollama models (see below) |
 | `PROXY_TLS_CERT` | *(unset)* | Path to PEM certificate file — enables HTTPS when set |
 | `PROXY_TLS_KEY` | *(unset)* | Path to PEM private key file — required when cert is set |
@@ -145,6 +146,20 @@ This combines with `PROXY_API_KEY` if both are set (the latter is tracked under 
 Each caller authenticates the same way (`x-api-key` or `Authorization: Bearer`), but with their own key. Per-key request counts and token usage are broken out separately in `GET /metrics` (`api_keys_usage`), `GET /metrics/prometheus` (`proxy_api_key_requests_total` / `proxy_api_key_tokens_total`), and the live dashboard — so you can see who's using how much, and revoke a single caller's key (by removing it from `PROXY_API_KEYS` and restarting) without rotating everyone else's.
 
 The `/health` and `/metrics` endpoints are always unauthenticated so monitoring tools can reach them freely.
+
+### Per-key model access control
+
+By default any caller can request any Ollama model. To restrict which models a given key can use, set `PROXY_API_KEY_MODELS` to a comma-separated list of `name:model1|model2|...` entries (the name matches a `PROXY_API_KEYS`/`PROXY_API_KEY` name, or `default` when no named keys are configured):
+
+```bash
+PROXY_API_KEYS="nick:sk-abc123,family:sk-def456" \
+PROXY_API_KEY_MODELS="family:llama3.2:1b" \
+node proxy.js
+```
+
+Here `nick`'s key has unrestricted access, while `family`'s key can only use `llama3.2:1b` — any other model (including `claude-*` aliases that resolve to a different Ollama model) gets a `403 permission_error`. Use `|` to allow multiple models for one key, e.g. `kids:llama3.2:1b|qwen2.5:7b`. Keys with no entry in `PROXY_API_KEY_MODELS` are unaffected.
+
+The check applies to `POST /v1/messages`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, and each item in `POST /v1/messages/batches` — after `MODEL_MAP` alias resolution, so the restriction is enforced against the actual Ollama model name.
 
 ## Point Claude Code at the proxy
 

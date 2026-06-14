@@ -38,6 +38,9 @@ const {
   timingSafeEqual,
   checkAuth,
   parseApiKeys,
+  parseApiKeyModels,
+  checkModelAccess,
+  _apiKeyModels,
   recordTokens,
   checkConcurrency,
   trackActiveLlmRequest,
@@ -1167,6 +1170,116 @@ describe('parseApiKeys', () => {
       { name: 'default', key: 'shared-secret' },
       { name: 'laptop', key: 'laptop-key' },
     ]);
+  });
+});
+
+// ── parseApiKeyModels / checkModelAccess ──────────────────────────────────────
+
+describe('parseApiKeyModels', () => {
+  test('returns an empty Map when the env var is unset or empty', () => {
+    assert.deepEqual(parseApiKeyModels(undefined), new Map());
+    assert.deepEqual(parseApiKeyModels(''), new Map());
+  });
+
+  test('parses a single "name:model" entry', () => {
+    const map = parseApiKeyModels('family:llama3.2:1b');
+    assert.deepEqual(map.get('family'), new Set(['llama3.2:1b']));
+  });
+
+  test('parses multiple pipe-separated models for one key', () => {
+    const map = parseApiKeyModels('family:qwen2.5:7b|llama3.2:1b');
+    assert.deepEqual(map.get('family'), new Set(['qwen2.5:7b', 'llama3.2:1b']));
+  });
+
+  test('parses multiple comma-separated key entries', () => {
+    const map = parseApiKeyModels('family:llama3.2:1b,nick:qwen2.5:7b|qwen2.5:14b');
+    assert.deepEqual(map.get('family'), new Set(['llama3.2:1b']));
+    assert.deepEqual(map.get('nick'), new Set(['qwen2.5:7b', 'qwen2.5:14b']));
+  });
+
+  test('trims whitespace around names, models, and entries', () => {
+    const map = parseApiKeyModels(' family : qwen2.5:7b | llama3.2:1b , nick:qwen2.5:14b ');
+    assert.deepEqual(map.get('family'), new Set(['qwen2.5:7b', 'llama3.2:1b']));
+    assert.deepEqual(map.get('nick'), new Set(['qwen2.5:14b']));
+  });
+
+  test('skips malformed entries with no colon', () => {
+    const map = parseApiKeyModels('not-a-valid-entry,family:llama3.2:1b');
+    assert.equal(map.has('not-a-valid-entry'), false);
+    assert.deepEqual(map.get('family'), new Set(['llama3.2:1b']));
+  });
+
+  test('skips entries with an empty model list', () => {
+    const map = parseApiKeyModels('family:,nick:qwen2.5:7b');
+    assert.equal(map.has('family'), false);
+    assert.deepEqual(map.get('nick'), new Set(['qwen2.5:7b']));
+  });
+
+  test('skips empty entries from trailing/double commas', () => {
+    const map = parseApiKeyModels('family:llama3.2:1b,,nick:qwen2.5:7b,');
+    assert.deepEqual(map.get('family'), new Set(['llama3.2:1b']));
+    assert.deepEqual(map.get('nick'), new Set(['qwen2.5:7b']));
+  });
+});
+
+describe('checkModelAccess', () => {
+  test('returns null (no restriction) when PROXY_API_KEY_MODELS is not configured', () => {
+    assert.equal(_apiKeyModels.size, 0);
+    assert.equal(checkModelAccess({ _apiKeyName: 'nick' }, 'qwen2.5:7b'), null);
+    assert.equal(checkModelAccess({}, 'qwen2.5:7b'), null);
+  });
+
+  // Helper: load a fresh proxy module with PROXY_API_KEY_MODELS set, run a single
+  // test, then restore the module cache so other tests are unaffected.
+  function withApiKeyModels(value, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    const saved = process.env.PROXY_API_KEY_MODELS;
+    let freshProxy;
+    try {
+      process.env.PROXY_API_KEY_MODELS = value;
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      if (saved !== undefined) process.env.PROXY_API_KEY_MODELS = saved;
+      else delete process.env.PROXY_API_KEY_MODELS;
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  test('allows a key to use a model in its allow-list', () => {
+    withApiKeyModels('family:llama3.2:1b', (m) => {
+      const req = { _apiKeyName: 'family' };
+      assert.equal(m.checkModelAccess(req, 'llama3.2:1b'), null);
+    });
+  });
+
+  test('rejects a key using a model not in its allow-list', () => {
+    withApiKeyModels('family:llama3.2:1b', (m) => {
+      const req = { _apiKeyName: 'family' };
+      const err = m.checkModelAccess(req, 'qwen2.5:7b');
+      assert.match(err, /family/);
+      assert.match(err, /qwen2\.5:7b/);
+      assert.match(err, /llama3\.2:1b/);
+    });
+  });
+
+  test('keys with no entry in PROXY_API_KEY_MODELS have unrestricted access', () => {
+    withApiKeyModels('family:llama3.2:1b', (m) => {
+      const req = { _apiKeyName: 'nick' };
+      assert.equal(m.checkModelAccess(req, 'qwen2.5:72b'), null);
+    });
+  });
+
+  test('falls back to the "default" bucket when req._apiKeyName is unset', () => {
+    withApiKeyModels('default:llama3.2:1b', (m) => {
+      const reqNoKeyName = {};
+      assert.equal(m.checkModelAccess(reqNoKeyName, 'llama3.2:1b'), null);
+      const err = m.checkModelAccess(reqNoKeyName, 'qwen2.5:7b');
+      assert.match(err, /default/);
+    });
   });
 });
 
