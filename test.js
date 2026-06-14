@@ -13,6 +13,7 @@ const {
   OLLAMA_OPTIONS,
   resolveModel,
   resolveMaxTokens,
+  validateModelField,
   PROXY_HARD_MAX_TOKENS,
   toOpenAIMessages,
   toOpenAITools,
@@ -70,6 +71,34 @@ describe('resolveModel', () => {
     assert.equal(resolveModel('claude-3-haiku'), DEFAULT);
     assert.equal(resolveModel('claude-3-opus-20240229'), DEFAULT);
     assert.equal(resolveModel('claude-sonnet-4-6'), DEFAULT);
+  });
+
+  test('falls back to the default model for non-string input instead of throwing', () => {
+    assert.equal(resolveModel(123), DEFAULT);
+    assert.equal(resolveModel(true), DEFAULT);
+    assert.equal(resolveModel({}), DEFAULT);
+    assert.equal(resolveModel(['claude-3-opus']), DEFAULT);
+  });
+});
+
+// ── validateModelField ────────────────────────────────────────────────────────
+
+describe('validateModelField', () => {
+  test('accepts absent or null model', () => {
+    assert.deepEqual(validateModelField(undefined), {});
+    assert.deepEqual(validateModelField(null), {});
+  });
+
+  test('accepts a string model', () => {
+    assert.deepEqual(validateModelField('qwen2.5:7b'), {});
+    assert.deepEqual(validateModelField(''), {});
+  });
+
+  test('rejects non-string model values', () => {
+    assert.match(validateModelField(123).error, /must be a string/);
+    assert.match(validateModelField(true).error, /must be a string/);
+    assert.match(validateModelField({}).error, /must be a string/);
+    assert.match(validateModelField(['claude-3-opus']).error, /must be a string/);
   });
 });
 
@@ -2702,6 +2731,22 @@ describe('handleMessages — max_tokens validation', () => {
   test('400 when max_tokens is a non-numeric string', async () => {
     const res = mockRes();
     await handleMessages(mockReq({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 'big' }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('400 when model is not a string', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({ messages: [{ role: 'user', content: 'hi' }], model: 123 }), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /model/);
+  });
+
+  test('400 when model is an object', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({ messages: [{ role: 'user', content: 'hi' }], model: { foo: 'bar' } }), res);
     assert.equal(res._status, 400);
     assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
   });

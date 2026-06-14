@@ -449,7 +449,7 @@ function pctile(sorted, p) {
 }
 
 function resolveModel(requestedModel) {
-  if (!requestedModel) return MODEL;
+  if (!requestedModel || typeof requestedModel !== 'string') return MODEL;
   if (MODEL_MAP[requestedModel]) return MODEL_MAP[requestedModel];
   if (requestedModel.startsWith('claude-')) {
     for (const [key, target] of Object.entries(MODEL_MAP)) {
@@ -458,6 +458,19 @@ function resolveModel(requestedModel) {
     return MODEL;
   }
   return requestedModel;
+}
+
+// Validates that a request's `model` field, if present, is a string — as required
+// by both the Anthropic and OpenAI APIs. Returns { error } when invalid, or {}
+// when the field is absent/null or a valid string. Catches malformed values
+// (numbers, booleans, arrays, objects) with a clear 400 invalid_request_error
+// instead of a confusing 500 from resolveModel()'s String.prototype.startsWith()
+// call. Exported for unit testing.
+function validateModelField(model) {
+  if (model !== undefined && model !== null && typeof model !== 'string') {
+    return { error: '`model` must be a string' };
+  }
+  return {};
 }
 
 // Resolves the effective max_tokens for a request:
@@ -1046,6 +1059,15 @@ async function handleMessages(req, res) {
     clearTO();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: maxTokensResult.error } }));
+    return;
+  }
+
+  const modelResult = validateModelField(anthropicReq.model);
+  if (modelResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: modelResult.error } }));
     return;
   }
 
@@ -2186,6 +2208,12 @@ async function handleCreateBatch(req, res) {
       res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}' must have a params.messages array` } }));
       return;
     }
+    const batchModelResult = validateModelField(r.params.model);
+    if (batchModelResult.error) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchModelResult.error}` } }));
+      return;
+    }
   }
 
   const now   = new Date();
@@ -2310,6 +2338,15 @@ async function handleEmbeddings(req, res) {
     return;
   }
 
+  const embedModelResult = validateModelField(embedReq.model);
+  if (embedModelResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: embedModelResult.error } }));
+    return;
+  }
+
   const effectiveModel = resolveModel(embedReq.model);
 
   let ollamaRes;
@@ -2380,6 +2417,13 @@ async function handleCountTokens(req, res) {
   if (!Array.isArray(anthropicReq.messages)) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`messages` is required and must be an array' } }));
+    return;
+  }
+
+  const ctModelResult = validateModelField(anthropicReq.model);
+  if (ctModelResult.error) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: ctModelResult.error } }));
     return;
   }
 
@@ -2914,6 +2958,15 @@ async function handleOpenAIChat(req, res) {
     return;
   }
 
+  const chatModelResult = validateModelField(openaiReq.model);
+  if (chatModelResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: chatModelResult.error } }));
+    return;
+  }
+
   const effectiveModel = resolveModel(openaiReq.model);
   openaiReq.model = effectiveModel;
   // Accept max_completion_tokens as an alias — newer OpenAI SDK versions (used with o1/o3 models)
@@ -3160,6 +3213,15 @@ async function handleOpenAICompletions(req, res) {
     clearTO();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`prompt` is required' } }));
+    return;
+  }
+
+  const compModelResult = validateModelField(completionReq.model);
+  if (compModelResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: compModelResult.error } }));
     return;
   }
 
@@ -3690,6 +3752,7 @@ module.exports = {
   OLLAMA_OPTIONS,
   resolveModel,
   resolveMaxTokens,
+  validateModelField,
   PROXY_HARD_MAX_TOKENS,
   PROXY_IDLE_TIMEOUT,
   PROXY_FORCE_THINK,
