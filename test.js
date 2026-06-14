@@ -40,6 +40,7 @@ const {
   parseApiKeys,
   parseApiKeyModels,
   checkModelAccess,
+  isModelVisibleToCaller,
   _apiKeyModels,
   recordTokens,
   checkConcurrency,
@@ -1540,6 +1541,144 @@ describe('MODEL_MAP alias resolution logic', () => {
   test('empty map resolves everything to null', () => {
     assert.equal(resolveAlias('claude-3-haiku', {}), null);
     assert.equal(resolveAlias('qwen2.5:7b',     {}), null);
+  });
+});
+
+// ── isModelVisibleToCaller ──────────────────────────────────────────────────────
+
+describe('isModelVisibleToCaller', () => {
+  test('returns true for every model when PROXY_API_KEY_MODELS is not configured', () => {
+    assert.equal(_apiKeyModels.size, 0);
+    assert.equal(isModelVisibleToCaller({ _apiKeyName: 'nick' }, 'qwen2.5:7b'), true);
+    assert.equal(isModelVisibleToCaller({}, 'llama3.2:1b'), true);
+  });
+});
+
+// ── GET /v1/models & GET /v1/models/:id — PROXY_API_KEY_MODELS visibility filtering ──
+// handleModels and handleModelById are exercised end-to-end (with a stubbed Ollama
+// /api/tags + /api/show) by reloading the proxy module with custom MODEL_MAP and
+// PROXY_API_KEY_MODELS env vars, mirroring the withApiKeyModels reload pattern above.
+
+describe('handleModels / handleModelById — model visibility filtering', () => {
+  function withProxyEnv(envOverrides, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    const savedEnv = {};
+    for (const k of Object.keys(envOverrides)) savedEnv[k] = process.env[k];
+    let freshProxy;
+    try {
+      for (const [k, v] of Object.entries(envOverrides)) process.env[k] = v;
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v !== undefined) process.env[k] = v;
+        else delete process.env[k];
+      }
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  function mockReq(apiKeyName) {
+    return { headers: {}, socket: { remoteAddress: '127.0.0.1' }, _apiKeyName: apiKeyName };
+  }
+
+  function mockRes() {
+    return {
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(status, headers) { this._status = status; if (headers) Object.assign(this._headers, headers); },
+      end(chunk = '') { this._body += chunk; },
+    };
+  }
+
+  const tagsResponse = {
+    models: [
+      { name: 'llama3.2:1b', modified_at: '2024-01-01T00:00:00Z', size: 100, details: {} },
+      { name: 'qwen2.5:7b',  modified_at: '2024-01-01T00:00:00Z', size: 200, details: {} },
+      { name: 'qwen2.5:14b', modified_at: '2024-01-01T00:00:00Z', size: 300, details: {} },
+    ],
+  };
+
+  function stubFetch(response) {
+    const orig = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => response });
+    return () => { global.fetch = orig; };
+  }
+
+  test('unrestricted key sees every Ollama model and MODEL_MAP alias', async () => {
+    await withProxyEnv({
+      MODEL_MAP: JSON.stringify({ 'claude-3-haiku': 'qwen2.5:7b' }),
+      PROXY_API_KEY_MODELS: 'family:llama3.2:1b',
+    }, async (m) => {
+      const restore = stubFetch(tagsResponse);
+      try {
+        const req = mockReq('nick'); // no entry in PROXY_API_KEY_MODELS -> unrestricted
+        const res = mockRes();
+        await m.handleModels(req, res);
+        const ids = JSON.parse(res._body).data.map(x => x.id);
+        assert.deepEqual(ids.sort(), ['claude-3-haiku', 'llama3.2:1b', 'qwen2.5:14b', 'qwen2.5:7b']);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test('restricted key only sees its allowed models and matching aliases', async () => {
+    await withProxyEnv({
+      MODEL_MAP: JSON.stringify({ 'claude-3-haiku': 'qwen2.5:7b', 'claude-3-big': 'qwen2.5:14b' }),
+      PROXY_API_KEY_MODELS: 'family:qwen2.5:7b',
+    }, async (m) => {
+      const restore = stubFetch(tagsResponse);
+      try {
+        const req = mockReq('family');
+        const res = mockRes();
+        await m.handleModels(req, res);
+        const ids = JSON.parse(res._body).data.map(x => x.id);
+        assert.deepEqual(ids.sort(), ['claude-3-haiku', 'qwen2.5:7b']);
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test('returns 404 for a real model outside the caller\'s allow-list', async () => {
+    await withProxyEnv({
+      PROXY_API_KEY_MODELS: 'family:llama3.2:1b',
+    }, async (m) => {
+      const restore = stubFetch(tagsResponse);
+      try {
+        const req = mockReq('family');
+        const res = mockRes();
+        await m.handleModelById(req, res, 'qwen2.5:7b');
+        assert.equal(res._status, 404);
+        assert.equal(JSON.parse(res._body).error.type, 'not_found_error');
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  test('returns the model details for a model in the caller\'s allow-list', async () => {
+    await withProxyEnv({
+      PROXY_API_KEY_MODELS: 'family:llama3.2:1b',
+    }, async (m) => {
+      const restore = stubFetch(tagsResponse);
+      try {
+        const req = mockReq('family');
+        const res = mockRes();
+        await m.handleModelById(req, res, 'llama3.2:1b');
+        assert.equal(res._status, 200);
+        assert.equal(JSON.parse(res._body).id, 'llama3.2:1b');
+      } finally {
+        restore();
+      }
+    });
   });
 });
 

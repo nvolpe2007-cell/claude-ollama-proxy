@@ -161,6 +161,8 @@ Here `nick`'s key has unrestricted access, while `family`'s key can only use `ll
 
 The check applies to `POST /v1/messages`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, and each item in `POST /v1/messages/batches` — after `MODEL_MAP` alias resolution, so the restriction is enforced against the actual Ollama model name.
 
+`GET /v1/models` and `GET /v1/models/:id` respect the same allow-list: a restricted key only sees the Ollama models (and matching `MODEL_MAP` aliases) it's permitted to use, and looking up a model outside its allow-list returns `404 not_found_error` — so model-picker UIs (Continue, Open WebUI, Cursor) never offer a choice that would 403.
+
 ## Point Claude Code at the proxy
 
 Claude Code reads the `ANTHROPIC_BASE_URL` environment variable. Set it before starting Claude Code:
@@ -204,6 +206,8 @@ Returns the models currently loaded in Ollama in OpenAI-compatible format, inclu
 ```
 
 When `MODEL_MAP` is configured, Claude alias names (e.g. `claude-3-haiku`) are also included in the list so model-picker clients like Cursor and Continue can discover and select them.
+
+If `PROXY_API_KEY_MODELS` is configured, the list (and `GET /v1/models/:id`) is filtered per-caller — see [Per-key model access control](#per-key-model-access-control).
 
 ### Look up, pull, and delete models
 

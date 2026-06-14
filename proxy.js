@@ -326,6 +326,16 @@ function checkModelAccess(req, effectiveModel) {
   return `API key '${keyName}' is not permitted to use model '${effectiveModel}'. Allowed: ${[...allowed].join(', ')}`;
 }
 
+// Returns true if the caller may see/use the Ollama model named realModelName, per
+// checkModelAccess/PROXY_API_KEY_MODELS. Used by GET /v1/models and GET /v1/models/:id
+// to filter model listings so a restricted key (e.g. a "kids" key limited to one small
+// model) only sees models it can actually use — keeping model-picker UIs (Continue,
+// Open WebUI, Cursor) from offering choices that would 403 if selected.
+// Exported for unit testing.
+function isModelVisibleToCaller(req, realModelName) {
+  return checkModelAccess(req, realModelName) === null;
+}
+
 // Returns a sanitized deep copy of obj with long base64 strings replaced by a short
 // placeholder so debug log lines stay human-readable even when requests contain images.
 // Matches: the `data` key for Anthropic base64 source blocks, and the `url` key when
@@ -1706,7 +1716,11 @@ async function handleModels(req, res) {
     return;
   }
 
-  const ollamaModels = (data.models || []).map(m => ({
+  // Restricted API keys (PROXY_API_KEY_MODELS) only see models they're actually
+  // permitted to use — keeps model-picker UIs from listing choices that would 403.
+  const visibleOllamaModels = (data.models || []).filter(m => isModelVisibleToCaller(req, m.name));
+
+  const ollamaModels = visibleOllamaModels.map(m => ({
     id: m.name,
     object: 'model',
     created: m.modified_at ? Math.floor(new Date(m.modified_at).getTime() / 1000) : 0,
@@ -1732,6 +1746,7 @@ async function handleModels(req, res) {
   }
   const aliasModels = Object.entries(MODEL_MAP)
     .filter(([alias]) => !ollamaIds.has(alias))
+    .filter(([, target]) => isModelVisibleToCaller(req, target))
     .map(([alias, target]) => {
       const meta = byTargetDetails[target] || {};
       return {
@@ -1779,6 +1794,15 @@ async function handleModelById(req, res, modelId) {
   }
 
   if (!model) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Model '${modelId}' not found in Ollama` } }));
+    return;
+  }
+
+  // Restricted API keys (PROXY_API_KEY_MODELS) get the same 404 as a model that
+  // doesn't exist — consistent with GET /v1/models already hiding it from the list,
+  // and avoids confirming the existence of models the caller can't use.
+  if (!isModelVisibleToCaller(req, model.name)) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Model '${modelId}' not found in Ollama` } }));
     return;
@@ -3940,5 +3964,8 @@ module.exports = {
   _apiKeys,
   parseApiKeyModels,
   checkModelAccess,
+  isModelVisibleToCaller,
   _apiKeyModels,
+  handleModels,
+  handleModelById,
 };
