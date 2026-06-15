@@ -2492,6 +2492,26 @@ async function handleCancelBatch(req, res, batchId) {
   res.end(JSON.stringify(batchToResponse(batch, getBatchBaseUrl(req))));
 }
 
+// DELETE /v1/messages/batches/{id} — Anthropic only allows deleting a batch once it has
+// finished processing; an in-progress batch must be canceled first (matches the real API).
+async function handleDeleteBatch(req, res, batchId) {
+  const batch = _batches.get(batchId);
+  if (!batch) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Batch '${batchId}' not found` } }));
+    return;
+  }
+  if (batch.status !== 'ended') {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Batch '${batchId}' has not ended yet (status: ${batch.status}); cancel it first` } }));
+    return;
+  }
+  _batches.delete(batchId);
+  saveBatchesToDisk();
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ id: batchId, type: 'message_batch_deleted' }));
+}
+
 async function handleEmbeddings(req, res) {
   const ollamaBase = getOllamaHost();
   const ac = new AbortController();
@@ -3775,6 +3795,9 @@ async function requestHandler(req, res) {
     } else if (req.method === 'POST' && path.startsWith('/v1/messages/batches/') && path.endsWith('/cancel')) {
       if (!checkAuth(req, res)) return;
       await handleCancelBatch(req, res, path.slice('/v1/messages/batches/'.length, -'/cancel'.length));
+    } else if (req.method === 'DELETE' && path.startsWith('/v1/messages/batches/')) {
+      if (!checkAuth(req, res)) return;
+      await handleDeleteBatch(req, res, path.slice('/v1/messages/batches/'.length));
     } else if (req.method === 'GET' && path.startsWith('/v1/messages/batches/')) {
       if (!checkAuth(req, res)) return;
       await handleGetBatch(req, res, path.slice('/v1/messages/batches/'.length));
@@ -4041,6 +4064,7 @@ module.exports = {
   handleGetBatch,
   handleGetBatchResults,
   handleCancelBatch,
+  handleDeleteBatch,
   processBatch,
   cleanupExpiredBatches,
   processBatchRequest,

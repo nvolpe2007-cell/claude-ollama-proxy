@@ -53,6 +53,7 @@ const {
   batchRequestCounts,
   saveBatchesToDisk,
   loadBatchesFromDisk,
+  handleDeleteBatch,
   _batches,
   truncateToContext,
 } = require('./proxy');
@@ -3461,6 +3462,72 @@ describe('Batch persistence', () => {
       _batches.delete(batch.id);
       fs.rmSync(file, { force: true });
     }
+  });
+});
+
+// ── handleDeleteBatch ─────────────────────────────────────────────────────────
+describe('handleDeleteBatch', () => {
+  function makeBatch(overrides = {}) {
+    const id = 'msgbatch_delete_test_' + Math.random().toString(36).slice(2);
+    const batch = {
+      id,
+      status:              'ended',
+      created_at:          new Date().toISOString(),
+      expires_at:          new Date(Date.now() + 60_000).toISOString(),
+      ended_at:            new Date().toISOString(),
+      cancel_initiated_at: null,
+      requests:            [],
+      results:             new Map(),
+      cancelRequested:     false,
+      ...overrides,
+    };
+    _batches.set(id, batch);
+    return batch;
+  }
+
+  function mockReq() {
+    return { headers: {}, socket: { remoteAddress: '127.0.0.1' } };
+  }
+
+  function mockRes() {
+    return {
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(status, headers) { this._status = status; if (headers) Object.assign(this._headers, headers); },
+      end(chunk = '') { this._body += chunk; },
+    };
+  }
+
+  test('returns 404 for an unknown batch id', async () => {
+    const res = mockRes();
+    await handleDeleteBatch(mockReq(), res, 'msgbatch_does_not_exist');
+    assert.equal(res._status, 404);
+    assert.equal(JSON.parse(res._body).error.type, 'not_found_error');
+  });
+
+  test('returns 400 and keeps the batch when it has not ended yet', async () => {
+    const batch = makeBatch({ status: 'in_progress', ended_at: null });
+    try {
+      const res = mockRes();
+      await handleDeleteBatch(mockReq(), res, batch.id);
+      assert.equal(res._status, 400);
+      assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+      assert.ok(_batches.has(batch.id), 'in-progress batch should not be deleted');
+    } finally {
+      _batches.delete(batch.id);
+    }
+  });
+
+  test('deletes an ended batch and returns message_batch_deleted', async () => {
+    const batch = makeBatch();
+    const res = mockRes();
+    await handleDeleteBatch(mockReq(), res, batch.id);
+    assert.equal(res._status, 200);
+    assert.deepEqual(JSON.parse(res._body), { id: batch.id, type: 'message_batch_deleted' });
+    assert.ok(!_batches.has(batch.id), 'deleted batch should be removed from the Map');
   });
 });
 

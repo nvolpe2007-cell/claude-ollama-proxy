@@ -369,12 +369,16 @@ curl http://localhost:4000/v1/messages/batches/msgbatch_xxx/results -H 'x-api-ke
 
 # Cancel a batch
 curl -X POST http://localhost:4000/v1/messages/batches/msgbatch_xxx/cancel -H 'x-api-key: mysecret'
+
+# Delete an ended batch
+curl -X DELETE http://localhost:4000/v1/messages/batches/msgbatch_xxx -H 'x-api-key: mysecret'
 ```
 
 Notes:
 - Batches expire 24 hours after creation; unprocessed items are marked `expired`. Ended batches are removed from memory after 1 hour.
 - Each batch item respects `PROXY_MAX_CONCURRENCY` and competes fairly with real-time requests.
-- Batches are **in-memory** — they do not survive a proxy restart.
+- `DELETE /v1/messages/batches/{id}` only succeeds once a batch has `processing_status: "ended"` (matching the real Anthropic API); an in-progress or canceling batch must be canceled first and allowed to finish before it can be deleted. Returns `{"id":"msgbatch_xxx","type":"message_batch_deleted"}`.
+- Batches are **in-memory** by default — set `PROXY_BATCH_PERSIST_PATH` to persist batches and results across restarts.
 
 ## Rate limiting
 
