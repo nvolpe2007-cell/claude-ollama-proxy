@@ -16,6 +16,7 @@ const {
   validateModelField,
   validateTools,
   validateSystemField,
+  validateMessages,
   PROXY_HARD_MAX_TOKENS,
   toOpenAIMessages,
   toOpenAITools,
@@ -160,6 +161,62 @@ describe('validateSystemField', () => {
     assert.match(validateSystemField(123).error, /must be a string or an array/);
     assert.match(validateSystemField(true).error, /must be a string or an array/);
     assert.match(validateSystemField({ type: 'text', text: 'be concise' }).error, /must be a string or an array/);
+  });
+});
+
+// ── validateMessages ─────────────────────────────────────────────────────────
+
+describe('validateMessages', () => {
+  test('accepts string content', () => {
+    assert.deepEqual(validateMessages([{ role: 'user', content: 'hello' }]), {});
+  });
+
+  test('accepts a well-formed content-block array', () => {
+    assert.deepEqual(validateMessages([
+      { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+    ]), {});
+    assert.deepEqual(validateMessages([
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'x', name: 'foo', input: {} }] },
+    ]), {});
+    assert.deepEqual(validateMessages([
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x', content: [{ type: 'text', text: 'result' }] }] },
+    ]), {});
+  });
+
+  test('accepts absent/null content and OpenAI-style messages', () => {
+    assert.deepEqual(validateMessages([{ role: 'user' }]), {});
+    assert.deepEqual(validateMessages([
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: null, tool_calls: [{ id: '1' }] },
+      { role: 'user', content: [{ type: 'text', text: 'hi' }, { type: 'image_url', image_url: { url: 'x' } }] },
+    ]), {});
+  });
+
+  test('rejects non-object/null message entries that would crash toOpenAIMessages', () => {
+    assert.match(validateMessages([null]).error, /must be an object/);
+    assert.match(validateMessages(['hello']).error, /must be an object/);
+  });
+
+  test('rejects a missing/non-string role', () => {
+    assert.match(validateMessages([{ content: 'hi' }]).error, /string `role`/);
+    assert.match(validateMessages([{ role: 1, content: 'hi' }]).error, /string `role`/);
+  });
+
+  test('rejects content that is neither a string nor an array', () => {
+    assert.match(validateMessages([{ role: 'user', content: 123 }]).error, /must be a string or an array/);
+  });
+
+  test('rejects null/non-object content blocks that would crash toOpenAIMessages', () => {
+    assert.match(validateMessages([{ role: 'user', content: [null] }]).error, /content block/);
+    assert.match(validateMessages([{ role: 'user', content: ['hi'] }]).error, /content block/);
+    assert.match(validateMessages([{ role: 'user', content: [{ text: 'hi' }] }]).error, /string `type`/);
+  });
+
+  test('rejects null tool_result content entries that would crash toOpenAIMessages', () => {
+    assert.match(validateMessages([
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x', content: [null] }] },
+    ]).error, /tool_result.*content block/);
   });
 });
 
@@ -2286,6 +2343,22 @@ describe('handleMessages', () => {
   test('400 when messages is not an array', async () => {
     const res = mockRes();
     await handleMessages(mockReq({ messages: 'not-an-array' }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('400 when a message entry is malformed (would crash toOpenAIMessages)', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({ messages: [null] }), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /messages/);
+  });
+
+  test('400 when a content block is malformed (would crash toOpenAIMessages)', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({ messages: [{ role: 'user', content: [null] }] }), res);
     assert.equal(res._status, 400);
     assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
   });

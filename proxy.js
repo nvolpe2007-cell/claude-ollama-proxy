@@ -549,6 +549,47 @@ function validateSystemField(system) {
   return { error: '`system` must be a string or an array of content blocks' };
 }
 
+// Validates a request's `messages` array (already confirmed to be an array by the
+// caller). toOpenAIMessages() and the OpenAI-passthrough handlers read `.role`,
+// `.content`, and `.type` off each message/content-block without guarding against
+// null or non-object entries, so e.g. `messages: [null]` or a content block of
+// `null` would throw a TypeError that surfaces as an opaque 500 internal_error
+// instead of a clear 400. Each message must be a non-null object with a string
+// `role`; an optional `content` must be a string or an array of non-null objects
+// with a string `type` (covers both Anthropic content blocks and OpenAI content
+// parts); `tool_result` blocks' own `content` array is checked the same way.
+// Returns { error } when invalid, or {} when messages is well-formed.
+// Exported for unit testing.
+function validateMessages(messages) {
+  const isBlock = (b) => b && typeof b === 'object' && !Array.isArray(b) && typeof b.type === 'string';
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+      return { error: 'each item in `messages` must be an object' };
+    }
+    if (typeof msg.role !== 'string') {
+      return { error: 'each item in `messages` must have a string `role`' };
+    }
+    const { content } = msg;
+    if (content === undefined || content === null || typeof content === 'string') continue;
+    if (!Array.isArray(content)) {
+      return { error: '`content` must be a string or an array of content blocks' };
+    }
+    for (const block of content) {
+      if (!isBlock(block)) {
+        return { error: 'each content block must be an object with a string `type`' };
+      }
+      if (block.type === 'tool_result' && Array.isArray(block.content)) {
+        for (const c of block.content) {
+          if (!isBlock(c)) {
+            return { error: 'each `tool_result` content block must be an object with a string `type`' };
+          }
+        }
+      }
+    }
+  }
+  return {};
+}
+
 // Resolves the effective max_tokens for a request:
 //   1. Uses the client's value if provided and valid.
 //   2. Falls back to PROXY_MAX_TOKENS when client omits it.
@@ -1126,6 +1167,15 @@ async function handleMessages(req, res) {
     clearTO();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`messages` is required and must be an array' } }));
+    return;
+  }
+
+  const messagesResult = validateMessages(anthropicReq.messages);
+  if (messagesResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: messagesResult.error } }));
     return;
   }
 
@@ -2325,6 +2375,12 @@ async function handleCreateBatch(req, res) {
       res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}' must have a params.messages array` } }));
       return;
     }
+    const batchMessagesResult = validateMessages(r.params.messages);
+    if (batchMessagesResult.error) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchMessagesResult.error}` } }));
+      return;
+    }
     const batchModelResult = validateModelField(r.params.model);
     if (batchModelResult.error) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -2561,6 +2617,13 @@ async function handleCountTokens(req, res) {
   if (!Array.isArray(anthropicReq.messages)) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`messages` is required and must be an array' } }));
+    return;
+  }
+
+  const ctMessagesResult = validateMessages(anthropicReq.messages);
+  if (ctMessagesResult.error) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: ctMessagesResult.error } }));
     return;
   }
 
@@ -3110,6 +3173,15 @@ async function handleOpenAIChat(req, res) {
     clearTO();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`messages` is required and must be an array' } }));
+    return;
+  }
+
+  const chatMessagesResult = validateMessages(openaiReq.messages);
+  if (chatMessagesResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: chatMessagesResult.error } }));
     return;
   }
 
@@ -3934,6 +4006,7 @@ module.exports = {
   validateModelField,
   validateTools,
   validateSystemField,
+  validateMessages,
   PROXY_HARD_MAX_TOKENS,
   PROXY_IDLE_TIMEOUT,
   PROXY_FORCE_THINK,
