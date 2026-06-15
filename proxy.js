@@ -537,6 +537,18 @@ function validateTools(tools) {
   return {};
 }
 
+// Validates a request's optional `system` field. Per the Anthropic API spec, `system`
+// must be a string or an array of content blocks. injectSystemPrompt() spreads non-string
+// values (`...system`) when PROXY_SYSTEM_PROMPT is set, so a non-array, non-string,
+// truthy value (number, boolean, object) would throw a TypeError that surfaces as an
+// opaque 500 internal_error instead of a clear 400. Returns { error } when invalid, or
+// {} when system is absent/null or a valid string/array. Exported for unit testing.
+function validateSystemField(system) {
+  if (system === undefined || system === null) return {};
+  if (typeof system === 'string' || Array.isArray(system)) return {};
+  return { error: '`system` must be a string or an array of content blocks' };
+}
+
 // Resolves the effective max_tokens for a request:
 //   1. Uses the client's value if provided and valid.
 //   2. Falls back to PROXY_MAX_TOKENS when client omits it.
@@ -1141,6 +1153,15 @@ async function handleMessages(req, res) {
     clearTO();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: toolsResult.error } }));
+    return;
+  }
+
+  const systemResult = validateSystemField(anthropicReq.system);
+  if (systemResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: systemResult.error } }));
     return;
   }
 
@@ -2316,6 +2337,12 @@ async function handleCreateBatch(req, res) {
       res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchToolsResult.error}` } }));
       return;
     }
+    const batchSystemResult = validateSystemField(r.params.system);
+    if (batchSystemResult.error) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchSystemResult.error}` } }));
+      return;
+    }
     const batchAccessError = checkModelAccess(req, resolveModel(r.params.model));
     if (batchAccessError) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
@@ -2541,6 +2568,13 @@ async function handleCountTokens(req, res) {
   if (ctModelResult.error) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: ctModelResult.error } }));
+    return;
+  }
+
+  const ctSystemResult = validateSystemField(anthropicReq.system);
+  if (ctSystemResult.error) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: ctSystemResult.error } }));
     return;
   }
 
@@ -3899,6 +3933,7 @@ module.exports = {
   resolveMaxTokens,
   validateModelField,
   validateTools,
+  validateSystemField,
   PROXY_HARD_MAX_TOKENS,
   PROXY_IDLE_TIMEOUT,
   PROXY_FORCE_THINK,

@@ -15,6 +15,7 @@ const {
   resolveMaxTokens,
   validateModelField,
   validateTools,
+  validateSystemField,
   PROXY_HARD_MAX_TOKENS,
   toOpenAIMessages,
   toOpenAITools,
@@ -134,6 +135,31 @@ describe('validateTools', () => {
     assert.match(validateTools([{}]).error, /non-empty string `name`/);
     assert.match(validateTools([{ name: '' }]).error, /non-empty string `name`/);
     assert.match(validateTools([{ name: 123 }]).error, /non-empty string `name`/);
+  });
+});
+
+// ── validateSystemField ───────────────────────────────────────────────────────
+
+describe('validateSystemField', () => {
+  test('accepts absent or null system', () => {
+    assert.deepEqual(validateSystemField(undefined), {});
+    assert.deepEqual(validateSystemField(null), {});
+  });
+
+  test('accepts a string system prompt', () => {
+    assert.deepEqual(validateSystemField('be concise'), {});
+    assert.deepEqual(validateSystemField(''), {});
+  });
+
+  test('accepts an array of content blocks', () => {
+    assert.deepEqual(validateSystemField([]), {});
+    assert.deepEqual(validateSystemField([{ type: 'text', text: 'be concise' }]), {});
+  });
+
+  test('rejects non-string, non-array system values that would crash injectSystemPrompt', () => {
+    assert.match(validateSystemField(123).error, /must be a string or an array/);
+    assert.match(validateSystemField(true).error, /must be a string or an array/);
+    assert.match(validateSystemField({ type: 'text', text: 'be concise' }).error, /must be a string or an array/);
   });
 });
 
