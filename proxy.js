@@ -2158,6 +2158,20 @@ function batchToResponse(batch, baseUrl) {
   };
 }
 
+// Returns the caller's API key name for batch-ownership purposes, defaulting to
+// "default" when no named key matched (mirrors checkModelAccess's convention).
+function batchOwnerName(req) {
+  return req._apiKeyName || 'default';
+}
+
+// Returns true if the caller may view/manage this batch. Batches persisted before
+// this field existed have no `owner` and are treated as belonging to "default" so
+// existing single-key/no-auth deployments keep working unchanged.
+// Exported for unit testing.
+function batchOwnedByCaller(req, batch) {
+  return (batch.owner || 'default') === batchOwnerName(req);
+}
+
 // Process a single batch request item — reuses the same conversion logic as
 // handleMessages but operates synchronously against Ollama (non-streaming).
 // Returns { type: 'succeeded', message } or { type: 'errored', error }.
@@ -2411,6 +2425,7 @@ async function handleCreateBatch(req, res) {
   const batch = {
     id:                  newBatchId(),
     status:              'in_progress',
+    owner:               batchOwnerName(req),
     created_at:          now.toISOString(),
     expires_at:          new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
     ended_at:            null,
@@ -2430,7 +2445,7 @@ async function handleCreateBatch(req, res) {
 
 async function handleListBatches(req, res) {
   const baseUrl = getBatchBaseUrl(req);
-  const all     = [..._batches.values()].reverse();
+  const all     = [..._batches.values()].filter(b => batchOwnedByCaller(req, b)).reverse();
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     data:     all.map(b => batchToResponse(b, baseUrl)),
@@ -2442,7 +2457,7 @@ async function handleListBatches(req, res) {
 
 async function handleGetBatch(req, res, batchId) {
   const batch = _batches.get(batchId);
-  if (!batch) {
+  if (!batch || !batchOwnedByCaller(req, batch)) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Batch '${batchId}' not found` } }));
     return;
@@ -2453,7 +2468,7 @@ async function handleGetBatch(req, res, batchId) {
 
 async function handleGetBatchResults(req, res, batchId) {
   const batch = _batches.get(batchId);
-  if (!batch) {
+  if (!batch || !batchOwnedByCaller(req, batch)) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Batch '${batchId}' not found` } }));
     return;
@@ -2474,7 +2489,7 @@ async function handleGetBatchResults(req, res, batchId) {
 
 async function handleCancelBatch(req, res, batchId) {
   const batch = _batches.get(batchId);
-  if (!batch) {
+  if (!batch || !batchOwnedByCaller(req, batch)) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Batch '${batchId}' not found` } }));
     return;
@@ -2496,7 +2511,7 @@ async function handleCancelBatch(req, res, batchId) {
 // finished processing; an in-progress batch must be canceled first (matches the real API).
 async function handleDeleteBatch(req, res, batchId) {
   const batch = _batches.get(batchId);
-  if (!batch) {
+  if (!batch || !batchOwnedByCaller(req, batch)) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'not_found_error', message: `Batch '${batchId}' not found` } }));
     return;
@@ -4070,6 +4085,8 @@ module.exports = {
   processBatchRequest,
   batchRequestCounts,
   batchToResponse,
+  batchOwnedByCaller,
+  batchOwnerName,
   saveBatchesToDisk,
   loadBatchesFromDisk,
   PROXY_BATCH_PERSIST_PATH,

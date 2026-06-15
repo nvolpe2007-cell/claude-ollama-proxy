@@ -51,8 +51,15 @@ const {
   cleanupExpiredBatches,
   processBatch,
   batchRequestCounts,
+  batchOwnedByCaller,
+  batchOwnerName,
   saveBatchesToDisk,
   loadBatchesFromDisk,
+  handleCreateBatch,
+  handleListBatches,
+  handleGetBatch,
+  handleGetBatchResults,
+  handleCancelBatch,
   handleDeleteBatch,
   _batches,
   truncateToContext,
@@ -3461,6 +3468,157 @@ describe('Batch persistence', () => {
     } finally {
       _batches.delete(batch.id);
       fs.rmSync(file, { force: true });
+    }
+  });
+});
+
+// ── Batch ownership / per-API-key isolation ────────────────────────────────────
+// One caller's API key must not be able to list, read, cancel, or delete batches
+// created under a different key (or under "default" when no key was used).
+describe('Batch ownership / per-API-key isolation', () => {
+  function makeBatch(overrides = {}) {
+    const id = 'msgbatch_owner_test_' + Math.random().toString(36).slice(2);
+    const batch = {
+      id,
+      status:              'ended',
+      created_at:          new Date().toISOString(),
+      expires_at:          new Date(Date.now() + 60_000).toISOString(),
+      ended_at:            new Date().toISOString(),
+      cancel_initiated_at: null,
+      requests:            [{ custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } }],
+      results:             new Map([['r1', { type: 'succeeded', message: { id: 'msg_1' } }]]),
+      cancelRequested:     false,
+      ...overrides,
+    };
+    _batches.set(id, batch);
+    return batch;
+  }
+
+  function mockReq(apiKeyName) {
+    return { headers: {}, socket: { remoteAddress: '127.0.0.1' }, _apiKeyName: apiKeyName };
+  }
+
+  function mockRes() {
+    return {
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(status, headers) { this._status = status; if (headers) Object.assign(this._headers, headers); },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; },
+    };
+  }
+
+  test('batchOwnerName falls back to "default" when no API key matched', () => {
+    assert.equal(batchOwnerName({}), 'default');
+    assert.equal(batchOwnerName({ _apiKeyName: 'nick' }), 'nick');
+  });
+
+  test('batchOwnedByCaller treats a missing owner field as "default"', () => {
+    const batch = makeBatch({ owner: undefined });
+    try {
+      assert.equal(batchOwnedByCaller(mockReq(undefined), batch), true);
+      assert.equal(batchOwnedByCaller(mockReq('nick'), batch), false);
+    } finally {
+      _batches.delete(batch.id);
+    }
+  });
+
+  test('handleCreateBatch tags the new batch with the caller\'s key name', async () => {
+    const req = {
+      headers: {}, socket: { remoteAddress: '127.0.0.1' }, _apiKeyName: 'nick',
+      [Symbol.asyncIterator]: async function* () {
+        yield JSON.stringify({ requests: [{ custom_id: 'r1', params: { messages: [{ role: 'user', content: 'hi' }], model: 'test', max_tokens: 1 } }] });
+      },
+    };
+    const res = mockRes();
+    const orig = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'hi' } }] }), text: async () => '{}', body: null });
+    try {
+      await handleCreateBatch(req, res);
+      const created = JSON.parse(res._body);
+      assert.equal(_batches.get(created.id).owner, 'nick');
+    } finally {
+      global.fetch = orig;
+      _batches.delete(JSON.parse(res._body).id);
+    }
+  });
+
+  test('handleListBatches only returns batches owned by the caller', async () => {
+    const nickBatch    = makeBatch({ owner: 'nick' });
+    const familyBatch  = makeBatch({ owner: 'family' });
+    const legacyBatch  = makeBatch({ owner: undefined });
+    try {
+      const res = mockRes();
+      await handleListBatches(mockReq('nick'), res);
+      const ids = JSON.parse(res._body).data.map(b => b.id);
+      assert.ok(ids.includes(nickBatch.id), 'caller should see their own batch');
+      assert.ok(!ids.includes(familyBatch.id), 'caller should not see another key\'s batch');
+      assert.ok(!ids.includes(legacyBatch.id), 'caller should not see a legacy batch owned by "default"');
+
+      const resDefault = mockRes();
+      await handleListBatches(mockReq(undefined), resDefault);
+      const defaultIds = JSON.parse(resDefault._body).data.map(b => b.id);
+      assert.ok(defaultIds.includes(legacyBatch.id), '"default" caller should see legacy batches with no owner');
+      assert.ok(!defaultIds.includes(nickBatch.id), '"default" caller should not see another key\'s batch');
+    } finally {
+      _batches.delete(nickBatch.id);
+      _batches.delete(familyBatch.id);
+      _batches.delete(legacyBatch.id);
+    }
+  });
+
+  test('handleGetBatch returns 404 for a batch owned by a different key', async () => {
+    const batch = makeBatch({ owner: 'nick' });
+    try {
+      const res = mockRes();
+      await handleGetBatch(mockReq('family'), res, batch.id);
+      assert.equal(res._status, 404);
+      assert.equal(JSON.parse(res._body).error.type, 'not_found_error');
+
+      const resOwner = mockRes();
+      await handleGetBatch(mockReq('nick'), resOwner, batch.id);
+      assert.equal(resOwner._status, 200);
+    } finally {
+      _batches.delete(batch.id);
+    }
+  });
+
+  test('handleGetBatchResults returns 404 for a batch owned by a different key', async () => {
+    const batch = makeBatch({ owner: 'nick' });
+    try {
+      const res = mockRes();
+      await handleGetBatchResults(mockReq('family'), res, batch.id);
+      assert.equal(res._status, 404);
+      assert.equal(JSON.parse(res._body).error.type, 'not_found_error');
+    } finally {
+      _batches.delete(batch.id);
+    }
+  });
+
+  test('handleCancelBatch returns 404 and does not cancel a batch owned by a different key', async () => {
+    const batch = makeBatch({ owner: 'nick', status: 'in_progress', ended_at: null });
+    try {
+      const res = mockRes();
+      await handleCancelBatch(mockReq('family'), res, batch.id);
+      assert.equal(res._status, 404);
+      assert.equal(batch.cancelRequested, false, 'batch should not be canceled by a non-owner');
+    } finally {
+      _batches.delete(batch.id);
+    }
+  });
+
+  test('handleDeleteBatch returns 404 and keeps a batch owned by a different key', async () => {
+    const batch = makeBatch({ owner: 'nick' });
+    try {
+      const res = mockRes();
+      await handleDeleteBatch(mockReq('family'), res, batch.id);
+      assert.equal(res._status, 404);
+      assert.ok(_batches.has(batch.id), 'batch should not be deleted by a non-owner');
+    } finally {
+      _batches.delete(batch.id);
     }
   });
 });
