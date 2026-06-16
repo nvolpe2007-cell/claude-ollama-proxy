@@ -2634,6 +2634,9 @@ async function handleEmbeddings(req, res) {
   const embeddings = data.embeddings || [];
   const promptTokens = data.prompt_eval_count || 0;
 
+  recordTokens(promptTokens, 0, effectiveModel, req._apiKeyName);
+  res._logMeta = { model: effectiveModel, tokensIn: promptTokens, tokensOut: 0 };
+
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     object: 'list',

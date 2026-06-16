@@ -63,6 +63,7 @@ const {
   handleDeleteBatch,
   _batches,
   truncateToContext,
+  handleEmbeddings,
 } = require('./proxy');
 
 // ── resolveModel ──────────────────────────────────────────────────────────────
@@ -4228,5 +4229,174 @@ describe('truncateToContext', () => {
     const { droppedCount, messages } = truncateToContext(m, budget);
     assert.ok(droppedCount >= 2, `expected droppedCount >=2, got ${droppedCount}`);
     assert.equal(messages[0].role, 'user');
+  });
+});
+
+// ── handleEmbeddings ──────────────────────────────────────────────────────────
+describe('handleEmbeddings', () => {
+  function mockReq(body) {
+    return {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST',
+      url: '/v1/embeddings',
+      _apiKeyName: 'default',
+      [Symbol.asyncIterator]: async function* () { yield JSON.stringify(body); },
+    };
+  }
+
+  function mockRes() {
+    const res = {
+      headersSent: false,
+      writableEnded: false,
+      _status: null,
+      _body: '',
+      _headers: {},
+      _logMeta: null,
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(status, headers) {
+        this._status = status; this.headersSent = true;
+        if (headers) for (const [k, v] of Object.entries(headers)) this._headers[k] = v;
+      },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; },
+      on() {},
+    };
+    return res;
+  }
+
+  function stubFetch(ollamaResponse, status = 200) {
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: status < 400,
+      status,
+      json: async () => ollamaResponse,
+      text: async () => JSON.stringify(ollamaResponse),
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  test('returns 400 when body is not valid JSON', async () => {
+    const req = {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST', url: '/v1/embeddings',
+      [Symbol.asyncIterator]: async function* () { yield 'NOT JSON'; },
+    };
+    const res = mockRes();
+    await handleEmbeddings(req, res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('returns 400 when input is missing', async () => {
+    const res = mockRes();
+    await handleEmbeddings(mockReq({ model: 'nomic-embed-text' }), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /input/);
+  });
+
+  test('returns 400 when model field is not a string', async () => {
+    const res = mockRes();
+    await handleEmbeddings(mockReq({ model: 42, input: 'hello' }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('returns OpenAI-compatible embedding envelope for a successful request', async () => {
+    const restore = stubFetch({
+      embeddings: [[0.1, 0.2, 0.3]],
+      prompt_eval_count: 7,
+    });
+    try {
+      const res = mockRes();
+      await handleEmbeddings(mockReq({ model: 'nomic-embed-text', input: 'hello world' }), res);
+      assert.equal(res._status, 200);
+      const body = JSON.parse(res._body);
+      assert.equal(body.object, 'list');
+      assert.equal(body.data.length, 1);
+      assert.equal(body.data[0].object, 'embedding');
+      assert.deepEqual(body.data[0].embedding, [0.1, 0.2, 0.3]);
+      assert.equal(body.data[0].index, 0);
+      assert.equal(body.usage.prompt_tokens, 7);
+      assert.equal(body.usage.total_tokens, 7);
+    } finally {
+      restore();
+    }
+  });
+
+  test('accepts input as an array of strings', async () => {
+    let sentBody;
+    const orig = global.fetch;
+    global.fetch = async (_url, opts) => {
+      sentBody = JSON.parse(opts.body);
+      return {
+        ok: true, status: 200,
+        json: async () => ({ embeddings: [[0.1], [0.2]], prompt_eval_count: 4 }),
+      };
+    };
+    try {
+      const res = mockRes();
+      await handleEmbeddings(mockReq({ input: ['foo', 'bar'] }), res);
+      assert.deepEqual(sentBody.input, ['foo', 'bar']);
+      const body = JSON.parse(res._body);
+      assert.equal(body.data.length, 2);
+      assert.equal(body.data[0].index, 0);
+      assert.equal(body.data[1].index, 1);
+    } finally {
+      global.fetch = orig;
+    }
+  });
+
+  test('records token usage in _metrics and sets res._logMeta', async () => {
+    const restore = stubFetch({
+      embeddings: [[0.5, 0.6]],
+      prompt_eval_count: 12,
+    });
+    try {
+      const beforeIn  = _metrics.tokensIn;
+      const beforeOut = _metrics.tokensOut;
+      const res = mockRes();
+      await handleEmbeddings(mockReq({ input: 'test sentence' }), res);
+      assert.equal(_metrics.tokensIn  - beforeIn,  12);
+      assert.equal(_metrics.tokensOut - beforeOut,   0);
+      assert.ok(res._logMeta, 'res._logMeta should be set');
+      assert.equal(res._logMeta.tokensIn,  12);
+      assert.equal(res._logMeta.tokensOut,  0);
+    } finally {
+      restore();
+    }
+  });
+
+  test('handles missing prompt_eval_count gracefully (treats as 0 tokens)', async () => {
+    const restore = stubFetch({ embeddings: [[0.1]] });
+    try {
+      const beforeIn = _metrics.tokensIn;
+      const res = mockRes();
+      await handleEmbeddings(mockReq({ input: 'hi' }), res);
+      assert.equal(res._status, 200);
+      assert.equal(_metrics.tokensIn - beforeIn, 0);
+      assert.equal(res._logMeta.tokensIn, 0);
+    } finally {
+      restore();
+    }
+  });
+
+  test('returns 502 when Ollama returns a non-ok response', async () => {
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: false, status: 400,
+      text: async () => JSON.stringify({ error: 'model not found' }),
+    });
+    try {
+      const res = mockRes();
+      await handleEmbeddings(mockReq({ input: 'hi' }), res);
+      assert.notEqual(res._status, 200);
+    } finally {
+      global.fetch = orig;
+    }
   });
 });
