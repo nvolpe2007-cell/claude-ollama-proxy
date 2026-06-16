@@ -2413,6 +2413,12 @@ async function handleCreateBatch(req, res) {
       res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchSystemResult.error}` } }));
       return;
     }
+    const batchMaxTokensResult = resolveMaxTokens(r.params.max_tokens);
+    if (batchMaxTokensResult.error) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchMaxTokensResult.error}` } }));
+      return;
+    }
     const batchAccessError = checkModelAccess(req, resolveModel(r.params.model));
     if (batchAccessError) {
       res.writeHead(403, { 'Content-Type': 'application/json' });

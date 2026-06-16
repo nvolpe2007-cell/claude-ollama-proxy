@@ -4400,3 +4400,93 @@ describe('handleEmbeddings', () => {
     }
   });
 });
+
+// ── handleCreateBatch — max_tokens validation ─────────────────────────────────
+describe('handleCreateBatch — max_tokens validation', () => {
+  function makeReq(body) {
+    return {
+      headers: {},
+      socket: { remoteAddress: '127.0.0.1' },
+      _apiKeyName: undefined,
+      [Symbol.asyncIterator]: async function* () { yield JSON.stringify(body); },
+    };
+  }
+  function makeRes() {
+    return {
+      _status: null, _body: '', _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(s, h) { this._status = s; if (h) Object.assign(this._headers, h); },
+      write(c) { this._body += c; },
+      end(c = '') { this._body += c; },
+    };
+  }
+  const validItem = { custom_id: 'r1', params: { messages: [{ role: 'user', content: 'hi' }], model: 'test', max_tokens: 10 } };
+
+  test('accepts a batch with a valid max_tokens', async () => {
+    const orig = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'hi' } }] }), text: async () => '{}', body: null });
+    try {
+      const res = makeRes();
+      await handleCreateBatch(makeReq({ requests: [validItem] }), res);
+      assert.equal(res._status, 200);
+      const batch = JSON.parse(res._body);
+      _batches.delete(batch.id);
+    } finally {
+      global.fetch = orig;
+    }
+  });
+
+  test('accepts a batch with max_tokens omitted (defaults to PROXY_MAX_TOKENS)', async () => {
+    const orig = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'hi' } }] }), text: async () => '{}', body: null });
+    try {
+      const item = { custom_id: 'r1', params: { messages: [{ role: 'user', content: 'hi' }], model: 'test' } };
+      const res = makeRes();
+      await handleCreateBatch(makeReq({ requests: [item] }), res);
+      assert.equal(res._status, 200);
+      const batch = JSON.parse(res._body);
+      _batches.delete(batch.id);
+    } finally {
+      global.fetch = orig;
+    }
+  });
+
+  test('rejects a batch item with max_tokens: 0 at creation time', async () => {
+    const item = { custom_id: 'bad', params: { messages: [{ role: 'user', content: 'hi' }], model: 'test', max_tokens: 0 } };
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: [item] }), res);
+    assert.equal(res._status, 400);
+    const err = JSON.parse(res._body).error;
+    assert.equal(err.type, 'invalid_request_error');
+    assert.ok(err.message.includes('bad'), 'error message should reference the bad custom_id');
+    assert.ok(err.message.includes('max_tokens'));
+  });
+
+  test('rejects a batch item with negative max_tokens at creation time', async () => {
+    const item = { custom_id: 'neg', params: { messages: [{ role: 'user', content: 'hi' }], model: 'test', max_tokens: -5 } };
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: [item] }), res);
+    assert.equal(res._status, 400);
+    const err = JSON.parse(res._body).error;
+    assert.equal(err.type, 'invalid_request_error');
+    assert.ok(err.message.includes('neg'));
+  });
+
+  test('rejects a batch item with non-integer float max_tokens at creation time', async () => {
+    const item = { custom_id: 'flt', params: { messages: [{ role: 'user', content: 'hi' }], model: 'test', max_tokens: 1.5 } };
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: [item] }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('batch with invalid max_tokens is never created in _batches', async () => {
+    const before = _batches.size;
+    const item = { custom_id: 'bad2', params: { messages: [{ role: 'user', content: 'hi' }], model: 'test', max_tokens: -1 } };
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: [item] }), res);
+    assert.equal(res._status, 400);
+    assert.equal(_batches.size, before, 'no batch should be created when max_tokens is invalid');
+  });
+});
