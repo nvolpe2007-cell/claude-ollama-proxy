@@ -2449,15 +2449,56 @@ async function handleCreateBatch(req, res) {
   res.end(JSON.stringify(batchToResponse(batch, getBatchBaseUrl(req))));
 }
 
+// Parses `limit`/`before_id`/`after_id` query params for GET /v1/messages/batches,
+// matching the cursor-pagination convention used across the Anthropic API.
+function parseBatchListParams(req) {
+  const params = new URLSearchParams((req.url || '').split('?')[1] || '');
+  let limit = 20;
+  if (params.has('limit')) {
+    limit = Number(params.get('limit'));
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+      return { error: '`limit` must be an integer between 1 and 1000' };
+    }
+  }
+  return { limit, before_id: params.get('before_id') || null, after_id: params.get('after_id') || null };
+}
+
 async function handleListBatches(req, res) {
   const baseUrl = getBatchBaseUrl(req);
-  const all     = [..._batches.values()].filter(b => batchOwnedByCaller(req, b)).reverse();
+  const parsed  = parseBatchListParams(req);
+  if (parsed.error) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: parsed.error } }));
+    return;
+  }
+  const { limit, before_id, after_id } = parsed;
+  // Newest first, matching the real API's ordering.
+  const all = [..._batches.values()].filter(b => batchOwnedByCaller(req, b)).reverse();
+
+  let startIdx, endExclusive;
+  if (before_id) {
+    // Unknown cursor (incl. one belonging to another caller's batch, already filtered
+    // out of `all`) is treated as "nothing before it" rather than erroring, so a
+    // pagination cursor can never reveal whether an id exists in another tenant's list.
+    const idx = all.findIndex(b => b.id === before_id);
+    endExclusive = idx === -1 ? 0 : idx;
+    startIdx     = Math.max(0, endExclusive - limit);
+  } else {
+    startIdx = after_id ? (() => {
+      const idx = all.findIndex(b => b.id === after_id);
+      return idx === -1 ? all.length : idx + 1;
+    })() : 0;
+    endExclusive = Math.min(all.length, startIdx + limit);
+  }
+  const page     = all.slice(startIdx, endExclusive);
+  const hasMore  = before_id ? startIdx > 0 : endExclusive < all.length;
+
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    data:     all.map(b => batchToResponse(b, baseUrl)),
-    has_more: false,
-    first_id: all[0]?.id                  || null,
-    last_id:  all[all.length - 1]?.id     || null,
+    data:     page.map(b => batchToResponse(b, baseUrl)),
+    has_more: hasMore,
+    first_id: page[0]?.id                || null,
+    last_id:  page[page.length - 1]?.id  || null,
   }));
 }
 
@@ -4085,6 +4126,7 @@ module.exports = {
   handlePullModel,
   handleCreateBatch,
   handleListBatches,
+  parseBatchListParams,
   handleGetBatch,
   handleGetBatchResults,
   handleCancelBatch,

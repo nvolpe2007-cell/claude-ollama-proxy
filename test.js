@@ -57,6 +57,7 @@ const {
   loadBatchesFromDisk,
   handleCreateBatch,
   handleListBatches,
+  parseBatchListParams,
   handleGetBatch,
   handleGetBatchResults,
   handleCancelBatch,
@@ -3620,6 +3621,128 @@ describe('Batch ownership / per-API-key isolation', () => {
       assert.ok(_batches.has(batch.id), 'batch should not be deleted by a non-owner');
     } finally {
       _batches.delete(batch.id);
+    }
+  });
+});
+
+// ── GET /v1/messages/batches pagination ─────────────────────────────────────
+describe('parseBatchListParams / handleListBatches pagination', () => {
+  function makeBatch(overrides = {}) {
+    const id = 'msgbatch_page_test_' + Math.random().toString(36).slice(2);
+    const batch = {
+      id,
+      status:              'ended',
+      created_at:          new Date().toISOString(),
+      expires_at:          new Date(Date.now() + 60_000).toISOString(),
+      ended_at:            new Date().toISOString(),
+      cancel_initiated_at: null,
+      requests:            [{ custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } }],
+      results:             new Map([['r1', { type: 'succeeded', message: { id: 'msg_1' } }]]),
+      cancelRequested:     false,
+      owner:               'pager',
+      ...overrides,
+    };
+    _batches.set(id, batch);
+    return batch;
+  }
+
+  function mockReq(url) {
+    return { url, headers: {}, socket: { remoteAddress: '127.0.0.1' }, _apiKeyName: 'pager' };
+  }
+
+  function mockRes() {
+    return {
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(status, headers) { this._status = status; if (headers) Object.assign(this._headers, headers); },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; },
+    };
+  }
+
+  test('parseBatchListParams defaults limit to 20 with no cursors', () => {
+    assert.deepEqual(parseBatchListParams({ url: '/v1/messages/batches' }), { limit: 20, before_id: null, after_id: null });
+  });
+
+  test('parseBatchListParams reads limit/before_id/after_id from the query string', () => {
+    const parsed = parseBatchListParams({ url: '/v1/messages/batches?limit=5&after_id=msgbatch_1' });
+    assert.deepEqual(parsed, { limit: 5, before_id: null, after_id: 'msgbatch_1' });
+  });
+
+  test('parseBatchListParams rejects an out-of-range or non-integer limit', () => {
+    assert.ok(parseBatchListParams({ url: '/v1/messages/batches?limit=0' }).error);
+    assert.ok(parseBatchListParams({ url: '/v1/messages/batches?limit=1001' }).error);
+    assert.ok(parseBatchListParams({ url: '/v1/messages/batches?limit=abc' }).error);
+    assert.ok(parseBatchListParams({ url: '/v1/messages/batches?limit=2.5' }).error);
+  });
+
+  test('handleListBatches returns 400 invalid_request_error for a bad limit', async () => {
+    const res = mockRes();
+    await handleListBatches(mockReq('/v1/messages/batches?limit=0'), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('handleListBatches paginates newest-first and reports has_more', async () => {
+    // Created in order b0 (oldest) .. b4 (newest); listing is newest-first.
+    const batches = [];
+    for (let i = 0; i < 5; i++) batches.push(makeBatch());
+    try {
+      const res = mockRes();
+      await handleListBatches(mockReq('/v1/messages/batches?limit=2'), res);
+      const page1 = JSON.parse(res._body);
+      assert.equal(page1.data.length, 2);
+      assert.equal(page1.data[0].id, batches[4].id);
+      assert.equal(page1.data[1].id, batches[3].id);
+      assert.equal(page1.has_more, true);
+      assert.equal(page1.first_id, batches[4].id);
+      assert.equal(page1.last_id, batches[3].id);
+
+      const res2 = mockRes();
+      await handleListBatches(mockReq(`/v1/messages/batches?limit=2&after_id=${page1.last_id}`), res2);
+      const page2 = JSON.parse(res2._body);
+      assert.deepEqual(page2.data.map(b => b.id), [batches[2].id, batches[1].id]);
+      assert.equal(page2.has_more, true);
+
+      const res3 = mockRes();
+      await handleListBatches(mockReq(`/v1/messages/batches?limit=2&after_id=${page2.last_id}`), res3);
+      const page3 = JSON.parse(res3._body);
+      assert.deepEqual(page3.data.map(b => b.id), [batches[0].id]);
+      assert.equal(page3.has_more, false);
+    } finally {
+      for (const b of batches) _batches.delete(b.id);
+    }
+  });
+
+  test('handleListBatches before_id returns the page immediately newer than the cursor', async () => {
+    const batches = [];
+    for (let i = 0; i < 3; i++) batches.push(makeBatch());
+    try {
+      const res = mockRes();
+      await handleListBatches(mockReq(`/v1/messages/batches?limit=10&before_id=${batches[0].id}`), res);
+      const body = JSON.parse(res._body);
+      assert.deepEqual(body.data.map(b => b.id), [batches[2].id, batches[1].id]);
+      assert.equal(body.has_more, false);
+    } finally {
+      for (const b of batches) _batches.delete(b.id);
+    }
+  });
+
+  test('handleListBatches treats a cursor from another caller\'s batch as an empty page', async () => {
+    const otherBatch = makeBatch({ owner: 'someone-else' });
+    const ownBatch    = makeBatch();
+    try {
+      const res = mockRes();
+      await handleListBatches(mockReq(`/v1/messages/batches?after_id=${otherBatch.id}`), res);
+      const body = JSON.parse(res._body);
+      assert.deepEqual(body.data, []);
+      assert.equal(body.has_more, false);
+    } finally {
+      _batches.delete(otherBatch.id);
+      _batches.delete(ownBatch.id);
     }
   });
 });
