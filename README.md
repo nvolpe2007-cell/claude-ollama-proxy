@@ -159,7 +159,7 @@ node proxy.js
 
 Here `nick`'s key has unrestricted access, while `family`'s key can only use `llama3.2:1b` — any other model (including `claude-*` aliases that resolve to a different Ollama model) gets a `403 permission_error`. Use `|` to allow multiple models for one key, e.g. `kids:llama3.2:1b|qwen2.5:7b`. Keys with no entry in `PROXY_API_KEY_MODELS` are unaffected.
 
-The check applies to `POST /v1/messages`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, and each item in `POST /v1/messages/batches` — after `MODEL_MAP` alias resolution, so the restriction is enforced against the actual Ollama model name. It also applies to `GET /v1/models`/`GET /v1/models/:id` (restricted keys only see models they're allowed to use) and to `DELETE /v1/models/:id` / `POST /v1/models/pull`, so a restricted key can't delete or download models outside its allow-list either.
+The check applies to `POST /v1/messages`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages/count_tokens`, and each item in `POST /v1/messages/batches` — after `MODEL_MAP` alias resolution, so the restriction is enforced against the actual Ollama model name. It also applies to `GET /v1/models`/`GET /v1/models/:id` (restricted keys only see models they're allowed to use) and to `DELETE /v1/models/:id` / `POST /v1/models/pull`, so a restricted key can't delete or download models outside its allow-list either.
 
 `GET /v1/models` and `GET /v1/models/:id` respect the same allow-list: a restricted key only sees the Ollama models (and matching `MODEL_MAP` aliases) it's permitted to use, and looking up a model outside its allow-list returns `404 not_found_error` — so model-picker UIs (Continue, Open WebUI, Cursor) never offer a choice that would 403.
 

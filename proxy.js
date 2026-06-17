@@ -2741,6 +2741,14 @@ async function handleCountTokens(req, res) {
   }
 
   const effectiveModel = resolveModel(anthropicReq.model);
+
+  const ctAccessError = checkModelAccess(req, effectiveModel);
+  if (ctAccessError) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'permission_error', message: ctAccessError } }));
+    return;
+  }
+
   const ollamaBase = getOllamaHost();
 
   // Flatten messages + system to a single string for tokenization.
@@ -4136,6 +4144,7 @@ module.exports = {
   handleOpenAIChat,
   handleOpenAICompletions,
   handleEmbeddings,
+  handleCountTokens,
   handleDeleteModel,
   handlePullModel,
   handleCreateBatch,

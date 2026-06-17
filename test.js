@@ -1915,6 +1915,114 @@ describe('handleDeleteModel / handlePullModel — model access control', () => {
   });
 });
 
+// ── POST /v1/messages/count_tokens — PROXY_API_KEY_MODELS enforcement ──────────
+// handleCountTokens resolved the model and forwarded it straight to Ollama's
+// /api/tokenize endpoint without ever checking the caller's model allow-list,
+// unlike every other model-touching endpoint (messages, chat completions,
+// completions, embeddings, batches, model management). A restricted key could
+// use this to force-load a disallowed model into Ollama just to count tokens.
+
+describe('handleCountTokens — model access control', () => {
+  function withProxyEnv(envOverrides, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    const savedEnv = {};
+    for (const k of Object.keys(envOverrides)) savedEnv[k] = process.env[k];
+    let freshProxy;
+    try {
+      for (const [k, v] of Object.entries(envOverrides)) process.env[k] = v;
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v !== undefined) process.env[k] = v;
+        else delete process.env[k];
+      }
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  function mockReq(apiKeyName, bodyObj) {
+    const body = JSON.stringify(bodyObj);
+    const req = {
+      headers: {},
+      socket: { remoteAddress: '127.0.0.1', once() {}, off() {} },
+      _apiKeyName: apiKeyName,
+    };
+    req[Symbol.asyncIterator] = async function* () { yield Buffer.from(body); };
+    return req;
+  }
+
+  function mockRes() {
+    return {
+      _status: null,
+      _body: '',
+      _headers: {},
+      writableEnded: false,
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(status, headers) { this._status = status; if (headers) Object.assign(this._headers, headers); },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; },
+    };
+  }
+
+  function stubFetch() {
+    const orig = global.fetch;
+    let calls = 0;
+    global.fetch = async () => { calls++; return { ok: true, status: 200, json: async () => ({ tokens: [1, 2, 3] }) }; };
+    return { restore: () => { global.fetch = orig; }, callCount: () => calls };
+  }
+
+  test('rejects a model outside the caller\'s allow-list without calling Ollama', async () => {
+    await withProxyEnv({ PROXY_API_KEY_MODELS: 'family:llama3.2:1b' }, async (m) => {
+      const fetchStub = stubFetch();
+      try {
+        const req = mockReq('family', { model: 'qwen2.5:7b', messages: [{ role: 'user', content: 'hi' }] });
+        const res = mockRes();
+        await m.handleCountTokens(req, res);
+        assert.equal(res._status, 403);
+        assert.equal(JSON.parse(res._body).error.type, 'permission_error');
+        assert.equal(fetchStub.callCount(), 0, 'Ollama should never be called for a disallowed model');
+      } finally {
+        fetchStub.restore();
+      }
+    });
+  });
+
+  test('allows a model in the caller\'s allow-list', async () => {
+    await withProxyEnv({ PROXY_API_KEY_MODELS: 'family:llama3.2:1b' }, async (m) => {
+      const fetchStub = stubFetch();
+      try {
+        const req = mockReq('family', { model: 'llama3.2:1b', messages: [{ role: 'user', content: 'hi' }] });
+        const res = mockRes();
+        await m.handleCountTokens(req, res);
+        assert.equal(res._status, 200);
+        assert.equal(JSON.parse(res._body).input_tokens, 3);
+        assert.equal(fetchStub.callCount(), 1);
+      } finally {
+        fetchStub.restore();
+      }
+    });
+  });
+
+  test('is unrestricted for a key with no PROXY_API_KEY_MODELS entry', async () => {
+    await withProxyEnv({ PROXY_API_KEY_MODELS: 'family:llama3.2:1b' }, async (m) => {
+      const fetchStub = stubFetch();
+      try {
+        const req = mockReq('nick', { model: 'qwen2.5:72b', messages: [{ role: 'user', content: 'hi' }] });
+        const res = mockRes();
+        await m.handleCountTokens(req, res);
+        assert.equal(res._status, 200);
+        assert.equal(fetchStub.callCount(), 1);
+      } finally {
+        fetchStub.restore();
+      }
+    });
+  });
+});
+
 // ── sanitizeForLog ────────────────────────────────────────────────────────────
 
 describe('sanitizeForLog', () => {
