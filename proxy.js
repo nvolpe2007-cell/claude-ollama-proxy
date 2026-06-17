@@ -1917,6 +1917,13 @@ async function handleModelById(req, res, modelId) {
 // Auth-gated like other model management endpoints. Returns {deleted:true,id} on
 // success, 404 if the model isn't in Ollama, 502 if Ollama is unreachable.
 async function handleDeleteModel(req, res, modelId) {
+  const deleteAccessError = checkModelAccess(req, modelId);
+  if (deleteAccessError) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'permission_error', message: deleteAccessError } }));
+    return;
+  }
+
   const ollamaBase = getOllamaHost();
   let ollamaRes;
   try {
@@ -1970,6 +1977,13 @@ async function handlePullModel(req, res) {
   if (!pullReq.model || typeof pullReq.model !== 'string') {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`model` is required and must be a string' } }));
+    return;
+  }
+
+  const pullAccessError = checkModelAccess(req, pullReq.model);
+  if (pullAccessError) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'permission_error', message: pullAccessError } }));
     return;
   }
 
