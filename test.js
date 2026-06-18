@@ -4800,6 +4800,62 @@ describe('handleEmbeddings', () => {
       global.fetch = orig;
     }
   });
+
+  test('does not send num_ctx/keep_alive to /api/embed when unset', async () => {
+    let sentBody;
+    const orig = global.fetch;
+    global.fetch = async (_url, opts) => {
+      sentBody = JSON.parse(opts.body);
+      return { ok: true, status: 200, json: async () => ({ embeddings: [[0.1]], prompt_eval_count: 1 }) };
+    };
+    try {
+      await handleEmbeddings(mockReq({ input: 'hi' }), mockRes());
+      assert.equal('num_ctx' in sentBody, false);
+      assert.equal('keep_alive' in sentBody, false);
+    } finally {
+      global.fetch = orig;
+    }
+  });
+
+  // Helper: load a fresh proxy module with OLLAMA_NUM_CTX/OLLAMA_KEEP_ALIVE
+  // set, run a single test, then restore the module cache so other tests
+  // are unaffected — mirrors the withHosts()/withForceThink() pattern used
+  // elsewhere in this file for env vars captured as module-level consts.
+  function withOllamaTuning(fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    let freshProxy;
+    try {
+      process.env.OLLAMA_NUM_CTX = '4096';
+      process.env.OLLAMA_KEEP_ALIVE = '30m';
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      delete process.env.OLLAMA_NUM_CTX;
+      delete process.env.OLLAMA_KEEP_ALIVE;
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  test('forwards OLLAMA_NUM_CTX and OLLAMA_KEEP_ALIVE to /api/embed when configured', async () => {
+    await withOllamaTuning(async (mod) => {
+      let sentBody;
+      const orig = global.fetch;
+      global.fetch = async (_url, opts) => {
+        sentBody = JSON.parse(opts.body);
+        return { ok: true, status: 200, json: async () => ({ embeddings: [[0.1]], prompt_eval_count: 1 }) };
+      };
+      try {
+        await mod.handleEmbeddings(mockReq({ input: 'hi' }), mockRes());
+        assert.equal(sentBody.num_ctx, 4096);
+        assert.equal(sentBody.keep_alive, '30m');
+      } finally {
+        global.fetch = orig;
+      }
+    });
+  });
 });
 
 // ── handleCreateBatch — max_tokens validation ─────────────────────────────────

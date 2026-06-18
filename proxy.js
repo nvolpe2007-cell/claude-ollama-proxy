@@ -2649,12 +2649,16 @@ async function handleEmbeddings(req, res) {
     return;
   }
 
+  const embedBody = { ...OLLAMA_OPTIONS, model: effectiveModel, input: embedReq.input };
+  if (OLLAMA_NUM_CTX)    embedBody.num_ctx    = OLLAMA_NUM_CTX;
+  if (OLLAMA_KEEP_ALIVE) embedBody.keep_alive = OLLAMA_KEEP_ALIVE;
+
   let ollamaRes;
   try {
     ollamaRes = await fetchWithRetry(`${ollamaBase}/api/embed`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...OLLAMA_OPTIONS, model: effectiveModel, input: embedReq.input }),
+      body: JSON.stringify(embedBody),
       signal: ac.signal,
     });
   } catch (e) {
