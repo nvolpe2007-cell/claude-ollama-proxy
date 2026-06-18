@@ -2193,7 +2193,9 @@ function batchOwnedByCaller(req, batch) {
 // Process a single batch request item — reuses the same conversion logic as
 // handleMessages but operates synchronously against Ollama (non-streaming).
 // Returns { type: 'succeeded', message } or { type: 'errored', error }.
-async function processBatchRequest(anthropicReq, ollamaBase) {
+// apiKeyName attributes the item's token usage to the batch's owning API key in
+// _metrics.apiKeysUsed, mirroring every real-time endpoint (handleMessages, etc.).
+async function processBatchRequest(anthropicReq, ollamaBase, apiKeyName) {
   const effectiveModel = resolveModel(anthropicReq.model);
   const maxTokensResult = resolveMaxTokens(anthropicReq.max_tokens);
   if (maxTokensResult.error)
@@ -2282,7 +2284,7 @@ async function processBatchRequest(anthropicReq, ollamaBase) {
 
   const promptTok     = data.usage?.prompt_tokens     || 0;
   const completionTok = data.usage?.completion_tokens || 0;
-  recordTokens(promptTok, completionTok, effectiveModel);
+  recordTokens(promptTok, completionTok, effectiveModel, apiKeyName);
 
   return {
     type: 'succeeded',
@@ -2329,7 +2331,7 @@ async function processBatch(batch) {
       continue;
     }
     await acquireLlmSlotForBatch();
-    const result = await processBatchRequest(item.params, ollamaBase).catch(e => ({
+    const result = await processBatchRequest(item.params, ollamaBase, batch.owner || 'default').catch(e => ({
       type: 'errored',
       error: { type: 'internal_error', message: e.message },
     }));

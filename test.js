@@ -3670,6 +3670,85 @@ describe('processBatch — resume', () => {
   });
 });
 
+// ── processBatch — per-API-key token attribution ──────────────────────────────
+
+describe('processBatch — per-API-key metrics', () => {
+  test('attributes processed token usage to the batch owner in _metrics.apiKeysUsed', async () => {
+    const before = JSON.parse(JSON.stringify(_metrics.apiKeysUsed));
+    const batch = {
+      id:              'msgbatch_owner_metrics_test',
+      status:          'in_progress',
+      owner:           'nick',
+      expires_at:      new Date(Date.now() + 60_000).toISOString(),
+      ended_at:        null,
+      cancelRequested: false,
+      requests: [
+        { custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } },
+      ],
+      results: new Map(),
+    };
+    _batches.set(batch.id, batch);
+
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      json: async () => ({
+        choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 40, completion_tokens: 12 },
+      }),
+    });
+
+    try {
+      await processBatch(batch);
+      assert.deepEqual(_metrics.apiKeysUsed.nick, {
+        requests:  (before.nick?.requests  || 0) + 1,
+        tokensIn:  (before.nick?.tokensIn  || 0) + 40,
+        tokensOut: (before.nick?.tokensOut || 0) + 12,
+      });
+    } finally {
+      global.fetch = orig;
+      _batches.delete(batch.id);
+    }
+  });
+
+  test('falls back to "default" when a persisted batch has no owner field', async () => {
+    const before = JSON.parse(JSON.stringify(_metrics.apiKeysUsed));
+    const batch = {
+      id:              'msgbatch_no_owner_metrics_test',
+      status:          'in_progress',
+      expires_at:      new Date(Date.now() + 60_000).toISOString(),
+      ended_at:        null,
+      cancelRequested: false,
+      requests: [
+        { custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } },
+      ],
+      results: new Map(),
+    };
+    _batches.set(batch.id, batch);
+
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      json: async () => ({
+        choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 7, completion_tokens: 3 },
+      }),
+    });
+
+    try {
+      await processBatch(batch);
+      assert.deepEqual(_metrics.apiKeysUsed.default, {
+        requests:  (before.default?.requests  || 0) + 1,
+        tokensIn:  (before.default?.tokensIn  || 0) + 7,
+        tokensOut: (before.default?.tokensOut || 0) + 3,
+      });
+    } finally {
+      global.fetch = orig;
+      _batches.delete(batch.id);
+    }
+  });
+});
+
 // ── Batch persistence (saveBatchesToDisk / loadBatchesFromDisk) ───────────────
 
 describe('Batch persistence', () => {
