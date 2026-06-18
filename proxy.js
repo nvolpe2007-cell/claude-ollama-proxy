@@ -50,9 +50,13 @@ function parseDotEnv(content) {
 
 // Multi-host: OLLAMA_HOST may be a comma-separated list of Ollama base URLs.
 // Requests are distributed round-robin across all listed hosts so you can
-// spread load across multiple GPUs or Ollama instances.
+// spread load across multiple GPUs or Ollama instances. Trailing slashes are
+// stripped — every call site builds URLs as `${host}/api/...`, so a host of
+// "http://localhost:11434/" would otherwise produce a double-slash path
+// (e.g. "http://localhost:11434//api/tags") that many HTTP servers either
+// 404 on or redirect in a way that breaks POST requests.
 const OLLAMA_HOSTS = (process.env.OLLAMA_HOST || 'http://localhost:11434')
-  .split(',').map(h => h.trim()).filter(Boolean);
+  .split(',').map(h => h.trim().replace(/\/+$/, '')).filter(Boolean);
 
 // Tracks per-host health so getOllamaHost() can route around a host that is
 // down (crashed Ollama instance, unplugged GPU box, etc.) instead of sending

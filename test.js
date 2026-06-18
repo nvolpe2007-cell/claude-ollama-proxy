@@ -891,6 +891,36 @@ function withHosts(hostsCsv, fn) {
   return fn(freshProxy);
 }
 
+describe('OLLAMA_HOST trailing slash normalization', () => {
+  test('strips a single trailing slash from a single host', () => {
+    withHosts('http://localhost:11434/', (mod) => {
+      assert.deepEqual(mod.OLLAMA_HOSTS, ['http://localhost:11434']);
+    });
+  });
+
+  test('strips repeated trailing slashes', () => {
+    withHosts('http://localhost:11434///', (mod) => {
+      assert.deepEqual(mod.OLLAMA_HOSTS, ['http://localhost:11434']);
+    });
+  });
+
+  test('strips trailing slashes independently across a comma-separated list', () => {
+    withHosts('http://host-a:11434/, http://host-b:11434 ,http://host-c:11434//', (mod) => {
+      assert.deepEqual(mod.OLLAMA_HOSTS, [
+        'http://host-a:11434',
+        'http://host-b:11434',
+        'http://host-c:11434',
+      ]);
+    });
+  });
+
+  test('leaves a host with no trailing slash unchanged', () => {
+    withHosts('http://localhost:11434', (mod) => {
+      assert.deepEqual(mod.OLLAMA_HOSTS, ['http://localhost:11434']);
+    });
+  });
+});
+
 describe('multi-host failover', () => {
   test('round-robins across all healthy hosts', () => {
     withHosts('http://host-a:11434,http://host-b:11434', (mod) => {
