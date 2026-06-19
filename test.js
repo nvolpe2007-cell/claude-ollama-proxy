@@ -1046,19 +1046,57 @@ describe('getClientIp', () => {
     assert.equal(getClientIp(req), '10.0.0.1');
   });
 
-  test('returns first IP from x-forwarded-for header', () => {
+  test('ignores x-forwarded-for by default (PROXY_TRUST_PROXY not set)', () => {
     const req = { headers: { 'x-forwarded-for': '203.0.113.5, 10.0.0.2, 10.0.0.3' }, socket: { remoteAddress: '10.0.0.2' } };
-    assert.equal(getClientIp(req), '203.0.113.5');
-  });
-
-  test('trims whitespace from x-forwarded-for', () => {
-    const req = { headers: { 'x-forwarded-for': '  192.168.1.1  ' }, socket: { remoteAddress: '10.0.0.1' } };
-    assert.equal(getClientIp(req), '192.168.1.1');
+    assert.equal(getClientIp(req), '10.0.0.2',
+      'a client-supplied x-forwarded-for must not override the socket address unless PROXY_TRUST_PROXY=true, otherwise RATE_LIMIT_PER_IP_RPM is trivially spoofable');
   });
 
   test('falls back to "unknown" when socket has no remoteAddress', () => {
     const req = { headers: {}, socket: {} };
     assert.equal(getClientIp(req), 'unknown');
+  });
+});
+
+// withTrustProxy() loads a fresh proxy module with PROXY_TRUST_PROXY=true so
+// x-forwarded-for trust behavior can be tested in isolation, then restores the
+// original module cache so other tests are unaffected.
+function withTrustProxy(fn) {
+  const modKey = require.resolve('./proxy');
+  const savedMod = require.cache[modKey];
+  let freshProxy;
+  try {
+    process.env.PROXY_TRUST_PROXY = 'true';
+    delete require.cache[modKey];
+    freshProxy = require('./proxy');
+  } finally {
+    delete process.env.PROXY_TRUST_PROXY;
+    delete require.cache[modKey];
+    require.cache[modKey] = savedMod;
+  }
+  return fn(freshProxy);
+}
+
+describe('getClientIp with PROXY_TRUST_PROXY=true', () => {
+  test('returns first IP from x-forwarded-for header', () => {
+    withTrustProxy(({ getClientIp }) => {
+      const req = { headers: { 'x-forwarded-for': '203.0.113.5, 10.0.0.2, 10.0.0.3' }, socket: { remoteAddress: '10.0.0.2' } };
+      assert.equal(getClientIp(req), '203.0.113.5');
+    });
+  });
+
+  test('trims whitespace from x-forwarded-for', () => {
+    withTrustProxy(({ getClientIp }) => {
+      const req = { headers: { 'x-forwarded-for': '  192.168.1.1  ' }, socket: { remoteAddress: '10.0.0.1' } };
+      assert.equal(getClientIp(req), '192.168.1.1');
+    });
+  });
+
+  test('falls back to socket remoteAddress when header absent', () => {
+    withTrustProxy(({ getClientIp }) => {
+      const req = { headers: {}, socket: { remoteAddress: '10.0.0.1' } };
+      assert.equal(getClientIp(req), '10.0.0.1');
+    });
   });
 });
 

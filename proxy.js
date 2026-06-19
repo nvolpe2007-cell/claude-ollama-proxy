@@ -399,8 +399,8 @@ function debugLog(label, obj) {
 // Optional request rate limits. All apply to POST /v1/messages, /v1/chat/completions,
 // /v1/completions, /v1/messages/count_tokens, and /v1/embeddings. Unset (disabled) by default.
 // RATE_LIMIT_RPM         — global cap across all callers (requests / minute).
-// RATE_LIMIT_PER_IP_RPM  — per-client-IP cap (requests / minute); uses
-//                          x-forwarded-for when behind a reverse proxy.
+// RATE_LIMIT_PER_IP_RPM  — per-client-IP cap (requests / minute); see PROXY_TRUST_PROXY below
+//                          for how the client IP is determined.
 // RATE_LIMIT_PER_KEY_RPM — per-API-key cap (requests / minute); buckets by the
 //                          caller's matched PROXY_API_KEYS name (or 'default' when
 //                          no API keys are configured, or PROXY_API_KEY is used),
@@ -409,6 +409,15 @@ function debugLog(label, obj) {
 const RATE_LIMIT_RPM         = process.env.RATE_LIMIT_RPM         ? Number(process.env.RATE_LIMIT_RPM)         : null;
 const RATE_LIMIT_PER_IP_RPM  = process.env.RATE_LIMIT_PER_IP_RPM  ? Number(process.env.RATE_LIMIT_PER_IP_RPM)  : null;
 const RATE_LIMIT_PER_KEY_RPM = process.env.RATE_LIMIT_PER_KEY_RPM ? Number(process.env.RATE_LIMIT_PER_KEY_RPM) : null;
+
+// By default the proxy does NOT trust the x-forwarded-for header when computing a
+// client's IP for RATE_LIMIT_PER_IP_RPM, because PROXY_LISTEN_HOST defaults to all
+// interfaces (0.0.0.0) — many deployments are reached directly, not through a reverse
+// proxy, and a client-supplied x-forwarded-for header is otherwise trivial to spoof to
+// get a fresh rate-limit bucket on every request. Set PROXY_TRUST_PROXY=true only when
+// the proxy sits behind a reverse proxy/load balancer that overwrites x-forwarded-for
+// with the real client IP before it reaches Node.
+const PROXY_TRUST_PROXY = process.env.PROXY_TRUST_PROXY === 'true';
 
 // Optional JSON map: claude-* model name (or prefix) → Ollama model name.
 // Exact match wins; then prefix match (e.g. "claude-3-haiku" matches any claude-3-haiku-*).
@@ -926,10 +935,14 @@ async function readBody(req) {
 // after the previous one expires, which is cheap and good enough for burst protection.
 const _rateLimitWindows = new Map(); // key → { count, windowStart }
 
-// Returns the client IP, respecting x-forwarded-for for reverse-proxy deployments.
+// Returns the client IP. Only consults x-forwarded-for when PROXY_TRUST_PROXY=true
+// (i.e. the operator has confirmed a trusted reverse proxy sets this header) — otherwise
+// a direct caller could spoof a fresh IP on every request to dodge RATE_LIMIT_PER_IP_RPM.
 function getClientIp(req) {
-  const xff = req.headers['x-forwarded-for'];
-  if (xff) return xff.split(',')[0].trim();
+  if (PROXY_TRUST_PROXY) {
+    const xff = req.headers['x-forwarded-for'];
+    if (xff) return xff.split(',')[0].trim();
+  }
   return req.socket.remoteAddress || 'unknown';
 }
 
@@ -3042,6 +3055,7 @@ function handleDashboard(req, res) {
     rateLimitRpm:       RATE_LIMIT_RPM,
     rateLimitPerIpRpm:  RATE_LIMIT_PER_IP_RPM,
     rateLimitPerKeyRpm: RATE_LIMIT_PER_KEY_RPM,
+    trustProxy:         PROXY_TRUST_PROXY,
     warmup:             PROXY_WARMUP,
     timeout:            PROXY_TIMEOUT,
     idleTimeout:        PROXY_IDLE_TIMEOUT,
@@ -3151,7 +3165,7 @@ async function refresh(){
   if(C.timeout)g+=row('Timeout',fmt(C.timeout)+' ms');
   if(C.idleTimeout)g+=row('Idle timeout',fmt(C.idleTimeout)+' ms');
   if(C.rateLimitRpm)g+=row('Rate limit (global)',fmt(C.rateLimitRpm)+' req/min');
-  if(C.rateLimitPerIpRpm)g+=row('Rate limit (per-IP)',fmt(C.rateLimitPerIpRpm)+' req/min');
+  if(C.rateLimitPerIpRpm)g+=row('Rate limit (per-IP)',fmt(C.rateLimitPerIpRpm)+' req/min ('+(C.trustProxy?'trusting x-forwarded-for':'socket address')+')');
   if(C.rateLimitPerKeyRpm)g+=row('Rate limit (per-key)',fmt(C.rateLimitPerKeyRpm)+' req/min');
   if(C.maxConcurrency)g+=row('Max concurrency',fmt(C.maxConcurrency)+' req');
   if(C.maxQueueSize)g+=row('Queue depth',fmt(C.maxQueueSize)+' req'+(C.queueTimeoutMs?', '+fmt(C.queueTimeoutMs)+'ms timeout':''));
@@ -4011,7 +4025,7 @@ if (require.main === module) {
     }
     console.log(`  Batches: ${PROXY_BATCH_PERSIST_PATH ? `persisted to ${PROXY_BATCH_PERSIST_PATH}` : 'in-memory only (set PROXY_BATCH_PERSIST_PATH to survive restarts)'}`);
     const rlGlobal = RATE_LIMIT_RPM         ? `global ${RATE_LIMIT_RPM} req/min`     : 'no global limit';
-    const rlIp     = RATE_LIMIT_PER_IP_RPM  ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min`  : 'no per-IP limit';
+    const rlIp     = RATE_LIMIT_PER_IP_RPM  ? `per-IP ${RATE_LIMIT_PER_IP_RPM} req/min (${PROXY_TRUST_PROXY ? 'trusting x-forwarded-for' : 'socket address — set PROXY_TRUST_PROXY=true if behind a reverse proxy'})`  : 'no per-IP limit';
     const rlKey    = RATE_LIMIT_PER_KEY_RPM ? `per-key ${RATE_LIMIT_PER_KEY_RPM} req/min` : 'no per-key limit';
     console.log(`  RateLimit: ${rlGlobal}; ${rlIp}; ${rlKey} (set RATE_LIMIT_RPM / RATE_LIMIT_PER_IP_RPM / RATE_LIMIT_PER_KEY_RPM)`);
     console.log(`  Concurrency: ${PROXY_MAX_CONCURRENCY ? `max ${PROXY_MAX_CONCURRENCY} simultaneous LLM requests (503 when exceeded)` : 'unlimited (set PROXY_MAX_CONCURRENCY to prevent GPU OOM)'}`);
@@ -4130,6 +4144,7 @@ module.exports = {
   PROXY_HARD_MAX_TOKENS,
   PROXY_IDLE_TIMEOUT,
   PROXY_FORCE_THINK,
+  PROXY_TRUST_PROXY,
   PROXY_AUTO_TRUNCATE,
   truncateToContext,
   toOpenAIMessages,
