@@ -3787,6 +3787,47 @@ describe('processBatch — per-API-key metrics', () => {
   });
 });
 
+// ── processBatch — multi-host round robin ──────────────────────────────────────
+
+describe('processBatch — multi-host round robin', () => {
+  test('re-resolves the Ollama host per item instead of pinning the whole batch to one host', async () => {
+    await withHosts('http://host-a:11434,http://host-b:11434', async (mod) => {
+      const batch = {
+        id:              'msgbatch_multihost_test',
+        status:          'in_progress',
+        expires_at:      new Date(Date.now() + 60_000).toISOString(),
+        ended_at:        null,
+        cancelRequested: false,
+        requests: [
+          { custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } },
+          { custom_id: 'r2', params: { messages: [], model: 'test', max_tokens: 1 } },
+        ],
+        results: new Map(),
+      };
+      mod._batches.set(batch.id, batch);
+
+      const orig = global.fetch;
+      const calledUrls = [];
+      global.fetch = async (url) => {
+        calledUrls.push(url);
+        return {
+          ok: true, status: 200,
+          json: async () => ({ choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }], usage: {} }),
+        };
+      };
+
+      try {
+        await mod.processBatch(batch);
+        assert.deepEqual(calledUrls, mod.OLLAMA_HOSTS.map(h => `${h}/v1/chat/completions`),
+          'each item should round-robin across hosts instead of pinning the whole batch to one host');
+      } finally {
+        global.fetch = orig;
+        mod._batches.delete(batch.id);
+      }
+    });
+  });
+});
+
 // ── Batch persistence (saveBatchesToDisk / loadBatchesFromDisk) ───────────────
 
 describe('Batch persistence', () => {

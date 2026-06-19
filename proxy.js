@@ -2334,7 +2334,6 @@ async function processBatchRequest(anthropicReq, ollamaBase, apiKeyName) {
 // Ollama, so batch requests respect PROXY_MAX_CONCURRENCY and compete fairly with
 // real-time requests rather than bypassing the gate.
 async function processBatch(batch) {
-  const ollamaBase = getOllamaHost();
   for (const item of batch.requests) {
     // Already processed — happens when a persisted batch is resumed after a restart.
     if (batch.results.has(item.custom_id)) continue;
@@ -2351,6 +2350,12 @@ async function processBatch(batch) {
       continue;
     }
     await acquireLlmSlotForBatch();
+    // Re-resolve the host for every item rather than once for the whole batch: a batch
+    // can run for hours, and pinning it to whichever host was current at the start defeats
+    // both multi-host round-robin load distribution and the automatic-failover health
+    // tracking (_hostHealth) that every other handler already gets by calling
+    // getOllamaHost() fresh per request.
+    const ollamaBase = getOllamaHost();
     const result = await processBatchRequest(item.params, ollamaBase, batch.owner || 'default').catch(e => ({
       type: 'errored',
       error: { type: 'internal_error', message: e.message },
