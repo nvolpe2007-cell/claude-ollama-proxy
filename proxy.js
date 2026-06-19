@@ -1168,7 +1168,14 @@ async function handleMessages(req, res) {
   const onClientClose = () => { if (!res.writableEnded) { clearTO(); ac.abort(); } };
   req.socket.once('close', onClientClose);
 
-  const body = await readBody(req);
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (e) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    throw e;
+  }
   let anthropicReq;
   try { anthropicReq = JSON.parse(body); }
   catch {
@@ -2625,7 +2632,14 @@ async function handleEmbeddings(req, res) {
   const onClientClose = () => { if (!res.writableEnded) { clearTO(); ac.abort(); } };
   req.socket.once('close', onClientClose);
 
-  const body = await readBody(req);
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (e) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    throw e;
+  }
   let embedReq;
   try { embedReq = JSON.parse(body); }
   catch {
@@ -3288,7 +3302,14 @@ async function handleOpenAIChat(req, res) {
   const onClientClose = () => { if (!res.writableEnded) { clearTO(); ac.abort(); } };
   req.socket.once('close', onClientClose);
 
-  const body = await readBody(req);
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (e) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    throw e;
+  }
   let openaiReq;
   try { openaiReq = JSON.parse(body); }
   catch {
@@ -3565,7 +3586,14 @@ async function handleOpenAICompletions(req, res) {
   const onClientClose = () => { if (!res.writableEnded) { clearTO(); ac.abort(); } };
   req.socket.once('close', onClientClose);
 
-  const body = await readBody(req);
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (e) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    throw e;
+  }
   let completionReq;
   try { completionReq = JSON.parse(body); }
   catch {

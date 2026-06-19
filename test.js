@@ -5064,3 +5064,84 @@ describe('handleCreateBatch — max_tokens validation', () => {
     assert.equal(_batches.size, before, 'no batch should be created when max_tokens is invalid');
   });
 });
+
+// ── readBody failure cleanup ────────────────────────────────────────────────────
+// handleMessages, handleOpenAIChat, handleOpenAICompletions, and handleEmbeddings all
+// register a PROXY_TIMEOUT timer and a socket 'close' listener *before* calling
+// readBody(req). If readBody throws (e.g. a PROXY_MAX_BODY_SIZE rejection), the
+// exception used to skip straight past each handler's own cleanup to the generic
+// router catch block, which has no access to those closures — leaving a dangling
+// timer (that later fires a misleading "Request timeout" warning for a request that
+// actually failed for an unrelated reason) and an unremoved 'close' listener.
+
+describe('readBody failure cleanup (PROXY_TIMEOUT / close listener)', () => {
+  const { EventEmitter } = require('events');
+
+  function withProxyEnv(envOverrides, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    const savedEnv = {};
+    for (const k of Object.keys(envOverrides)) savedEnv[k] = process.env[k];
+    let freshProxy;
+    try {
+      for (const [k, v] of Object.entries(envOverrides)) process.env[k] = v;
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v !== undefined) process.env[k] = v;
+        else delete process.env[k];
+      }
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  function mockReq(bodyChunk) {
+    const socket = new EventEmitter();
+    socket.remoteAddress = '127.0.0.1';
+    return {
+      headers: {},
+      socket,
+      method: 'POST',
+      [Symbol.asyncIterator]: async function* () { yield bodyChunk; },
+    };
+  }
+
+  function mockRes() {
+    return {
+      headersSent: false,
+      writableEnded: false,
+      _status: null,
+      _body: '',
+      setHeader() {},
+      getHeader() {},
+      writeHead(status) { this._status = status; this.headersSent = true; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; },
+    };
+  }
+
+  const oversizedBody = 'x'.repeat(64);
+  const cases = [
+    ['handleMessages', '/v1/messages'],
+    ['handleOpenAIChat', '/v1/chat/completions'],
+    ['handleOpenAICompletions', '/v1/completions'],
+    ['handleEmbeddings', '/v1/embeddings'],
+  ];
+
+  for (const [handlerName, url] of cases) {
+    test(`${handlerName} removes the close listener and clears the timeout when readBody rejects an oversized body`, async () => {
+      await withProxyEnv({ PROXY_MAX_BODY_SIZE: '10', PROXY_TIMEOUT: '60000' }, async (m) => {
+        const req = mockReq(oversizedBody);
+        req.url = url;
+        const res = mockRes();
+        await assert.rejects(
+          () => m[handlerName](req, res),
+          (e) => e.code === 'PAYLOAD_TOO_LARGE'
+        );
+        assert.equal(req.socket.listenerCount('close'), 0, 'close listener should be removed after readBody throws');
+      });
+    });
+  }
+});
