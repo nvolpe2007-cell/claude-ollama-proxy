@@ -1368,7 +1368,7 @@ async function handleMessages(req, res) {
     clearTO();
     debugLog('← Ollama response', data);
     const choice = data.choices?.[0];
-    if (!choice) {
+    if (!choice || !choice.message) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { type: 'ollama_error', message: 'Empty choices in Ollama response' } }));
       return;
@@ -1395,7 +1395,8 @@ async function handleMessages(req, res) {
     if (msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         let input = {};
-        try { input = JSON.parse(tc.function.arguments); } catch {}
+        try { input = JSON.parse(tc.function.arguments); }
+        catch { console.warn(`[tool-call] Model returned non-JSON arguments for tool "${tc.function?.name}", defaulting to {}: ${tc.function?.arguments}`); }
         content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
       }
     }
@@ -2277,7 +2278,7 @@ async function processBatchRequest(anthropicReq, ollamaBase, apiKeyName) {
   catch { return { type: 'errored', error: { type: 'ollama_error', message: 'Failed to parse Ollama response' } }; }
 
   const choice = data.choices?.[0];
-  if (!choice)
+  if (!choice || !choice.message)
     return { type: 'errored', error: { type: 'ollama_error', message: 'Empty choices in Ollama response' } };
 
   const msg     = choice.message;
@@ -2297,7 +2298,8 @@ async function processBatchRequest(anthropicReq, ollamaBase, apiKeyName) {
   if (msg.tool_calls) {
     for (const tc of msg.tool_calls) {
       let input = {};
-      try { input = JSON.parse(tc.function.arguments); } catch {}
+      try { input = JSON.parse(tc.function.arguments); }
+      catch { console.warn(`[tool-call] Model returned non-JSON arguments for tool "${tc.function?.name}", defaulting to {}: ${tc.function?.arguments}`); }
       content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
     }
   }
