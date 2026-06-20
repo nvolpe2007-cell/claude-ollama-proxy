@@ -5412,3 +5412,138 @@ describe('readBody failure cleanup (PROXY_TIMEOUT / close listener)', () => {
     });
   }
 });
+
+// ── Rate limiting on POST /v1/messages/batches (batch creation) ────────────────
+// Every other endpoint that triggers Ollama inference (/v1/messages,
+// /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/messages/count_tokens)
+// is gated by RATE_LIMIT_RPM / RATE_LIMIT_PER_IP_RPM / RATE_LIMIT_PER_KEY_RPM, but
+// batch creation previously had none of the three wired up in the router — letting
+// a caller bypass all request-rate limits by submitting work through the Batch API
+// instead of real-time calls, even though each batch item is processed through the
+// same Ollama call path. These tests exercise the router (requestHandler) directly
+// so they catch a regression in the wiring itself, not just in checkRateLimit().
+
+describe('rate limiting on POST /v1/messages/batches', () => {
+  function withProxyEnv(envOverrides, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    const savedEnv = {};
+    for (const k of Object.keys(envOverrides)) savedEnv[k] = process.env[k];
+    let freshProxy;
+    try {
+      for (const [k, v] of Object.entries(envOverrides)) process.env[k] = v;
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v !== undefined) process.env[k] = v;
+        else delete process.env[k];
+      }
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  function mockReq(method, path, body = null) {
+    return {
+      method,
+      url: path,
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1', encrypted: false },
+      [Symbol.asyncIterator]: async function* () { if (body) yield JSON.stringify(body); },
+    };
+  }
+
+  function mockRes() {
+    const listeners = {};
+    return {
+      headersSent: false,
+      writableEnded: false,
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k.toLowerCase()] = v; },
+      getHeader(k) { return this._headers[k.toLowerCase()]; },
+      writeHead(status) { this._status = status; this.headersSent = true; },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; if (listeners.finish) listeners.finish(); },
+      on(event, fn) { listeners[event] = fn; },
+      once(event, fn) { listeners[event] = fn; },
+      off() {},
+    };
+  }
+
+  function stubFetch() {
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      json: async () => ({ choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+      text: async () => '{}',
+      body: null,
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  const validBatchBody = {
+    requests: [{ custom_id: 'r1', params: { messages: [{ role: 'user', content: 'hi' }], model: 'test', max_tokens: 10 } }],
+  };
+
+  test('RATE_LIMIT_RPM rejects a second batch-creation call within the same window with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/messages/batches', validBatchBody), res1);
+        assert.equal(res1._status, 200, 'first batch-creation call should succeed');
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/messages/batches', validBatchBody), res2);
+        assert.equal(res2._status, 429, 'second batch-creation call should be rate-limited');
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('RATE_LIMIT_PER_IP_RPM rejects a second batch-creation call from the same IP with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_PER_IP_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/messages/batches', validBatchBody), res1);
+        assert.equal(res1._status, 200);
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/messages/batches', validBatchBody), res2);
+        assert.equal(res2._status, 429);
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('RATE_LIMIT_PER_KEY_RPM rejects a second batch-creation call from the same key with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_PER_KEY_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/messages/batches', validBatchBody), res1);
+        assert.equal(res1._status, 200);
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/messages/batches', validBatchBody), res2);
+        assert.equal(res2._status, 429);
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('batch creation succeeds normally when no rate limit env vars are set', async () => {
+    const restore = stubFetch();
+    try {
+      const res = mockRes();
+      const { requestHandler } = require('./proxy');
+      await requestHandler(mockReq('POST', '/v1/messages/batches', validBatchBody), res);
+      assert.equal(res._status, 200);
+    } finally { restore(); }
+  });
+});

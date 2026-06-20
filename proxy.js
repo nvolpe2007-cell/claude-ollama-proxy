@@ -397,7 +397,10 @@ function debugLog(label, obj) {
 }
 
 // Optional request rate limits. All apply to POST /v1/messages, /v1/chat/completions,
-// /v1/completions, /v1/messages/count_tokens, and /v1/embeddings. Unset (disabled) by default.
+// /v1/completions, /v1/messages/count_tokens, /v1/embeddings, and /v1/messages/batches
+// (batch creation) — the last one matters because a single batch can enqueue many
+// inference requests against the same shared Ollama/GPU resource the other limits
+// protect, so creation itself must be capped too. Unset (disabled) by default.
 // RATE_LIMIT_RPM         — global cap across all callers (requests / minute).
 // RATE_LIMIT_PER_IP_RPM  — per-client-IP cap (requests / minute); see PROXY_TRUST_PROXY below
 //                          for how the client IP is determined.
@@ -3965,6 +3968,9 @@ async function requestHandler(req, res) {
       await handleCountTokens(req, res);
     } else if (req.method === 'POST' && path === '/v1/messages/batches') {
       if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       await handleCreateBatch(req, res);
     } else if (req.method === 'GET' && path === '/v1/messages/batches') {
       if (!checkAuth(req, res)) return;
