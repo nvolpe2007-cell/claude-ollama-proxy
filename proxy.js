@@ -1357,7 +1357,9 @@ async function handleMessages(req, res) {
   }
 
   if (!ollamaRes.ok) {
-    const errText = await ollamaRes.text();
+    req.socket.off('close', onClientClose);
+    clearTO();
+    const errText = await ollamaRes.text().catch(() => '');
     const { status, type, message } = mapOllamaError(ollamaRes.status, errText);
     res.writeHead(status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type, message } }));
@@ -2751,7 +2753,7 @@ async function handleEmbeddings(req, res) {
   clearTO();
 
   if (!ollamaRes.ok) {
-    const errText = await ollamaRes.text();
+    const errText = await ollamaRes.text().catch(() => '');
     const { status, type, message } = mapOllamaError(ollamaRes.status, errText);
     res.writeHead(status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type, message } }));
@@ -3481,7 +3483,7 @@ async function handleOpenAIChat(req, res) {
   if (!ollamaRes.ok) {
     req.socket.off('close', onClientClose);
     clearTO();
-    const err = await ollamaRes.text();
+    const err = await ollamaRes.text().catch(() => '');
     res.writeHead(ollamaRes.status, { 'Content-Type': 'application/json' });
     res.end(err);
     return;
@@ -3743,7 +3745,7 @@ async function handleOpenAICompletions(req, res) {
   if (!ollamaRes.ok) {
     req.socket.off('close', onClientClose);
     clearTO();
-    const err = await ollamaRes.text();
+    const err = await ollamaRes.text().catch(() => '');
     res.writeHead(ollamaRes.status, { 'Content-Type': 'application/json' });
     res.end(err);
     return;

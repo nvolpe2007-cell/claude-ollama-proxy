@@ -2886,6 +2886,47 @@ describe('handleMessages', () => {
     } finally { restore(); }
   });
 
+  test('non-streaming: does not crash if reading the Ollama error body itself throws', async () => {
+    // Simulates a client abort / decoding failure while reading ollamaRes.text()
+    // in the !ollamaRes.ok branch — should degrade to a mapped error response,
+    // not an uncaught rejection.
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: false, status: 500,
+      text: async () => { throw new Error('AbortError'); },
+      body: null,
+    });
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Hi' }], stream: false }), res);
+      assert.equal(res._status, 502);
+      const body = JSON.parse(res._body);
+      assert.equal(body.error.type, 'ollama_error');
+    } finally { global.fetch = orig; }
+  });
+
+  test('non-streaming: removes the close listener and clears the timeout on a non-ok Ollama response', async () => {
+    const { EventEmitter } = require('events');
+    const restore = stubFetchError(500, 'CUDA out of memory');
+    try {
+      const socket = new EventEmitter();
+      socket.remoteAddress = '127.0.0.1';
+      const req = {
+        headers: {},
+        socket,
+        method: 'POST',
+        url: '/v1/messages',
+        [Symbol.asyncIterator]: async function* () {
+          yield JSON.stringify({ messages: [{ role: 'user', content: 'Hi' }], stream: false });
+        },
+      };
+      const res = mockRes();
+      await handleMessages(req, res);
+      assert.equal(res._status, 502);
+      assert.equal(socket.listenerCount('close'), 0, 'close listener should be removed after a non-ok Ollama response');
+    } finally { restore(); }
+  });
+
   test('non-streaming: <think> tags extracted into thinking content block', async () => {
     const restore = stubFetch({
       choices: [{
