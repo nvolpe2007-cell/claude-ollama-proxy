@@ -534,6 +534,27 @@ function validateModelField(model) {
   return {};
 }
 
+// Validates POST /v1/embeddings' optional `encoding_format` field. The real OpenAI API
+// accepts only "float" (default) or "base64"; several popular clients (e.g. LangChain's
+// OpenAIEmbeddings) request "base64" explicitly and decode the response as a base64-encoded
+// float32 buffer, so silently ignoring this field and always returning a plain float array
+// would hand those clients a string they then try to base64-decode as numbers — garbage in,
+// no error. Returns { error } when invalid, or {} when absent/null or one of the two values.
+// Exported for unit testing.
+function validateEncodingFormat(format) {
+  if (format === undefined || format === null) return {};
+  if (format !== 'float' && format !== 'base64') {
+    return { error: '`encoding_format` must be "float" or "base64"' };
+  }
+  return {};
+}
+
+// Encodes an embedding vector the way the real OpenAI API does for encoding_format:"base64" —
+// a base64 string of the IEEE-754 float32 values in little-endian byte order.
+function embeddingToBase64(embedding) {
+  return Buffer.from(Float32Array.from(embedding).buffer).toString('base64');
+}
+
 // Validates a request's optional `tools` field. toOpenAITools() calls `.map()` on this
 // value and reads `.name` off each entry, so a non-array value (string, object) or a
 // malformed entry (null, missing/non-string name) would otherwise throw a TypeError that
@@ -2674,6 +2695,15 @@ async function handleEmbeddings(req, res) {
     return;
   }
 
+  const encodingFormatResult = validateEncodingFormat(embedReq.encoding_format);
+  if (encodingFormatResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: encodingFormatResult.error } }));
+    return;
+  }
+
   const effectiveModel = resolveModel(embedReq.model);
 
   const embedAccessError = checkModelAccess(req, effectiveModel);
@@ -2742,10 +2772,12 @@ async function handleEmbeddings(req, res) {
   recordTokens(promptTokens, 0, effectiveModel, req._apiKeyName);
   res._logMeta = { model: effectiveModel, tokensIn: promptTokens, tokensOut: 0 };
 
+  const toEmbeddingValue = embedReq.encoding_format === 'base64' ? embeddingToBase64 : (emb) => emb;
+
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     object: 'list',
-    data: embeddings.map((emb, i) => ({ object: 'embedding', embedding: emb, index: i })),
+    data: embeddings.map((emb, i) => ({ object: 'embedding', embedding: toEmbeddingValue(emb), index: i })),
     model: effectiveModel,
     usage: { prompt_tokens: promptTokens, total_tokens: promptTokens },
   }));
@@ -4176,6 +4208,8 @@ module.exports = {
   validateTools,
   validateSystemField,
   validateMessages,
+  validateEncodingFormat,
+  embeddingToBase64,
   PROXY_HARD_MAX_TOKENS,
   PROXY_IDLE_TIMEOUT,
   PROXY_FORCE_THINK,

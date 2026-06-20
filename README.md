@@ -346,6 +346,8 @@ Forwards to Ollama's `/api/embed` and returns an OpenAI-compatible envelope:
 
 `input` may be a string or an array of strings. Supports any Ollama embedding model (`nomic-embed-text`, `mxbai-embed-large`, etc.) and resolves `MODEL_MAP` aliases. Auth, rate limiting, timeout, retry, and `OLLAMA_OPTIONS` all apply.
 
+`encoding_format` is also supported: `"float"` (default) returns the plain JSON array shown above; `"base64"` returns each `embedding` as a base64 string of little-endian float32 bytes, matching the real OpenAI API's wire format — needed by clients that request it explicitly, such as LangChain's `OpenAIEmbeddings`, which defaults to `encoding_format:"base64"`.
+
 ## Anthropic Messages Batch API
 
 The proxy implements Anthropic's [Message Batches API](https://docs.anthropic.com/en/api/creating-message-batches) backed by an in-memory queue, processed serially against Ollama:

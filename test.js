@@ -65,6 +65,8 @@ const {
   _batches,
   truncateToContext,
   handleEmbeddings,
+  validateEncodingFormat,
+  embeddingToBase64,
 } = require('./proxy');
 
 // ── resolveModel ──────────────────────────────────────────────────────────────
@@ -146,6 +148,39 @@ describe('validateTools', () => {
     assert.match(validateTools([{}]).error, /non-empty string `name`/);
     assert.match(validateTools([{ name: '' }]).error, /non-empty string `name`/);
     assert.match(validateTools([{ name: 123 }]).error, /non-empty string `name`/);
+  });
+});
+
+// ── validateEncodingFormat / embeddingToBase64 ────────────────────────────────
+
+describe('validateEncodingFormat', () => {
+  test('accepts absent or null encoding_format', () => {
+    assert.deepEqual(validateEncodingFormat(undefined), {});
+    assert.deepEqual(validateEncodingFormat(null), {});
+  });
+
+  test('accepts "float" and "base64"', () => {
+    assert.deepEqual(validateEncodingFormat('float'), {});
+    assert.deepEqual(validateEncodingFormat('base64'), {});
+  });
+
+  test('rejects any other value', () => {
+    assert.match(validateEncodingFormat('hex').error, /must be "float" or "base64"/);
+    assert.match(validateEncodingFormat(123).error, /must be "float" or "base64"/);
+    assert.match(validateEncodingFormat(true).error, /must be "float" or "base64"/);
+  });
+});
+
+describe('embeddingToBase64', () => {
+  test('round-trips a float vector through base64 the way the OpenAI wire format expects', () => {
+    const original = [0.1, -0.5, 2, 0];
+    const encoded = embeddingToBase64(original);
+    assert.equal(typeof encoded, 'string');
+    const buf = Buffer.from(encoded, 'base64');
+    const decoded = [...new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)];
+    for (let i = 0; i < original.length; i++) {
+      assert.ok(Math.abs(decoded[i] - original[i]) < 1e-6);
+    }
   });
 });
 
@@ -4973,6 +5008,15 @@ describe('handleEmbeddings', () => {
     assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
   });
 
+  test('returns 400 when encoding_format is not "float" or "base64"', async () => {
+    const res = mockRes();
+    await handleEmbeddings(mockReq({ input: 'hello', encoding_format: 'hex' }), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /encoding_format/);
+  });
+
   test('returns OpenAI-compatible embedding envelope for a successful request', async () => {
     const restore = stubFetch({
       embeddings: [[0.1, 0.2, 0.3]],
@@ -4990,6 +5034,39 @@ describe('handleEmbeddings', () => {
       assert.equal(body.data[0].index, 0);
       assert.equal(body.usage.prompt_tokens, 7);
       assert.equal(body.usage.total_tokens, 7);
+    } finally {
+      restore();
+    }
+  });
+
+  test('encodes embeddings as base64 float32 when encoding_format is "base64"', async () => {
+    const restore = stubFetch({
+      embeddings: [[0.1, 0.2, 0.3]],
+      prompt_eval_count: 7,
+    });
+    try {
+      const res = mockRes();
+      await handleEmbeddings(mockReq({ model: 'nomic-embed-text', input: 'hello world', encoding_format: 'base64' }), res);
+      assert.equal(res._status, 200);
+      const body = JSON.parse(res._body);
+      assert.equal(typeof body.data[0].embedding, 'string');
+      const buf = Buffer.from(body.data[0].embedding, 'base64');
+      const decoded = [...new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)];
+      assert.deepEqual(decoded.map(n => Math.round(n * 10) / 10), [0.1, 0.2, 0.3]);
+    } finally {
+      restore();
+    }
+  });
+
+  test('returns a plain float array when encoding_format is "float" or omitted', async () => {
+    const restore = stubFetch({
+      embeddings: [[0.1, 0.2, 0.3]],
+      prompt_eval_count: 7,
+    });
+    try {
+      const res = mockRes();
+      await handleEmbeddings(mockReq({ input: 'hello world', encoding_format: 'float' }), res);
+      assert.deepEqual(JSON.parse(res._body).data[0].embedding, [0.1, 0.2, 0.3]);
     } finally {
       restore();
     }
