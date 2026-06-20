@@ -5547,3 +5547,125 @@ describe('rate limiting on POST /v1/messages/batches', () => {
     } finally { restore(); }
   });
 });
+
+describe('rate limiting on POST /v1/models/pull', () => {
+  function withProxyEnv(envOverrides, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    const savedEnv = {};
+    for (const k of Object.keys(envOverrides)) savedEnv[k] = process.env[k];
+    let freshProxy;
+    try {
+      for (const [k, v] of Object.entries(envOverrides)) process.env[k] = v;
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v !== undefined) process.env[k] = v;
+        else delete process.env[k];
+      }
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  function mockReq(method, path, body = null) {
+    return {
+      method,
+      url: path,
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1', encrypted: false },
+      [Symbol.asyncIterator]: async function* () { if (body) yield JSON.stringify(body); },
+    };
+  }
+
+  function mockRes() {
+    const listeners = {};
+    return {
+      headersSent: false,
+      writableEnded: false,
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k.toLowerCase()] = v; },
+      getHeader(k) { return this._headers[k.toLowerCase()]; },
+      writeHead(status) { this._status = status; this.headersSent = true; },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; if (listeners.finish) listeners.finish(); },
+      on(event, fn) { listeners[event] = fn; },
+      once(event, fn) { listeners[event] = fn; },
+      off() {},
+    };
+  }
+
+  function stubFetch() {
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      json: async () => ({ status: 'success' }),
+      text: async () => '{}',
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  const pullBody = { model: 'llama3.2:1b' };
+
+  test('RATE_LIMIT_RPM rejects a second pull call within the same window with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/models/pull', pullBody), res1);
+        assert.equal(res1._status, 200, 'first pull call should succeed');
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/models/pull', pullBody), res2);
+        assert.equal(res2._status, 429, 'second pull call should be rate-limited');
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('RATE_LIMIT_PER_IP_RPM rejects a second pull call from the same IP with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_PER_IP_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/models/pull', pullBody), res1);
+        assert.equal(res1._status, 200);
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/models/pull', pullBody), res2);
+        assert.equal(res2._status, 429);
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('RATE_LIMIT_PER_KEY_RPM rejects a second pull call from the same key with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_PER_KEY_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/models/pull', pullBody), res1);
+        assert.equal(res1._status, 200);
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('POST', '/v1/models/pull', pullBody), res2);
+        assert.equal(res2._status, 429);
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('pull succeeds normally when no rate limit env vars are set', async () => {
+    const restore = stubFetch();
+    try {
+      const res = mockRes();
+      const { requestHandler } = require('./proxy');
+      await requestHandler(mockReq('POST', '/v1/models/pull', pullBody), res);
+      assert.equal(res._status, 200);
+    } finally { restore(); }
+  });
+});
