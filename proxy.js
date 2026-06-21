@@ -3176,6 +3176,7 @@ a{color:#58a6ff;text-decoration:none;font-size:12px}a:hover{text-decoration:unde
 <script>
 const C=${cfg};
 function fmt(n){return n==null?'—':typeof n==='number'?n.toLocaleString():n}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function ms(n){return n==null?'—':n.toLocaleString()+'&thinsp;ms'}
 function row(l,v,cls){return'<div class="row"><span class="lbl">'+l+'</span><span class="val '+(cls||'')+'">'+v+'</span></div>'}
 function badge(ok,okT,errT){return'<span class="badge '+(ok?'ok':'err')+'">'+(ok?okT:errT)+'</span>'}
@@ -3196,12 +3197,12 @@ async function refresh(){
   if(h&&h.hosts&&h.hosts.length>1){
     h.hosts.forEach(hh=>{
       const ok2=hh.status==='ok';
-      let v=badge(ok2,'OK',hh.error||'Err');
+      let v=badge(ok2,'OK',esc(hh.error||'Err'));
       if(hh.routing==='skipped')v+=' <span class="err" title="repeated failures — skipped by round-robin until it recovers">skipped</span>';
       g+=row(hh.url.replace(/^https?:\\/\\//,''),v);
     });
   } else if(h&&h.ollamaError){
-    g+=row('Error','<span class="err">'+h.ollamaError+'</span>');
+    g+=row('Error','<span class="err">'+esc(h.ollamaError)+'</span>');
   }
   if(h&&h.model_available===false){
     g+=row('Model','<span class="err" title="Run: ollama pull '+C.model+'">'+C.model+' — not pulled ⚠</span>');
@@ -3254,7 +3255,7 @@ async function refresh(){
   g+='<div class="card"><h2>Requests</h2>';
   if(m){
     const routes=Object.entries(m.requests_total||{});
-    if(routes.length){routes.forEach(([k,v])=>g+=row(k,fmt(v)));}
+    if(routes.length){routes.forEach(([k,v])=>g+=row(esc(k),fmt(v)));}
     else g+='<div class="row"><span class="lbl" style="color:#8b949e">No requests yet</span></div>';
     g+=row('Errors (5xx)',m.errors_total?m.errors_total:'0',m.errors_total>0?'err':'ok');
   }
@@ -3300,7 +3301,7 @@ async function refresh(){
     g+='<div class="card"><h2>Model Usage</h2>';
     models.forEach(([model,v],i)=>{
       if(i>0)g+='<div class="sep"></div>';
-      g+='<div style="color:#e6edf3;font-size:12px;font-family:monospace;padding:4px 0">'+model+'</div>';
+      g+='<div style="color:#e6edf3;font-size:12px;font-family:monospace;padding:4px 0">'+esc(model)+'</div>';
       g+=row('Requests',fmt(v.requests));
       g+=row('Tokens in',fmt(v.tokens_in));
       g+=row('Tokens out',fmt(v.tokens_out));
@@ -3316,7 +3317,7 @@ async function refresh(){
     g+='<div class="card"><h2>API Key Usage</h2>';
     apiKeys.forEach(([name,v],i)=>{
       if(i>0)g+='<div class="sep"></div>';
-      g+='<div style="color:#e6edf3;font-size:12px;font-family:monospace;padding:4px 0">'+name+'</div>';
+      g+='<div style="color:#e6edf3;font-size:12px;font-family:monospace;padding:4px 0">'+esc(name)+'</div>';
       g+=row('Requests',fmt(v.requests));
       g+=row('Tokens in',fmt(v.tokens_in));
       g+=row('Tokens out',fmt(v.tokens_out));
@@ -4307,4 +4308,5 @@ module.exports = {
   _apiKeyModels,
   handleModels,
   handleModelById,
+  handleDashboard,
 };

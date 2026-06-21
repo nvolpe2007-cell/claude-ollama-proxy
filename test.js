@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs   = require('fs');
 const os   = require('os');
 const path = require('path');
+const vm   = require('node:vm');
 
 const {
   parseDotEnv,
@@ -67,6 +68,7 @@ const {
   handleEmbeddings,
   validateEncodingFormat,
   embeddingToBase64,
+  handleDashboard,
 } = require('./proxy');
 
 // ── resolveModel ──────────────────────────────────────────────────────────────
@@ -5674,5 +5676,100 @@ describe('rate limiting on POST /v1/models/pull', () => {
       await requestHandler(mockReq('POST', '/v1/models/pull', pullBody), res);
       assert.equal(res._status, 200);
     } finally { restore(); }
+  });
+});
+
+// ── GET / dashboard — client-side script XSS escaping ─────────────────────────
+// handleDashboard() embeds a <script> that fetches /health and /metrics and
+// renders the results into the page via innerHTML. Several fields in those
+// responses originate from attacker-controlled input — e.g. models_usage keys
+// come straight from the client-supplied `model` field (resolveModel() passes
+// unrecognized model names through verbatim), and requests_total keys come
+// from the raw, unvalidated req.url path (recorded for every request,
+// including unauthenticated 404s). These tests run the actual embedded script
+// in a vm sandbox with a mocked DOM/fetch to verify malicious values are
+// HTML-escaped before reaching innerHTML, rather than just asserting the
+// script source contains an esc() call.
+describe('GET / dashboard — XSS escaping', () => {
+  function extractScript() {
+    let captured = '';
+    handleDashboard({}, { writeHead() {}, end(html) { captured = html; } });
+    const match = captured.match(/<script>([\s\S]*?)<\/script>/);
+    assert.ok(match, 'dashboard HTML should contain an embedded <script>');
+    return match[1];
+  }
+
+  // Runs the dashboard's client-side refresh() against mocked /health and
+  // /metrics responses, returning the resulting grid innerHTML.
+  async function renderWithMetrics(metrics) {
+    const scriptSrc = extractScript();
+    const elements = { dot: {}, ts: {}, grid: {} };
+    const sandbox = {
+      document: { getElementById: (id) => elements[id] },
+      fetch: async (url) => {
+        if (url === '/health') return { json: async () => ({ status: 'ok' }) };
+        if (url === '/metrics') return { json: async () => metrics };
+        throw new Error(`unexpected fetch ${url}`);
+      },
+      setInterval: () => {},
+      console, Promise, Date, Object, Math, String,
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(scriptSrc, sandbox);
+    assert.equal(typeof sandbox.refresh, 'function', 'script should expose a top-level refresh()');
+    await sandbox.refresh();
+    return elements.grid.innerHTML;
+  }
+
+  test('escapes a malicious route path key in the Requests card', async () => {
+    const payload = 'GET /<svg onload=alert(2)>';
+    const html = await renderWithMetrics({
+      requests_total: { [payload]: 1 },
+      status_codes: {}, models_usage: {}, api_keys_usage: {},
+    });
+    assert.ok(!html.includes(payload), 'raw payload must not appear unescaped');
+    assert.ok(html.includes('&lt;svg onload=alert(2)&gt;'), 'payload should be HTML-escaped');
+  });
+
+  test('escapes a malicious model name in the Model Usage card', async () => {
+    const payload = '<img src=x onerror=alert(1)>';
+    const html = await renderWithMetrics({
+      requests_total: {}, status_codes: {}, api_keys_usage: {},
+      models_usage: { [payload]: { requests: 1, tokens_in: 1, tokens_out: 1 } },
+    });
+    assert.ok(!html.includes(payload), 'raw payload must not appear unescaped');
+    assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;'), 'payload should be HTML-escaped');
+  });
+
+  test('escapes a malicious Ollama host error message', async () => {
+    const payload = '<script>alert(3)</script>';
+    const scriptSrc = extractScript();
+    const elements = { dot: {}, ts: {}, grid: {} };
+    const sandbox = {
+      document: { getElementById: (id) => elements[id] },
+      fetch: async (url) => {
+        if (url === '/health') return { json: async () => ({ status: 'degraded', ollamaError: payload }) };
+        if (url === '/metrics') return { json: async () => ({ requests_total: {}, status_codes: {}, models_usage: {}, api_keys_usage: {} }) };
+      },
+      setInterval: () => {},
+      console, Promise, Date, Object, Math, String,
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(scriptSrc, sandbox);
+    await sandbox.refresh();
+    const html = elements.grid.innerHTML;
+    assert.ok(!html.includes(payload), 'raw payload must not appear unescaped');
+    assert.ok(html.includes('&lt;script&gt;alert(3)&lt;/script&gt;'), 'payload should be HTML-escaped');
+  });
+
+  test('renders normal metrics without throwing and without escaping artifacts', async () => {
+    const html = await renderWithMetrics({
+      requests_total: { 'GET /health': 5 },
+      status_codes: { '200': 5 },
+      models_usage: { 'qwen2.5:7b': { requests: 5, tokens_in: 100, tokens_out: 200 } },
+      api_keys_usage: {},
+    });
+    assert.ok(html.includes('GET /health'));
+    assert.ok(html.includes('qwen2.5:7b'));
   });
 });
