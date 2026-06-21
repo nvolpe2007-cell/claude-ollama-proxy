@@ -2150,6 +2150,14 @@ async function handlePullModel(req, res) {
 // status: 'in_progress' | 'canceling' | 'ended'
 const _batches = new Map();
 
+// Real Anthropic Message Batches API caps a batch at 100,000 requests. Enforcing the
+// same limit here prevents a single POST /v1/messages/batches call from creating an
+// unbounded in-memory batch — every request's full messages/tools/system payload is
+// retained in `batch.requests` until the batch ends (and longer still if
+// PROXY_BATCH_PERSIST_PATH writes it to disk), so an unbounded array is an easy way
+// for one caller to exhaust proxy memory/disk with a single request.
+const MAX_BATCH_REQUESTS = 100000;
+
 function newBatchId() {
   return 'msgbatch_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
@@ -2459,6 +2467,12 @@ async function handleCreateBatch(req, res) {
   if (!Array.isArray(batchReq.requests) || batchReq.requests.length === 0) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: '`requests` must be a non-empty array' } }));
+    return;
+  }
+
+  if (batchReq.requests.length > MAX_BATCH_REQUESTS) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `\`requests\` must contain at most ${MAX_BATCH_REQUESTS} items (got ${batchReq.requests.length})` } }));
     return;
   }
 
@@ -4281,6 +4295,7 @@ module.exports = {
   saveBatchesToDisk,
   loadBatchesFromDisk,
   PROXY_BATCH_PERSIST_PATH,
+  MAX_BATCH_REQUESTS,
   _batches,
   handleMetricsPrometheus,
   // Rate-limit internals exported for unit testing only.

@@ -63,6 +63,7 @@ const {
   handleGetBatchResults,
   handleCancelBatch,
   handleDeleteBatch,
+  MAX_BATCH_REQUESTS,
   _batches,
   truncateToContext,
   handleEmbeddings,
@@ -5338,6 +5339,56 @@ describe('handleCreateBatch — max_tokens validation', () => {
     await handleCreateBatch(makeReq({ requests: [item] }), res);
     assert.equal(res._status, 400);
     assert.equal(_batches.size, before, 'no batch should be created when max_tokens is invalid');
+  });
+});
+
+describe('handleCreateBatch — requests array size limit', () => {
+  function makeReq(body) {
+    return {
+      headers: {},
+      socket: { remoteAddress: '127.0.0.1' },
+      _apiKeyName: undefined,
+      [Symbol.asyncIterator]: async function* () { yield JSON.stringify(body); },
+    };
+  }
+  function makeRes() {
+    return {
+      _status: null, _body: '', _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(s, h) { this._status = s; if (h) Object.assign(this._headers, h); },
+      write(c) { this._body += c; },
+      end(c = '') { this._body += c; },
+    };
+  }
+
+  test('rejects a batch with more than MAX_BATCH_REQUESTS items, without validating any of them', async () => {
+    const before = _batches.size;
+    // Content doesn't matter — the size check runs before any per-item validation,
+    // so a sparse array of holes (JSON-serialized as `null`s) is enough to prove it.
+    const oversized = new Array(MAX_BATCH_REQUESTS + 1);
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: oversized }), res);
+    assert.equal(res._status, 400);
+    const err = JSON.parse(res._body).error;
+    assert.equal(err.type, 'invalid_request_error');
+    assert.ok(err.message.includes(String(MAX_BATCH_REQUESTS)), 'error message should name the limit');
+    assert.equal(_batches.size, before, 'no batch should be created when the size limit is exceeded');
+  });
+
+  test('a batch with exactly MAX_BATCH_REQUESTS items passes the size check', async () => {
+    // All items intentionally invalid (missing custom_id) so per-item validation
+    // rejects on the very first item instead of validating 100,000 entries — this
+    // still proves the boundary itself (length === MAX_BATCH_REQUESTS) is accepted
+    // past the size check and falls through to the existing per-item validation,
+    // i.e. the comparison is `>`, not `>=`.
+    const atLimit = new Array(MAX_BATCH_REQUESTS).fill({});
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: atLimit }), res);
+    assert.equal(res._status, 400);
+    const err = JSON.parse(res._body).error;
+    assert.ok(err.message.includes('custom_id'), 'should fail on the existing custom_id check, not the size limit');
+    assert.ok(!err.message.includes('must contain at most'), 'size limit should not fire exactly at the boundary');
   });
 });
 

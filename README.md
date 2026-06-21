@@ -378,6 +378,7 @@ curl -X DELETE http://localhost:4000/v1/messages/batches/msgbatch_xxx -H 'x-api-
 ```
 
 Notes:
+- A batch may contain at most 100,000 requests (matching the real Anthropic API's limit); a larger `requests` array is rejected with `400 invalid_request_error` at creation time.
 - Batches expire 24 hours after creation; unprocessed items are marked `expired`. Ended batches are removed from memory after 1 hour.
 - Each batch item respects `PROXY_MAX_CONCURRENCY` and competes fairly with real-time requests.
 - `DELETE /v1/messages/batches/{id}` only succeeds once a batch has `processing_status: "ended"` (matching the real Anthropic API); an in-progress or canceling batch must be canceled first and allowed to finish before it can be deleted. Returns `{"id":"msgbatch_xxx","type":"message_batch_deleted"}`.
