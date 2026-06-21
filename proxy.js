@@ -4027,6 +4027,9 @@ async function requestHandler(req, res) {
       await handleModelById(req, res, decodeURIComponent(path.slice('/v1/models/'.length)));
     } else if (req.method === 'DELETE' && path.startsWith('/v1/models/')) {
       if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       await handleDeleteModel(req, res, decodeURIComponent(path.slice('/v1/models/'.length)));
     } else if (req.method === 'POST' && path === '/v1/models/pull') {
       if (!checkAuth(req, res)) return;
