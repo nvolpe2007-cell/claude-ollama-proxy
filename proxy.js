@@ -578,11 +578,22 @@ function validateTools(tools) {
 // must be a string or an array of content blocks. injectSystemPrompt() spreads non-string
 // values (`...system`) when PROXY_SYSTEM_PROMPT is set, so a non-array, non-string,
 // truthy value (number, boolean, object) would throw a TypeError that surfaces as an
-// opaque 500 internal_error instead of a clear 400. Returns { error } when invalid, or
-// {} when system is absent/null or a valid string/array. Exported for unit testing.
+// opaque 500 internal_error instead of a clear 400. toOpenAIMessages() also reads
+// `.type`/`.text` off each array element unguarded, so a malformed element (e.g. `null`)
+// needs the same per-element check already applied to `messages` content blocks.
+// Returns { error } when invalid, or {} when system is absent/null or a valid string/array
+// of well-formed blocks. Exported for unit testing.
 function validateSystemField(system) {
   if (system === undefined || system === null) return {};
-  if (typeof system === 'string' || Array.isArray(system)) return {};
+  if (typeof system === 'string') return {};
+  if (Array.isArray(system)) {
+    for (const block of system) {
+      if (!block || typeof block !== 'object' || Array.isArray(block) || typeof block.type !== 'string') {
+        return { error: 'each item in `system` must be an object with a string `type`' };
+      }
+    }
+    return {};
+  }
   return { error: '`system` must be a string or an array of content blocks' };
 }
 

@@ -207,6 +207,13 @@ describe('validateSystemField', () => {
     assert.match(validateSystemField(true).error, /must be a string or an array/);
     assert.match(validateSystemField({ type: 'text', text: 'be concise' }).error, /must be a string or an array/);
   });
+
+  test('rejects a malformed element inside a system array that would crash toOpenAIMessages', () => {
+    assert.match(validateSystemField([null]).error, /each item in `system`/);
+    assert.match(validateSystemField(['be concise']).error, /each item in `system`/);
+    assert.match(validateSystemField([{ text: 'no type field' }]).error, /each item in `system`/);
+    assert.match(validateSystemField([{ type: 'text', text: 'ok' }, null]).error, /each item in `system`/);
+  });
 });
 
 // ── validateMessages ─────────────────────────────────────────────────────────
