@@ -452,9 +452,26 @@ const _metrics = {
 // Queue of { onGranted } entries waiting for a concurrency slot.
 const _concurrencyQueue = [];
 
+// recordRequest runs on every request via the `finish` listener registered before
+// checkAuth() (see requestHandler), so `path` is raw, unauthenticated, attacker-controlled
+// req.url. Without a cap, a caller with no API key at all could flood unique paths
+// (`/a`, `/b`, `/c`, ...) and grow `_metrics.requests` without bound for the life of the
+// process — the same unbounded-growth bug class as MAX_BATCH_REQUESTS above, just on the
+// metrics store instead of the batch store. Capping distinct keys and bucketing the rest
+// under a per-method overflow key keeps memory and /metrics response size bounded; the
+// real route table is a small fixed set so this never triggers in normal operation.
+const MAX_METRICS_PATH_KEYS = 200;
+
 function recordRequest(method, path, status, ms) {
   const k = `${method} ${path}`;
-  _metrics.requests[k] = (_metrics.requests[k] || 0) + 1;
+  if (_metrics.requests[k] !== undefined) {
+    _metrics.requests[k]++;
+  } else if (Object.keys(_metrics.requests).length < MAX_METRICS_PATH_KEYS) {
+    _metrics.requests[k] = 1;
+  } else {
+    const overflowKey = `${method} (other)`;
+    _metrics.requests[overflowKey] = (_metrics.requests[overflowKey] || 0) + 1;
+  }
   const s = String(status);
   _metrics.statusCodes[s] = (_metrics.statusCodes[s] || 0) + 1;
   if (status >= 500) _metrics.errors++;
@@ -4330,6 +4347,8 @@ module.exports = {
   trackActiveLlmRequest,
   _concurrencyQueue,
   _metrics,
+  recordRequest,
+  MAX_METRICS_PATH_KEYS,
   recordTokens,
   // Auth internals exported for unit testing only.
   checkAuth,

@@ -46,6 +46,8 @@ const {
   isModelVisibleToCaller,
   _apiKeyModels,
   recordTokens,
+  recordRequest,
+  MAX_METRICS_PATH_KEYS,
   checkConcurrency,
   trackActiveLlmRequest,
   _metrics,
@@ -1560,6 +1562,53 @@ describe('recordTokens', () => {
     const before = Object.keys(_metrics.apiKeysUsed).length;
     recordTokens(10, 5, 'qwen2.5:7b');
     assert.equal(Object.keys(_metrics.apiKeysUsed).length, before);
+  });
+});
+
+// ── recordRequest — _metrics.requests cardinality cap ─────────────────────────
+// recordRequest runs for every request, including unauthenticated ones (the `finish`
+// listener fires before checkAuth()), so an attacker who never sends a valid API key can
+// still drive it with an arbitrary number of distinct paths. Without a cap this grows
+// _metrics.requests (and GET /metrics/GET /metrics/prometheus response size) without bound.
+describe('recordRequest — _metrics.requests cardinality cap', () => {
+  test('caps the number of distinct path keys and buckets overflow under "(other)"', () => {
+    Object.keys(_metrics.requests).forEach(k => delete _metrics.requests[k]);
+
+    for (let i = 0; i < MAX_METRICS_PATH_KEYS + 50; i++) {
+      recordRequest('GET', `/attacker-path-${i}`, 404, 1);
+    }
+
+    const keys = Object.keys(_metrics.requests);
+    assert.ok(keys.length <= MAX_METRICS_PATH_KEYS + 1,
+      `expected at most ${MAX_METRICS_PATH_KEYS + 1} distinct keys (cap + overflow bucket), got ${keys.length}`);
+    assert.equal(_metrics.requests['GET (other)'], 50,
+      'the 50 paths beyond the cap should all be counted under the overflow bucket');
+  });
+
+  test('does not bucket a path already seen before the cap was reached', () => {
+    Object.keys(_metrics.requests).forEach(k => delete _metrics.requests[k]);
+
+    recordRequest('GET', '/health', 200, 1);
+    for (let i = 0; i < MAX_METRICS_PATH_KEYS + 10; i++) {
+      recordRequest('GET', `/flood-${i}`, 404, 1);
+    }
+    recordRequest('GET', '/health', 200, 1);
+
+    assert.equal(_metrics.requests['GET /health'], 2,
+      'a path recorded before the cap was reached keeps incrementing its own key');
+  });
+
+  test('still records status codes and latencies while a path is bucketed as overflow', () => {
+    Object.keys(_metrics.requests).forEach(k => delete _metrics.requests[k]);
+    const statusBefore = JSON.parse(JSON.stringify(_metrics.statusCodes));
+    const latLenBefore = _metrics.latencies.length;
+
+    for (let i = 0; i < MAX_METRICS_PATH_KEYS + 1; i++) {
+      recordRequest('GET', `/flood-${i}`, 404, 7);
+    }
+
+    assert.equal(_metrics.statusCodes['404'], (statusBefore['404'] || 0) + MAX_METRICS_PATH_KEYS + 1);
+    assert.equal(_metrics.latencies.length, Math.min(1000, latLenBefore + MAX_METRICS_PATH_KEYS + 1));
   });
 });
 
