@@ -2510,6 +2510,11 @@ async function handleCreateBatch(req, res) {
   }
 
   for (const r of batchReq.requests) {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Each item in `requests` must be an object' } }));
+      return;
+    }
     if (!r.custom_id || typeof r.custom_id !== 'string') {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Each request must have a string `custom_id`' } }));

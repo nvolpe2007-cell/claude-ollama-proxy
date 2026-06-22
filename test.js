@@ -5486,6 +5486,60 @@ describe('handleCreateBatch — requests array size limit', () => {
   });
 });
 
+describe('handleCreateBatch — malformed requests array entries', () => {
+  function makeReq(body) {
+    return {
+      headers: {},
+      socket: { remoteAddress: '127.0.0.1' },
+      _apiKeyName: undefined,
+      [Symbol.asyncIterator]: async function* () { yield JSON.stringify(body); },
+    };
+  }
+  function makeRes() {
+    return {
+      _status: null, _body: '', _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(s, h) { this._status = s; if (h) Object.assign(this._headers, h); },
+      write(c) { this._body += c; },
+      end(c = '') { this._body += c; },
+    };
+  }
+
+  test('rejects a `null` entry in requests with 400 instead of crashing with 500', async () => {
+    const before = _batches.size;
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: [null] }), res);
+    assert.equal(res._status, 400);
+    const err = JSON.parse(res._body).error;
+    assert.equal(err.type, 'invalid_request_error');
+    assert.equal(_batches.size, before, 'no batch should be created for a malformed entry');
+  });
+
+  test('rejects a non-object (string) entry in requests with 400', async () => {
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: ['not-an-object'] }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('rejects an array entry in requests with 400', async () => {
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: [[]] }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+
+  test('a valid entry after a malformed one never gets processed', async () => {
+    const before = _batches.size;
+    const validItem = { custom_id: 'r1', params: { messages: [{ role: 'user', content: 'hi' }], model: 'test', max_tokens: 10 } };
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: [null, validItem] }), res);
+    assert.equal(res._status, 400);
+    assert.equal(_batches.size, before, 'the whole batch should be rejected, not partially created');
+  });
+});
+
 // ── readBody failure cleanup ────────────────────────────────────────────────────
 // handleMessages, handleOpenAIChat, handleOpenAICompletions, and handleEmbeddings all
 // register a PROXY_TIMEOUT timer and a socket 'close' listener *before* calling
