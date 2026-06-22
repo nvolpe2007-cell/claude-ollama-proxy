@@ -708,6 +708,14 @@ function truncateToContext(messages, maxInputTokens) {
   return { messages: sysMsg ? [sysMsg, ...history] : history, droppedCount };
 }
 
+// Content block types toOpenAIMessages() knows how to convert. Anything else (e.g.
+// `redacted_thinking`, `server_tool_use`, `web_search_tool_result`, or any block type
+// added to the Anthropic API after this proxy's release) falls back to its `text` field
+// when present, and is otherwise dropped — either way a [content-block] warning is logged
+// so operators can see that a round-tripped conversation lost fidelity instead of it
+// happening silently.
+const KNOWN_CONTENT_BLOCK_TYPES = new Set(['text', 'image', 'tool_use', 'tool_result', 'thinking', 'document']);
+
 // Anthropic messages/tools → OpenAI format
 function toOpenAIMessages(messages, system) {
   const result = [];
@@ -724,9 +732,17 @@ function toOpenAIMessages(messages, system) {
     }
 
     const blocks = Array.isArray(msg.content) ? msg.content : [];
+    for (const b of blocks) {
+      if (!KNOWN_CONTENT_BLOCK_TYPES.has(b.type)) {
+        const hasTextFallback = typeof b.text === 'string';
+        console.warn(`[content-block] dropping unsupported content block type '${b.type}' from a ${msg.role} message${hasTextFallback ? ' (kept its text field)' : ''}`);
+      }
+    }
     const toolResults = blocks.filter(b => b.type === 'tool_result');
     const toolUses = blocks.filter(b => b.type === 'tool_use');
-    const textParts = blocks.filter(b => b.type === 'text');
+    // Unknown block types with a string `text` field (a common forward-compat shape)
+    // fall back to that text instead of vanishing entirely.
+    const textParts = blocks.filter(b => b.type === 'text' || (!KNOWN_CONTENT_BLOCK_TYPES.has(b.type) && typeof b.text === 'string'));
 
     if (toolResults.length > 0) {
       // tool result messages become role:tool in OpenAI

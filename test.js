@@ -743,6 +743,51 @@ describe('toOpenAIMessages', () => {
     assert.equal(result[1].role, 'user');
     assert.equal(result[2].role, 'assistant');
   });
+
+  test('drops unknown content block type and warns', () => {
+    const orig = console.warn;
+    const warns = [];
+    console.warn = (...a) => warns.push(a.join(' '));
+    const messages = [{
+      role: 'assistant',
+      content: [{ type: 'redacted_thinking', data: 'opaque-blob' }],
+    }];
+    let result;
+    try { result = toOpenAIMessages(messages, null); } finally { console.warn = orig; }
+    assert.equal(result[0].content, '');
+    assert.ok(warns.some(w => w.includes('redacted_thinking')));
+  });
+
+  test('falls back to text field of an unknown content block type', () => {
+    const orig = console.warn;
+    const warns = [];
+    console.warn = (...a) => warns.push(a.join(' '));
+    const messages = [{
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'known: ' },
+        { type: 'server_tool_use', text: 'unknown-but-has-text' },
+      ],
+    }];
+    let result;
+    try { result = toOpenAIMessages(messages, null); } finally { console.warn = orig; }
+    assert.equal(result[0].content, 'known: unknown-but-has-text');
+    assert.ok(warns.some(w => w.includes('server_tool_use') && w.includes('kept its text field')));
+  });
+
+  test('unknown content block in a tool_result turn still surfaces via text fallback', () => {
+    const messages = [{
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' },
+        { type: 'web_search_tool_result', text: 'search summary' },
+      ],
+    }];
+    const result = toOpenAIMessages(messages, null);
+    assert.equal(result[0].role, 'tool');
+    assert.equal(result[1].role, 'user');
+    assert.equal(result[1].content, 'search summary');
+  });
 });
 
 // ── logRequest ────────────────────────────────────────────────────────────────
