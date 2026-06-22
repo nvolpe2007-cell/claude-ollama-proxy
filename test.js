@@ -6000,6 +6000,125 @@ describe('rate limiting on DELETE /v1/models/:id', () => {
   });
 });
 
+// Batch creation (POST /v1/messages/batches) already enforces all three rate limits, but the
+// management endpoints that read or mutate an existing batch — list, get, results, cancel,
+// delete — previously went straight from checkAuth() to their handler with no checkRateLimit()
+// calls at all, the same gap class already closed for POST /v1/models/pull and
+// DELETE /v1/models/:id. A caller could repeatedly poll/cancel/delete batches with no budget,
+// unlike every other authenticated route. These run against a nonexistent batch id on purpose:
+// the point is that the *rate limiter* rejects the second call before the handler ever runs
+// (it would otherwise return 404), exactly mirroring how the pull/delete-model tests above
+// don't need real Ollama state either.
+describe('rate limiting on batch management endpoints (list/get/results/cancel/delete)', () => {
+  function withProxyEnv(envOverrides, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    const savedEnv = {};
+    for (const k of Object.keys(envOverrides)) savedEnv[k] = process.env[k];
+    let freshProxy;
+    try {
+      for (const [k, v] of Object.entries(envOverrides)) process.env[k] = v;
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v !== undefined) process.env[k] = v;
+        else delete process.env[k];
+      }
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  function mockReq(method, path) {
+    return {
+      method,
+      url: path,
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1', encrypted: false },
+      [Symbol.asyncIterator]: async function* () {},
+    };
+  }
+
+  function mockRes() {
+    const listeners = {};
+    return {
+      headersSent: false,
+      writableEnded: false,
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k.toLowerCase()] = v; },
+      getHeader(k) { return this._headers[k.toLowerCase()]; },
+      writeHead(status) { this._status = status; this.headersSent = true; },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; if (listeners.finish) listeners.finish(); },
+      on(event, fn) { listeners[event] = fn; },
+      once(event, fn) { listeners[event] = fn; },
+      off() {},
+    };
+  }
+
+  const endpoints = [
+    { label: 'GET /v1/messages/batches (list)',      method: 'GET',    path: '/v1/messages/batches' },
+    { label: 'GET /v1/messages/batches/:id',         method: 'GET',    path: '/v1/messages/batches/batch_nonexistent' },
+    { label: 'GET /v1/messages/batches/:id/results', method: 'GET',    path: '/v1/messages/batches/batch_nonexistent/results' },
+    { label: 'POST /v1/messages/batches/:id/cancel', method: 'POST',   path: '/v1/messages/batches/batch_nonexistent/cancel' },
+    { label: 'DELETE /v1/messages/batches/:id',      method: 'DELETE', path: '/v1/messages/batches/batch_nonexistent' },
+  ];
+
+  for (const { label, method, path } of endpoints) {
+    describe(label, () => {
+      test('RATE_LIMIT_RPM rejects a second call within the same window with 429', async () => {
+        await withProxyEnv({ RATE_LIMIT_RPM: '1' }, async (m) => {
+          const res1 = mockRes();
+          await m.requestHandler(mockReq(method, path), res1);
+          assert.notEqual(res1._status, 429, 'first call should not be rate-limited');
+
+          const res2 = mockRes();
+          await m.requestHandler(mockReq(method, path), res2);
+          assert.equal(res2._status, 429, 'second call should be rate-limited');
+          assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+        });
+      });
+
+      test('RATE_LIMIT_PER_IP_RPM rejects a second call from the same IP with 429', async () => {
+        await withProxyEnv({ RATE_LIMIT_PER_IP_RPM: '1' }, async (m) => {
+          const res1 = mockRes();
+          await m.requestHandler(mockReq(method, path), res1);
+          assert.notEqual(res1._status, 429);
+
+          const res2 = mockRes();
+          await m.requestHandler(mockReq(method, path), res2);
+          assert.equal(res2._status, 429);
+          assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+        });
+      });
+
+      test('RATE_LIMIT_PER_KEY_RPM rejects a second call from the same key with 429', async () => {
+        await withProxyEnv({ RATE_LIMIT_PER_KEY_RPM: '1' }, async (m) => {
+          const res1 = mockRes();
+          await m.requestHandler(mockReq(method, path), res1);
+          assert.notEqual(res1._status, 429);
+
+          const res2 = mockRes();
+          await m.requestHandler(mockReq(method, path), res2);
+          assert.equal(res2._status, 429);
+          assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+        });
+      });
+
+      test('proceeds normally (not rate-limited) when no rate limit env vars are set', async () => {
+        const res = mockRes();
+        const { requestHandler } = require('./proxy');
+        await requestHandler(mockReq(method, path), res);
+        assert.notEqual(res._status, 429);
+      });
+    });
+  }
+});
+
 // ── GET / dashboard — client-side script XSS escaping ─────────────────────────
 // handleDashboard() embeds a <script> that fetches /health and /metrics and
 // renders the results into the page via innerHTML. Several fields in those
