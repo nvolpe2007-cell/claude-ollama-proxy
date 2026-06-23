@@ -3158,6 +3158,7 @@ async function handleMetricsPrometheus(req, res) {
 // Self-contained: zero external deps, polls /health + /metrics every 5 s.
 // Static config (model, port, hosts, etc.) is embedded server-side for instant display.
 function handleDashboard(req, res) {
+  const nonce = crypto.randomBytes(16).toString('base64');
   const cfg = JSON.stringify({
     model:              MODEL,
     version:            PROXY_VERSION,
@@ -3225,7 +3226,7 @@ a{color:#58a6ff;text-decoration:none;font-size:12px}a:hover{text-decoration:unde
 <h1><span class="dot" id="dot"></span>Claude-Ollama Proxy</h1>
 <div class="ts" id="ts">Loading…</div>
 <div class="grid" id="grid"></div>
-<script>
+<script nonce="${nonce}">
 const C=${cfg};
 function fmt(n){return n==null?'—':typeof n==='number'?n.toLocaleString():n}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -3385,7 +3386,12 @@ setInterval(refresh,5000);
 </body>
 </html>`;
 
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Security-Policy': `default-src 'self'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
+    'X-Frame-Options': 'DENY',
+    'X-Content-Type-Options': 'nosniff',
+  });
   res.end(html);
 }
 
