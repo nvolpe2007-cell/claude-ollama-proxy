@@ -16,6 +16,7 @@ const {
   resolveMaxTokens,
   validateModelField,
   validateTools,
+  validateToolChoice,
   validateSystemField,
   validateMessages,
   PROXY_HARD_MAX_TOKENS,
@@ -153,6 +154,52 @@ describe('validateTools', () => {
     assert.match(validateTools([{}]).error, /non-empty string `name`/);
     assert.match(validateTools([{ name: '' }]).error, /non-empty string `name`/);
     assert.match(validateTools([{ name: 123 }]).error, /non-empty string `name`/);
+  });
+});
+
+// ── validateToolChoice ────────────────────────────────────────────────────────
+
+describe('validateToolChoice', () => {
+  const TOOLS = [
+    { name: 'get_weather', description: 'Get weather', input_schema: { type: 'object' } },
+  ];
+
+  test('accepts absent or null tool_choice', () => {
+    assert.deepEqual(validateToolChoice(undefined, TOOLS), {});
+    assert.deepEqual(validateToolChoice(null, TOOLS), {});
+  });
+
+  test('accepts well-formed auto/any/none', () => {
+    assert.deepEqual(validateToolChoice({ type: 'auto' }, TOOLS), {});
+    assert.deepEqual(validateToolChoice({ type: 'any' }, TOOLS), {});
+    assert.deepEqual(validateToolChoice({ type: 'none' }, TOOLS), {});
+  });
+
+  test('accepts a tool choice matching a declared tool', () => {
+    assert.deepEqual(validateToolChoice({ type: 'tool', name: 'get_weather' }, TOOLS), {});
+  });
+
+  test('rejects a non-object tool_choice', () => {
+    assert.match(validateToolChoice('auto', TOOLS).error, /must be an object with a string `type`/);
+    assert.match(validateToolChoice(42, TOOLS).error, /must be an object with a string `type`/);
+    assert.match(validateToolChoice([], TOOLS).error, /must be an object with a string `type`/);
+    assert.match(validateToolChoice({}, TOOLS).error, /must be an object with a string `type`/);
+  });
+
+  test('rejects an unrecognized type', () => {
+    assert.match(validateToolChoice({ type: 'sometimes' }, TOOLS).error, /must be one of "auto", "any", "tool", "none"/);
+  });
+
+  test('rejects type:"tool" with missing or empty name', () => {
+    assert.match(validateToolChoice({ type: 'tool' }, TOOLS).error, /non-empty string/);
+    assert.match(validateToolChoice({ type: 'tool', name: '' }, TOOLS).error, /non-empty string/);
+    assert.match(validateToolChoice({ type: 'tool', name: 123 }, TOOLS).error, /non-empty string/);
+  });
+
+  test('rejects type:"tool" naming a tool not in tools', () => {
+    assert.match(validateToolChoice({ type: 'tool', name: 'get_stock_price' }, TOOLS).error, /does not match any tool/);
+    assert.match(validateToolChoice({ type: 'tool', name: 'get_weather' }, undefined).error, /does not match any tool/);
+    assert.match(validateToolChoice({ type: 'tool', name: 'get_weather' }, []).error, /does not match any tool/);
   });
 });
 
@@ -3672,6 +3719,70 @@ describe('handleMessages — max_tokens validation', () => {
   });
 });
 
+// ── handleMessages — tool_choice validation ───────────────────────────────────
+
+describe('handleMessages — tool_choice validation', () => {
+  const { handleMessages } = require('./proxy');
+
+  function mockReq(body) {
+    return {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST', url: '/v1/messages',
+      [Symbol.asyncIterator]: async function* () { yield JSON.stringify(body); },
+    };
+  }
+  function mockRes() {
+    const res = {
+      headersSent: false, writableEnded: false,
+      _status: null, _body: '', _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(s) { this._status = s; this.headersSent = true; },
+      write(c) { this._body += c; },
+      end(c = '') { this._body += c; this.writableEnded = true; },
+      on() {},
+    };
+    return res;
+  }
+
+  test('400 when tool_choice has an unrecognized type', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({
+      messages: [{ role: 'user', content: 'hi' }],
+      tool_choice: { type: 'sometimes' },
+    }), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /tool_choice/);
+  });
+
+  test('400 when tool_choice:{type:"tool"} names a tool absent from tools', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ name: 'get_weather', input_schema: { type: 'object' } }],
+      tool_choice: { type: 'tool', name: 'get_stock_price' },
+    }), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /does not match any tool/);
+  });
+
+  test('400 when tool_choice:{type:"tool"} is missing name', async () => {
+    const res = mockRes();
+    await handleMessages(mockReq({
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ name: 'get_weather', input_schema: { type: 'object' } }],
+      tool_choice: { type: 'tool' },
+    }), res);
+    assert.equal(res._status, 400);
+    assert.equal(JSON.parse(res._body).error.type, 'invalid_request_error');
+  });
+});
+
 // ── PROXY_IDLE_TIMEOUT ────────────────────────────────────────────────────────
 
 describe('PROXY_IDLE_TIMEOUT — idle stream timeout', () => {
@@ -5433,6 +5544,85 @@ describe('handleCreateBatch — max_tokens validation', () => {
     await handleCreateBatch(makeReq({ requests: [item] }), res);
     assert.equal(res._status, 400);
     assert.equal(_batches.size, before, 'no batch should be created when max_tokens is invalid');
+  });
+});
+
+// ── handleCreateBatch — tool_choice validation ────────────────────────────────
+describe('handleCreateBatch — tool_choice validation', () => {
+  function makeReq(body) {
+    return {
+      headers: {},
+      socket: { remoteAddress: '127.0.0.1' },
+      _apiKeyName: undefined,
+      [Symbol.asyncIterator]: async function* () { yield JSON.stringify(body); },
+    };
+  }
+  function makeRes() {
+    return {
+      _status: null, _body: '', _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(s, h) { this._status = s; if (h) Object.assign(this._headers, h); },
+      write(c) { this._body += c; },
+      end(c = '') { this._body += c; },
+    };
+  }
+
+  test('rejects a batch item with an unrecognized tool_choice.type at creation time', async () => {
+    const item = {
+      custom_id: 'bad-tc',
+      params: { messages: [{ role: 'user', content: 'hi' }], model: 'test', tool_choice: { type: 'sometimes' } },
+    };
+    const before = _batches.size;
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: [item] }), res);
+    assert.equal(res._status, 400);
+    const err = JSON.parse(res._body).error;
+    assert.equal(err.type, 'invalid_request_error');
+    assert.ok(err.message.includes('bad-tc'), 'error message should reference the bad custom_id');
+    assert.match(err.message, /tool_choice/);
+    assert.equal(_batches.size, before, 'no batch should be created when tool_choice is invalid');
+  });
+
+  test('rejects a batch item whose tool_choice names a tool absent from tools', async () => {
+    const item = {
+      custom_id: 'dangling-tc',
+      params: {
+        messages: [{ role: 'user', content: 'hi' }],
+        model: 'test',
+        tools: [{ name: 'get_weather', input_schema: { type: 'object' } }],
+        tool_choice: { type: 'tool', name: 'get_stock_price' },
+      },
+    };
+    const res = makeRes();
+    await handleCreateBatch(makeReq({ requests: [item] }), res);
+    assert.equal(res._status, 400);
+    const err = JSON.parse(res._body).error;
+    assert.equal(err.type, 'invalid_request_error');
+    assert.match(err.message, /does not match any tool/);
+  });
+
+  test('accepts a batch item with a valid tool_choice', async () => {
+    const orig = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'hi' } }] }), text: async () => '{}', body: null });
+    try {
+      const item = {
+        custom_id: 'ok-tc',
+        params: {
+          messages: [{ role: 'user', content: 'hi' }],
+          model: 'test',
+          tools: [{ name: 'get_weather', input_schema: { type: 'object' } }],
+          tool_choice: { type: 'tool', name: 'get_weather' },
+        },
+      };
+      const res = makeRes();
+      await handleCreateBatch(makeReq({ requests: [item] }), res);
+      assert.equal(res._status, 200);
+      const batch = JSON.parse(res._body);
+      _batches.delete(batch.id);
+    } finally {
+      global.fetch = orig;
+    }
   });
 });
 
