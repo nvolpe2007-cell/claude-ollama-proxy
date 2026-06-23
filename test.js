@@ -6000,6 +6000,248 @@ describe('rate limiting on DELETE /v1/models/:id', () => {
   });
 });
 
+describe('rate limiting on GET /v1/models', () => {
+  function withProxyEnv(envOverrides, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    const savedEnv = {};
+    for (const k of Object.keys(envOverrides)) savedEnv[k] = process.env[k];
+    let freshProxy;
+    try {
+      for (const [k, v] of Object.entries(envOverrides)) process.env[k] = v;
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v !== undefined) process.env[k] = v;
+        else delete process.env[k];
+      }
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  function mockReq(method, path) {
+    return {
+      method,
+      url: path,
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1', encrypted: false },
+      [Symbol.asyncIterator]: async function* () {},
+    };
+  }
+
+  function mockRes() {
+    const listeners = {};
+    return {
+      headersSent: false,
+      writableEnded: false,
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k.toLowerCase()] = v; },
+      getHeader(k) { return this._headers[k.toLowerCase()]; },
+      writeHead(status) { this._status = status; this.headersSent = true; },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; if (listeners.finish) listeners.finish(); },
+      on(event, fn) { listeners[event] = fn; },
+      once(event, fn) { listeners[event] = fn; },
+      off() {},
+    };
+  }
+
+  function stubFetch() {
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      json: async () => ({ models: [{ name: 'llama3.2:1b', modified_at: '2024-01-01T00:00:00Z', size: 1, details: {} }] }),
+      text: async () => '{}',
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  test('RATE_LIMIT_RPM rejects a second models-list call within the same window with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('GET', '/v1/models'), res1);
+        assert.equal(res1._status, 200, 'first call should succeed');
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('GET', '/v1/models'), res2);
+        assert.equal(res2._status, 429, 'second call should be rate-limited');
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('RATE_LIMIT_PER_IP_RPM rejects a second models-list call from the same IP with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_PER_IP_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('GET', '/v1/models'), res1);
+        assert.equal(res1._status, 200);
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('GET', '/v1/models'), res2);
+        assert.equal(res2._status, 429);
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('RATE_LIMIT_PER_KEY_RPM rejects a second models-list call from the same key with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_PER_KEY_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('GET', '/v1/models'), res1);
+        assert.equal(res1._status, 200);
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('GET', '/v1/models'), res2);
+        assert.equal(res2._status, 429);
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('models list succeeds normally when no rate limit env vars are set', async () => {
+    const restore = stubFetch();
+    try {
+      const res = mockRes();
+      const { requestHandler } = require('./proxy');
+      await requestHandler(mockReq('GET', '/v1/models'), res);
+      assert.equal(res._status, 200);
+    } finally { restore(); }
+  });
+});
+
+describe('rate limiting on GET /v1/models/:id', () => {
+  function withProxyEnv(envOverrides, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    const savedEnv = {};
+    for (const k of Object.keys(envOverrides)) savedEnv[k] = process.env[k];
+    let freshProxy;
+    try {
+      for (const [k, v] of Object.entries(envOverrides)) process.env[k] = v;
+      delete require.cache[modKey];
+      freshProxy = require('./proxy');
+    } finally {
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v !== undefined) process.env[k] = v;
+        else delete process.env[k];
+      }
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+    return fn(freshProxy);
+  }
+
+  function mockReq(method, path) {
+    return {
+      method,
+      url: path,
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1', encrypted: false },
+      [Symbol.asyncIterator]: async function* () {},
+    };
+  }
+
+  function mockRes() {
+    const listeners = {};
+    return {
+      headersSent: false,
+      writableEnded: false,
+      _status: null,
+      _body: '',
+      _headers: {},
+      setHeader(k, v) { this._headers[k.toLowerCase()] = v; },
+      getHeader(k) { return this._headers[k.toLowerCase()]; },
+      writeHead(status) { this._status = status; this.headersSent = true; },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; if (listeners.finish) listeners.finish(); },
+      on(event, fn) { listeners[event] = fn; },
+      once(event, fn) { listeners[event] = fn; },
+      off() {},
+    };
+  }
+
+  function stubFetch() {
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      json: async () => ({ models: [{ name: 'llama3.2:1b', modified_at: '2024-01-01T00:00:00Z', size: 1, details: {} }] }),
+      text: async () => '{}',
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  const modelPath = '/v1/models/llama3.2:1b';
+
+  test('RATE_LIMIT_RPM rejects a second model-lookup call within the same window with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('GET', modelPath), res1);
+        assert.equal(res1._status, 200, 'first call should succeed');
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('GET', modelPath), res2);
+        assert.equal(res2._status, 429, 'second call should be rate-limited');
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('RATE_LIMIT_PER_IP_RPM rejects a second model-lookup call from the same IP with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_PER_IP_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('GET', modelPath), res1);
+        assert.equal(res1._status, 200);
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('GET', modelPath), res2);
+        assert.equal(res2._status, 429);
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('RATE_LIMIT_PER_KEY_RPM rejects a second model-lookup call from the same key with 429', async () => {
+    const restore = stubFetch();
+    try {
+      await withProxyEnv({ RATE_LIMIT_PER_KEY_RPM: '1' }, async (m) => {
+        const res1 = mockRes();
+        await m.requestHandler(mockReq('GET', modelPath), res1);
+        assert.equal(res1._status, 200);
+
+        const res2 = mockRes();
+        await m.requestHandler(mockReq('GET', modelPath), res2);
+        assert.equal(res2._status, 429);
+        assert.equal(JSON.parse(res2._body).error.type, 'rate_limit_error');
+      });
+    } finally { restore(); }
+  });
+
+  test('model lookup succeeds normally when no rate limit env vars are set', async () => {
+    const restore = stubFetch();
+    try {
+      const res = mockRes();
+      const { requestHandler } = require('./proxy');
+      await requestHandler(mockReq('GET', modelPath), res);
+      assert.equal(res._status, 200);
+    } finally { restore(); }
+  });
+});
+
 // ── GET / dashboard — client-side script XSS escaping ─────────────────────────
 // handleDashboard() embeds a <script> that fetches /health and /metrics and
 // renders the results into the page via innerHTML. Several fields in those
