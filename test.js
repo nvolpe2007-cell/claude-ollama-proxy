@@ -2951,6 +2951,30 @@ describe('handleMessages', () => {
     } finally { console.warn = origWarn; restore(); }
   });
 
+  test('non-streaming: tool_call missing "function" field degrades to empty name/input instead of crashing', async () => {
+    const restore = stubFetch({
+      choices: [{
+        message: { content: null, tool_calls: [{ id: 'call_1' }] },
+        finish_reason: 'tool_calls',
+      }],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    });
+    const origWarn = console.warn;
+    const warns = [];
+    console.warn = (...a) => warns.push(a.join(' '));
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Weather?' }], stream: false }), res);
+      assert.equal(res._status, 200, 'should not crash into a 500');
+      const body = JSON.parse(res._body);
+      const tu = body.content.find(c => c.type === 'tool_use');
+      assert.ok(tu, 'should have tool_use block');
+      assert.equal(tu.name, '');
+      assert.deepEqual(tu.input, {});
+      assert.ok(warns.some(w => w.includes('[tool-call]') && w.includes('missing')));
+    } finally { console.warn = origWarn; restore(); }
+  });
+
   test('non-streaming: Ollama 404 (unknown model) proxied as 404 not_found_error', async () => {
     const restore = stubFetchError(404, '{"error":"model \'xyz\' not found, try pulling it first"}');
     try {
@@ -3237,6 +3261,28 @@ describe('handleMessages', () => {
       // stop_reason must be tool_use
       const delta = events.find(e => e.event === 'message_delta');
       assert.equal(delta.data.delta.stop_reason, 'tool_use');
+    } finally { restore(); }
+  });
+
+  test('streaming: parallel tool calls get contiguous content block indices', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_weather","arguments":""}},{"index":1,"id":"call_b","type":"function","function":{"name":"get_time","arguments":""}}]},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}},{"index":1,"function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":10}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Weather and time?' }], stream: true }), res);
+      const events = parseSse(res._body);
+
+      const toolStarts = events.filter(e =>
+        e.event === 'content_block_start' && e.data.content_block?.type === 'tool_use'
+      );
+      assert.equal(toolStarts.length, 2, 'should have two tool_use content_block_start events');
+      const indices = toolStarts.map(e => e.data.index).sort((a, b) => a - b);
+      assert.deepEqual(indices, [0, 1], 'tool block indices should be contiguous starting at 0, not have gaps');
     } finally { restore(); }
   });
 
@@ -4067,6 +4113,51 @@ describe('processBatch — malformed Ollama responses', () => {
       assert.ok(tu, 'should have tool_use block');
       assert.deepEqual(tu.input, {});
       assert.ok(warns.some(w => w.includes('[tool-call]') && w.includes('get_weather')));
+    } finally {
+      console.warn = origWarn;
+      global.fetch = orig;
+      _batches.delete(batch.id);
+    }
+  });
+
+  test('tool_call missing "function" field degrades to errored-free result instead of crashing the batch item', async () => {
+    const batch = {
+      id:              'msgbatch_missing_function_test',
+      status:          'in_progress',
+      expires_at:      new Date(Date.now() + 60_000).toISOString(),
+      ended_at:        null,
+      cancelRequested: false,
+      requests: [
+        { custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } },
+      ],
+      results: new Map(),
+    };
+    _batches.set(batch.id, batch);
+
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      json: async () => ({
+        choices: [{
+          message: { content: null, tool_calls: [{ id: 'call_1' }] },
+          finish_reason: 'tool_calls',
+        }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+    });
+
+    const origWarn = console.warn;
+    const warns = [];
+    console.warn = (...a) => warns.push(a.join(' '));
+    try {
+      await processBatch(batch);
+      const result = batch.results.get('r1');
+      assert.equal(result.type, 'succeeded', 'should not error the whole item out on a thrown TypeError');
+      const tu = result.message.content.find(c => c.type === 'tool_use');
+      assert.ok(tu, 'should have tool_use block');
+      assert.equal(tu.name, '');
+      assert.deepEqual(tu.input, {});
+      assert.ok(warns.some(w => w.includes('[tool-call]') && w.includes('missing')));
     } finally {
       console.warn = origWarn;
       global.fetch = orig;
