@@ -591,6 +591,35 @@ function validateTools(tools) {
   return {};
 }
 
+// Validates a request's optional `tool_choice` field. Every other major request field
+// (model, tools, system, messages, max_tokens) has a matching validate*() that rejects
+// malformed input with a clear 400 before it reaches Ollama — tool_choice was the one
+// left out. Without this, toOpenAIToolChoice() silently returns undefined for an
+// unrecognized `type` (dropping the field instead of telling the caller their request
+// was malformed), and a `{type:"tool", name:"x"}` naming a tool absent from `tools` was
+// forwarded to Ollama unchanged instead of being rejected the way the real Anthropic API
+// rejects a tool_choice that doesn't match any declared tool. Returns { error } when
+// invalid, or {} when tool_choice is absent/null or well-formed. Exported for unit testing.
+function validateToolChoice(toolChoice, tools) {
+  if (toolChoice === undefined || toolChoice === null) return {};
+  if (typeof toolChoice !== 'object' || Array.isArray(toolChoice) || typeof toolChoice.type !== 'string') {
+    return { error: '`tool_choice` must be an object with a string `type`' };
+  }
+  if (!['auto', 'any', 'tool', 'none'].includes(toolChoice.type)) {
+    return { error: '`tool_choice.type` must be one of "auto", "any", "tool", "none"' };
+  }
+  if (toolChoice.type === 'tool') {
+    if (typeof toolChoice.name !== 'string' || !toolChoice.name) {
+      return { error: '`tool_choice.name` is required and must be a non-empty string when `tool_choice.type` is "tool"' };
+    }
+    const names = Array.isArray(tools) ? tools.map(t => t && t.name) : [];
+    if (!names.includes(toolChoice.name)) {
+      return { error: `\`tool_choice.name\` "${toolChoice.name}" does not match any tool in \`tools\`` };
+    }
+  }
+  return {};
+}
+
 // Validates a request's optional `system` field. Per the Anthropic API spec, `system`
 // must be a string or an array of content blocks. injectSystemPrompt() spreads non-string
 // values (`...system`) when PROXY_SYSTEM_PROMPT is set, so a non-array, non-string,
@@ -1295,6 +1324,15 @@ async function handleMessages(req, res) {
     clearTO();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: toolsResult.error } }));
+    return;
+  }
+
+  const toolChoiceResult = validateToolChoice(anthropicReq.tool_choice, anthropicReq.tools);
+  if (toolChoiceResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: toolChoiceResult.error } }));
     return;
   }
 
@@ -2541,6 +2579,12 @@ async function handleCreateBatch(req, res) {
     if (batchToolsResult.error) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchToolsResult.error}` } }));
+      return;
+    }
+    const batchToolChoiceResult = validateToolChoice(r.params.tool_choice, r.params.tools);
+    if (batchToolChoiceResult.error) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchToolChoiceResult.error}` } }));
       return;
     }
     const batchSystemResult = validateSystemField(r.params.system);
@@ -4284,6 +4328,7 @@ module.exports = {
   resolveMaxTokens,
   validateModelField,
   validateTools,
+  validateToolChoice,
   validateSystemField,
   validateMessages,
   validateEncodingFormat,
