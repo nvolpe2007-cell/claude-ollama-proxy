@@ -1465,9 +1465,13 @@ async function handleMessages(req, res) {
     if (msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         let input = {};
-        try { input = JSON.parse(tc.function.arguments); }
-        catch { console.warn(`[tool-call] Model returned non-JSON arguments for tool "${tc.function?.name}", defaulting to {}: ${tc.function?.arguments}`); }
-        content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+        if (!tc.function) {
+          console.warn(`[tool-call] Ollama tool_call missing "function" field, defaulting to empty name/input: ${JSON.stringify(tc)}`);
+        } else {
+          try { input = JSON.parse(tc.function.arguments); }
+          catch { console.warn(`[tool-call] Model returned non-JSON arguments for tool "${tc.function?.name}", defaulting to {}: ${tc.function?.arguments}`); }
+        }
+        content.push({ type: 'tool_use', id: tc.id, name: tc.function?.name || '', input });
       }
     }
 
@@ -1772,10 +1776,13 @@ async function handleMessages(req, res) {
           for (const tc of delta.tool_calls) {
             const oi = tc.index; // openai index
             if (!toolBlocks[oi]) {
-              const ai = nextBlockIdx + oi;
-              // Bump nextBlockIdx past this tool block so any subsequent text/thinking
-              // block gets a higher index and cannot clash with tool block indices.
-              nextBlockIdx = Math.max(nextBlockIdx, ai + 1);
+              // Allocate the next sequential Anthropic index regardless of the
+              // OpenAI-side index value — Ollama emits sequential per-call indices
+              // (0, 1, 2, ...) for parallel tool calls, so adding `oi` on top of
+              // nextBlockIdx (as before) compounded into growing gaps for every
+              // tool call after the first, leaving holes in the emitted content
+              // block index sequence.
+              const ai = nextBlockIdx++;
               toolBlocks[oi] = {
                 anthropicIndex: ai,
                 id: tc.id || `toolu_${oi}`,
@@ -2376,9 +2383,13 @@ async function processBatchRequest(anthropicReq, ollamaBase, apiKeyName) {
   if (msg.tool_calls) {
     for (const tc of msg.tool_calls) {
       let input = {};
-      try { input = JSON.parse(tc.function.arguments); }
-      catch { console.warn(`[tool-call] Model returned non-JSON arguments for tool "${tc.function?.name}", defaulting to {}: ${tc.function?.arguments}`); }
-      content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+      if (!tc.function) {
+        console.warn(`[tool-call] Ollama tool_call missing "function" field, defaulting to empty name/input: ${JSON.stringify(tc)}`);
+      } else {
+        try { input = JSON.parse(tc.function.arguments); }
+        catch { console.warn(`[tool-call] Model returned non-JSON arguments for tool "${tc.function?.name}", defaulting to {}: ${tc.function?.arguments}`); }
+      }
+      content.push({ type: 'tool_use', id: tc.id, name: tc.function?.name || '', input });
     }
   }
 
