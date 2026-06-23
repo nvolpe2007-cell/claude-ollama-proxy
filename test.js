@@ -6015,7 +6015,7 @@ describe('GET / dashboard — XSS escaping', () => {
   function extractScript() {
     let captured = '';
     handleDashboard({}, { writeHead() {}, end(html) { captured = html; } });
-    const match = captured.match(/<script>([\s\S]*?)<\/script>/);
+    const match = captured.match(/<script[^>]*>([\s\S]*?)<\/script>/);
     assert.ok(match, 'dashboard HTML should contain an embedded <script>');
     return match[1];
   }
@@ -6092,5 +6092,55 @@ describe('GET / dashboard — XSS escaping', () => {
     });
     assert.ok(html.includes('GET /health'));
     assert.ok(html.includes('qwen2.5:7b'));
+  });
+});
+
+// ── GET / dashboard — security response headers ───────────────────────────
+// Defense-in-depth alongside the XSS escaping above: even though esc() should
+// already prevent script injection via untrusted /health and /metrics data,
+// the dashboard is the one HTML/browser-facing endpoint in the proxy and
+// previously shipped with no CSP, framing, or MIME-sniffing protections.
+describe('GET / dashboard — security headers', () => {
+  function captureResponse() {
+    let headers = null;
+    let html = '';
+    handleDashboard({}, {
+      writeHead(status, h) { headers = h; },
+      end(body) { html = body; },
+    });
+    return { headers, html };
+  }
+
+  test('sets a restrictive Content-Security-Policy with a nonce', () => {
+    const { headers } = captureResponse();
+    assert.ok(headers, 'writeHead should have been called');
+    const csp = headers['Content-Security-Policy'];
+    assert.ok(csp, 'CSP header should be present');
+    assert.match(csp, /default-src 'self'/);
+    assert.match(csp, /script-src 'nonce-[A-Za-z0-9+/=]+'/);
+    assert.match(csp, /frame-ancestors 'none'/);
+  });
+
+  test('sets X-Frame-Options and X-Content-Type-Options', () => {
+    const { headers } = captureResponse();
+    assert.equal(headers['X-Frame-Options'], 'DENY');
+    assert.equal(headers['X-Content-Type-Options'], 'nosniff');
+  });
+
+  test('CSP nonce matches the nonce attribute on the embedded <script>', () => {
+    const { headers, html } = captureResponse();
+    const csp = headers['Content-Security-Policy'];
+    const cspNonce = csp.match(/script-src 'nonce-([A-Za-z0-9+/=]+)'/)[1];
+    const scriptMatch = html.match(/<script nonce="([^"]+)">/);
+    assert.ok(scriptMatch, 'embedded <script> should carry a nonce attribute');
+    assert.equal(scriptMatch[1], cspNonce, 'script nonce must match the CSP header nonce');
+  });
+
+  test('generates a fresh nonce on every call', () => {
+    const a = captureResponse();
+    const b = captureResponse();
+    const nonceA = a.headers['Content-Security-Policy'].match(/nonce-([A-Za-z0-9+/=]+)/)[1];
+    const nonceB = b.headers['Content-Security-Policy'].match(/nonce-([A-Za-z0-9+/=]+)/)[1];
+    assert.notEqual(nonceA, nonceB);
   });
 });
