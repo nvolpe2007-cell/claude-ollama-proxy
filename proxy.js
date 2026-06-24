@@ -462,6 +462,17 @@ const _concurrencyQueue = [];
 // real route table is a small fixed set so this never triggers in normal operation.
 const MAX_METRICS_PATH_KEYS = 200;
 
+// `model` reaches recordTokens() as the resolved effective Ollama model name —
+// resolveModel() returns any non-claude-* request `model` string verbatim, with only a
+// string-type check (validateModelField) and no bound on its value, so it is just as
+// client-controlled as the req.url path capped above. Without an equivalent cap here, a
+// caller could grow `_metrics.modelsUsed` — and therefore the size of every GET /metrics,
+// GET /metrics/prometheus, and dashboard response — without bound by sending a unique
+// `model` string per request. Same cap-and-bucket treatment as MAX_METRICS_PATH_KEYS; the
+// real model set is small and operator-controlled (MODEL_MAP, Ollama's pulled models) so
+// this never triggers in normal operation.
+const MAX_MODELS_USED_KEYS = 200;
+
 function recordRequest(method, path, status, ms) {
   const k = `${method} ${path}`;
   if (_metrics.requests[k] !== undefined) {
@@ -483,11 +494,13 @@ function recordTokens(input, output, model, apiKeyName) {
   _metrics.tokensIn  += input;
   _metrics.tokensOut += output;
   if (model) {
-    if (!_metrics.modelsUsed[model])
-      _metrics.modelsUsed[model] = { requests: 0, tokensIn: 0, tokensOut: 0 };
-    _metrics.modelsUsed[model].requests  += 1;
-    _metrics.modelsUsed[model].tokensIn  += input;
-    _metrics.modelsUsed[model].tokensOut += output;
+    const key = (_metrics.modelsUsed[model] !== undefined || Object.keys(_metrics.modelsUsed).length < MAX_MODELS_USED_KEYS)
+      ? model
+      : '(other)';
+    if (!_metrics.modelsUsed[key]) _metrics.modelsUsed[key] = { requests: 0, tokensIn: 0, tokensOut: 0 };
+    _metrics.modelsUsed[key].requests  += 1;
+    _metrics.modelsUsed[key].tokensIn  += input;
+    _metrics.modelsUsed[key].tokensOut += output;
   }
   if (apiKeyName) {
     if (!_metrics.apiKeysUsed[apiKeyName])
@@ -4377,6 +4390,7 @@ module.exports = {
   recordRequest,
   MAX_METRICS_PATH_KEYS,
   recordTokens,
+  MAX_MODELS_USED_KEYS,
   // Auth internals exported for unit testing only.
   checkAuth,
   timingSafeEqual,

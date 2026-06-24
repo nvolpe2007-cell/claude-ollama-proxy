@@ -48,6 +48,7 @@ const {
   recordTokens,
   recordRequest,
   MAX_METRICS_PATH_KEYS,
+  MAX_MODELS_USED_KEYS,
   checkConcurrency,
   trackActiveLlmRequest,
   _metrics,
@@ -1562,6 +1563,51 @@ describe('recordTokens', () => {
     const before = Object.keys(_metrics.apiKeysUsed).length;
     recordTokens(10, 5, 'qwen2.5:7b');
     assert.equal(Object.keys(_metrics.apiKeysUsed).length, before);
+  });
+});
+
+// ── recordTokens — _metrics.modelsUsed cardinality cap ────────────────────────
+// `model` reaches recordTokens() as the resolved effective model name, and resolveModel()
+// passes any non-claude-* request `model` string through verbatim — just as client-controlled
+// as the req.url path that MAX_METRICS_PATH_KEYS already caps. Without an equivalent cap here,
+// a caller could grow _metrics.modelsUsed (and GET /metrics/GET /metrics/prometheus response
+// size) without bound by sending a unique `model` string per request.
+describe('recordTokens — _metrics.modelsUsed cardinality cap', () => {
+  test('caps the number of distinct model keys and buckets overflow under "(other)"', () => {
+    Object.keys(_metrics.modelsUsed).forEach(k => delete _metrics.modelsUsed[k]);
+
+    for (let i = 0; i < MAX_MODELS_USED_KEYS + 50; i++) {
+      recordTokens(10, 5, `attacker-model-${i}`);
+    }
+
+    const keys = Object.keys(_metrics.modelsUsed);
+    assert.ok(keys.length <= MAX_MODELS_USED_KEYS + 1,
+      `expected at most ${MAX_MODELS_USED_KEYS + 1} distinct keys (cap + overflow bucket), got ${keys.length}`);
+    assert.deepEqual(_metrics.modelsUsed['(other)'], { requests: 50, tokensIn: 500, tokensOut: 250 });
+  });
+
+  test('does not bucket a model already seen before the cap was reached', () => {
+    Object.keys(_metrics.modelsUsed).forEach(k => delete _metrics.modelsUsed[k]);
+
+    recordTokens(10, 5, 'qwen2.5:7b');
+    for (let i = 0; i < MAX_MODELS_USED_KEYS + 10; i++) {
+      recordTokens(10, 5, `flood-model-${i}`);
+    }
+    recordTokens(20, 8, 'qwen2.5:7b');
+
+    assert.deepEqual(_metrics.modelsUsed['qwen2.5:7b'], { requests: 2, tokensIn: 30, tokensOut: 13 });
+  });
+
+  test('still aggregates global token totals while a model is bucketed as overflow', () => {
+    Object.keys(_metrics.modelsUsed).forEach(k => delete _metrics.modelsUsed[k]);
+    const before = { in: _metrics.tokensIn, out: _metrics.tokensOut };
+
+    for (let i = 0; i < MAX_MODELS_USED_KEYS + 1; i++) {
+      recordTokens(10, 5, `flood-model-${i}`);
+    }
+
+    assert.equal(_metrics.tokensIn,  before.in  + (MAX_MODELS_USED_KEYS + 1) * 10);
+    assert.equal(_metrics.tokensOut, before.out + (MAX_MODELS_USED_KEYS + 1) * 5);
   });
 });
 
