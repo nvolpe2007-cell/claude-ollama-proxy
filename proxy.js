@@ -4038,18 +4038,33 @@ async function requestHandler(req, res) {
       await handleCreateBatch(req, res);
     } else if (req.method === 'GET' && path === '/v1/messages/batches') {
       if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       await handleListBatches(req, res);
     } else if (req.method === 'GET' && path.startsWith('/v1/messages/batches/') && path.endsWith('/results')) {
       if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       await handleGetBatchResults(req, res, path.slice('/v1/messages/batches/'.length, -'/results'.length));
     } else if (req.method === 'POST' && path.startsWith('/v1/messages/batches/') && path.endsWith('/cancel')) {
       if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       await handleCancelBatch(req, res, path.slice('/v1/messages/batches/'.length, -'/cancel'.length));
     } else if (req.method === 'DELETE' && path.startsWith('/v1/messages/batches/')) {
       if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       await handleDeleteBatch(req, res, path.slice('/v1/messages/batches/'.length));
     } else if (req.method === 'GET' && path.startsWith('/v1/messages/batches/')) {
       if (!checkAuth(req, res)) return;
+      if (RATE_LIMIT_RPM        && !checkRateLimit('global',        RATE_LIMIT_RPM,        req, res)) return;
+      if (RATE_LIMIT_PER_IP_RPM && !checkRateLimit(getClientIp(req), RATE_LIMIT_PER_IP_RPM, req, res)) return;
+      if (RATE_LIMIT_PER_KEY_RPM && !checkRateLimit(rateLimitKeyForRequest(req), RATE_LIMIT_PER_KEY_RPM, req, res)) return;
       await handleGetBatch(req, res, path.slice('/v1/messages/batches/'.length));
     } else if (req.method === 'POST' && path === '/v1/embeddings') {
       if (!checkAuth(req, res)) return;
