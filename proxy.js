@@ -588,6 +588,19 @@ function embeddingToBase64(embedding) {
   return Buffer.from(Float32Array.from(embedding).buffer).toString('base64');
 }
 
+// Validates POST /v1/embeddings' required `input` field. Per the OpenAI API spec (and
+// CLAUDE.md's documented behavior), `input` must be a string or an array of strings.
+// handleEmbeddings previously only checked for null/undefined and forwarded anything else
+// (a number, object, or array of non-strings) straight to Ollama's /api/embed, trading a
+// clear 400 from the proxy for whatever error shape Ollama happens to return. Returns
+// { error } when invalid, or {} when input is a string or an array of strings. Exported
+// for unit testing.
+function validateEmbeddingsInput(input) {
+  if (typeof input === 'string') return {};
+  if (Array.isArray(input) && input.every(s => typeof s === 'string')) return {};
+  return { error: '`input` must be a string or an array of strings' };
+}
+
 // Validates a request's optional `tools` field. toOpenAITools() calls `.map()` on this
 // value and reads `.name` off each entry, so a non-array value (string, object) or a
 // malformed entry (null, missing/non-string name) would otherwise throw a TypeError that
@@ -2767,6 +2780,15 @@ async function handleEmbeddings(req, res) {
     return;
   }
 
+  const embedInputResult = validateEmbeddingsInput(embedReq.input);
+  if (embedInputResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: embedInputResult.error } }));
+    return;
+  }
+
   const embedModelResult = validateModelField(embedReq.model);
   if (embedModelResult.error) {
     req.socket.off('close', onClientClose);
@@ -4322,6 +4344,7 @@ module.exports = {
   validateSystemField,
   validateMessages,
   validateEncodingFormat,
+  validateEmbeddingsInput,
   embeddingToBase64,
   PROXY_HARD_MAX_TOKENS,
   PROXY_IDLE_TIMEOUT,
