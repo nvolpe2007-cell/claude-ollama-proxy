@@ -3495,12 +3495,19 @@ async function handleOpenAIChat(req, res) {
   if (PROXY_SYSTEM_PROMPT) {
     const sysIdx = openaiReq.messages.findIndex(m => m.role === 'system');
     if (sysIdx >= 0) {
-      const orig = typeof openaiReq.messages[sysIdx].content === 'string'
-        ? openaiReq.messages[sysIdx].content : '';
-      openaiReq.messages[sysIdx] = {
-        ...openaiReq.messages[sysIdx],
-        content: orig ? `${PROXY_SYSTEM_PROMPT}\n\n${orig}` : PROXY_SYSTEM_PROMPT,
-      };
+      const origContent = openaiReq.messages[sysIdx].content;
+      let newContent;
+      if (typeof origContent === 'string') {
+        newContent = origContent ? `${PROXY_SYSTEM_PROMPT}\n\n${origContent}` : PROXY_SYSTEM_PROMPT;
+      } else if (Array.isArray(origContent)) {
+        // OpenAI array-of-content-parts system message (e.g. [{type:'text',text:'...'}]).
+        // Prepend a text part instead of collapsing to a string, so the original
+        // content survives rather than being silently dropped.
+        newContent = [{ type: 'text', text: PROXY_SYSTEM_PROMPT }, ...origContent];
+      } else {
+        newContent = PROXY_SYSTEM_PROMPT;
+      }
+      openaiReq.messages[sysIdx] = { ...openaiReq.messages[sysIdx], content: newContent };
     } else {
       openaiReq.messages.unshift({ role: 'system', content: PROXY_SYSTEM_PROMPT });
     }

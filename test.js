@@ -4817,6 +4817,87 @@ describe('handleOpenAIChat', () => {
         'streaming OpenAI passthrough must include X-Accel-Buffering: no');
     } finally { restore(); }
   });
+
+  // PROXY_SYSTEM_PROMPT injection: reloads the module with the env var set, since
+  // it's read once into a module-level constant at require time.
+  describe('PROXY_SYSTEM_PROMPT injection', () => {
+    function withProxyEnv(envOverrides, fn) {
+      const modKey = require.resolve('./proxy');
+      const savedMod = require.cache[modKey];
+      const savedEnv = {};
+      for (const k of Object.keys(envOverrides)) savedEnv[k] = process.env[k];
+      let freshProxy;
+      try {
+        for (const [k, v] of Object.entries(envOverrides)) process.env[k] = v;
+        delete require.cache[modKey];
+        freshProxy = require('./proxy');
+      } finally {
+        for (const [k, v] of Object.entries(savedEnv)) {
+          if (v !== undefined) process.env[k] = v;
+          else delete process.env[k];
+        }
+        delete require.cache[modKey];
+        require.cache[modKey] = savedMod;
+      }
+      return fn(freshProxy);
+    }
+
+    function captureFetch() {
+      const orig = global.fetch;
+      const captured = {};
+      global.fetch = async (_url, opts) => {
+        captured.body = JSON.parse(opts.body);
+        return {
+          ok: true, status: 200,
+          json: async () => ({ id: 'x', choices: [{ message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop', index: 0 } ] }),
+          text: async () => '',
+          body: null,
+        };
+      };
+      return { captured, restore: () => { global.fetch = orig; } };
+    }
+
+    test('prepends to a string system message', async () => {
+      await withProxyEnv({ PROXY_SYSTEM_PROMPT: 'Operator rule.' }, async (m) => {
+        const { captured, restore } = captureFetch();
+        try {
+          await m.handleOpenAIChat(mockReq({
+            messages: [{ role: 'system', content: 'Be terse.' }, { role: 'user', content: 'hi' }],
+          }), mockRes());
+          const sysMsg = captured.body.messages.find(msg => msg.role === 'system');
+          assert.equal(sysMsg.content, 'Operator rule.\n\nBe terse.');
+        } finally { restore(); }
+      });
+    });
+
+    test('preserves array-form system content instead of discarding it', async () => {
+      // Regression test: PROXY_SYSTEM_PROMPT injection previously collapsed a
+      // non-string system message content to '', silently dropping it.
+      await withProxyEnv({ PROXY_SYSTEM_PROMPT: 'Operator rule.' }, async (m) => {
+        const { captured, restore } = captureFetch();
+        try {
+          const originalBlocks = [{ type: 'text', text: 'Be terse.' }];
+          await m.handleOpenAIChat(mockReq({
+            messages: [{ role: 'system', content: originalBlocks }, { role: 'user', content: 'hi' }],
+          }), mockRes());
+          const sysMsg = captured.body.messages.find(msg => msg.role === 'system');
+          assert.ok(Array.isArray(sysMsg.content), 'system content should remain an array');
+          assert.deepEqual(sysMsg.content, [{ type: 'text', text: 'Operator rule.' }, ...originalBlocks]);
+        } finally { restore(); }
+      });
+    });
+
+    test('inserts a new system message when none exists', async () => {
+      await withProxyEnv({ PROXY_SYSTEM_PROMPT: 'Operator rule.' }, async (m) => {
+        const { captured, restore } = captureFetch();
+        try {
+          await m.handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'hi' }] }), mockRes());
+          assert.equal(captured.body.messages[0].role, 'system');
+          assert.equal(captured.body.messages[0].content, 'Operator rule.');
+        } finally { restore(); }
+      });
+    });
+  });
 });
 
 // ── PROXY_FORCE_THINK ─────────────────────────────────────────────────────────
