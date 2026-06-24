@@ -71,6 +71,7 @@ const {
   truncateToContext,
   handleEmbeddings,
   validateEncodingFormat,
+  validateEmbeddingsInput,
   embeddingToBase64,
   handleDashboard,
 } = require('./proxy');
@@ -174,6 +175,33 @@ describe('validateEncodingFormat', () => {
     assert.match(validateEncodingFormat('hex').error, /must be "float" or "base64"/);
     assert.match(validateEncodingFormat(123).error, /must be "float" or "base64"/);
     assert.match(validateEncodingFormat(true).error, /must be "float" or "base64"/);
+  });
+});
+
+describe('validateEmbeddingsInput', () => {
+  test('accepts a string', () => {
+    assert.deepEqual(validateEmbeddingsInput('hello world'), {});
+  });
+
+  test('accepts an array of strings', () => {
+    assert.deepEqual(validateEmbeddingsInput(['hello', 'world']), {});
+  });
+
+  test('accepts an empty array', () => {
+    assert.deepEqual(validateEmbeddingsInput([]), {});
+  });
+
+  test('rejects a number', () => {
+    assert.match(validateEmbeddingsInput(123).error, /must be a string or an array of strings/);
+  });
+
+  test('rejects an object', () => {
+    assert.match(validateEmbeddingsInput({ foo: 'bar' }).error, /must be a string or an array of strings/);
+  });
+
+  test('rejects an array containing non-string elements', () => {
+    assert.match(validateEmbeddingsInput(['hello', 123]).error, /must be a string or an array of strings/);
+    assert.match(validateEmbeddingsInput([null]).error, /must be a string or an array of strings/);
   });
 });
 
@@ -5287,6 +5315,24 @@ describe('handleEmbeddings', () => {
     const body = JSON.parse(res._body);
     assert.equal(body.error.type, 'invalid_request_error');
     assert.match(body.error.message, /encoding_format/);
+  });
+
+  test('returns 400 when input is not a string or array of strings', async () => {
+    const res = mockRes();
+    await handleEmbeddings(mockReq({ input: 123 }), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /input/);
+  });
+
+  test('returns 400 when input array contains non-string elements', async () => {
+    const res = mockRes();
+    await handleEmbeddings(mockReq({ input: ['hello', 42] }), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.match(body.error.message, /input/);
   });
 
   test('returns OpenAI-compatible embedding envelope for a successful request', async () => {
