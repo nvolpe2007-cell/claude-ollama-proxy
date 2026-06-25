@@ -2443,6 +2443,23 @@ async function processBatch(batch) {
       continue;
     }
     await acquireLlmSlotForBatch();
+    // A cancel or TTL expiry can land while this item was parked in the concurrency queue
+    // above — acquireLlmSlotForBatch has no reference to `batch` and cannot observe either
+    // condition while waiting, so re-check both immediately after the slot is granted.
+    // Otherwise a canceled/expired item still burns a full inference cycle against Ollama
+    // just because it was queued before the cancellation or expiry arrived.
+    if (batch.cancelRequested) {
+      releaseLlmSlot();
+      batch.results.set(item.custom_id, { type: 'canceled' });
+      saveBatchesToDisk();
+      continue;
+    }
+    if (Date.now() >= new Date(batch.expires_at).getTime()) {
+      releaseLlmSlot();
+      batch.results.set(item.custom_id, { type: 'expired' });
+      saveBatchesToDisk();
+      continue;
+    }
     // Re-resolve the host for every item rather than once for the whole batch: a batch
     // can run for hours, and pinning it to whichever host was current at the start defeats
     // both multi-host round-robin load distribution and the automatic-failover health

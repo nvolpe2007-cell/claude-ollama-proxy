@@ -4162,6 +4162,74 @@ describe('processBatch — multi-host round robin', () => {
   });
 });
 
+// ── processBatch — cancellation race while parked in the concurrency queue ────
+
+describe('processBatch — cancellation race while parked in concurrency queue', () => {
+  function withMaxConcurrency(n, fn) {
+    const modKey = require.resolve('./proxy');
+    const savedMod = require.cache[modKey];
+    try {
+      process.env.PROXY_MAX_CONCURRENCY = String(n);
+      delete require.cache[modKey];
+      const freshProxy = require('./proxy');
+      return fn(freshProxy);
+    } finally {
+      delete process.env.PROXY_MAX_CONCURRENCY;
+      delete require.cache[modKey];
+      require.cache[modKey] = savedMod;
+    }
+  }
+
+  test('a batch item canceled while queued for a slot is recorded as canceled instead of running against Ollama', async () => {
+    await withMaxConcurrency(1, async (mod) => {
+      // Occupy the single concurrency slot, simulating real-time traffic holding it.
+      await mod.acquireLlmSlotForBatch();
+
+      const batch = {
+        id:              'msgbatch_cancel_race_test',
+        status:          'in_progress',
+        expires_at:      new Date(Date.now() + 60_000).toISOString(),
+        ended_at:        null,
+        cancelRequested: false,
+        requests:        [{ custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } }],
+        results:         new Map(),
+      };
+
+      const origFetch = global.fetch;
+      let fetchCalled = false;
+      global.fetch = async () => {
+        fetchCalled = true;
+        return {
+          ok: true, status: 200,
+          json: async () => ({ choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }], usage: {} }),
+        };
+      };
+
+      try {
+        const donePromise = mod.processBatch(batch);
+
+        // Let processBatch run up to (and park in) acquireLlmSlotForBatch's queue.
+        await new Promise(r => setImmediate(r));
+        assert.equal(mod._metrics.queuedLlmRequests, 1, 'item should be parked in the concurrency queue');
+
+        // Cancellation arrives while the item is queued — mirrors handleCancelBatch
+        // setting cancelRequested on a batch that has an item waiting for a slot.
+        batch.cancelRequested = true;
+
+        // Free the slot the item is waiting on.
+        mod.releaseLlmSlot();
+        await donePromise;
+
+        assert.equal(fetchCalled, false, 'a canceled item must not be sent to Ollama');
+        assert.deepEqual(batch.results.get('r1'), { type: 'canceled' });
+        assert.equal(batch.status, 'ended');
+      } finally {
+        global.fetch = origFetch;
+      }
+    });
+  });
+});
+
 // ── Batch persistence (saveBatchesToDisk / loadBatchesFromDisk) ───────────────
 
 describe('Batch persistence', () => {
