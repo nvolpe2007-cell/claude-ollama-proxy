@@ -2025,7 +2025,13 @@ async function handleModelById(req, res, modelId) {
 // Auth-gated like other model management endpoints. Returns {deleted:true,id} on
 // success, 404 if the model isn't in Ollama, 502 if Ollama is unreachable.
 async function handleDeleteModel(req, res, modelId) {
-  const deleteAccessError = checkModelAccess(req, modelId);
+  // Resolve MODEL_MAP aliases to the real Ollama model name before checking
+  // access or talking to Ollama — same as handleModelById — so a caller can
+  // address the model by its Claude-style alias (e.g. "claude-3-haiku") and
+  // PROXY_API_KEY_MODELS allow-lists (which are keyed by real model name) match.
+  const effectiveModel = resolveModel(modelId);
+
+  const deleteAccessError = checkModelAccess(req, effectiveModel);
   if (deleteAccessError) {
     res.writeHead(403, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'permission_error', message: deleteAccessError } }));
@@ -2038,7 +2044,7 @@ async function handleDeleteModel(req, res, modelId) {
     ollamaRes = await fetch(`${ollamaBase}/api/delete`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: modelId }),
+      body: JSON.stringify({ model: effectiveModel }),
       signal: AbortSignal.timeout(10_000),
     });
   } catch (e) {
@@ -2088,7 +2094,15 @@ async function handlePullModel(req, res) {
     return;
   }
 
-  const pullAccessError = checkModelAccess(req, pullReq.model);
+  // Resolve MODEL_MAP aliases to the real Ollama model name before checking
+  // access or talking to Ollama — same as handleModelById/handleDeleteModel —
+  // so PROXY_API_KEY_MODELS allow-lists (keyed by real model name) match, and
+  // so a caller pulling by alias actually triggers a pull of the right model
+  // instead of asking Ollama's registry for an image literally named e.g.
+  // "claude-3-haiku".
+  const effectiveModel = resolveModel(pullReq.model);
+
+  const pullAccessError = checkModelAccess(req, effectiveModel);
   if (pullAccessError) {
     res.writeHead(403, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'permission_error', message: pullAccessError } }));
@@ -2106,7 +2120,7 @@ async function handlePullModel(req, res) {
     ollamaRes = await fetch(`${ollamaBase}/api/pull`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: pullReq.model, stream: streaming }),
+      body: JSON.stringify({ model: effectiveModel, stream: streaming }),
       signal: ac.signal,
     });
   } catch (e) {

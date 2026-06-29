@@ -2166,6 +2166,103 @@ describe('handleDeleteModel / handlePullModel — model access control', () => {
       }
     });
   });
+
+  // MODEL_MAP alias resolution — neither handler used to call resolveModel(),
+  // so a caller addressing a model by its Claude-style alias bypassed the
+  // PROXY_API_KEY_MODELS allow-list (which is keyed by real model name) and
+  // sent the alias itself to Ollama's /api/delete and /api/pull, which don't
+  // understand it.
+
+  function stubFetchCapture(response) {
+    const orig = global.fetch;
+    const calls = [];
+    global.fetch = async (url, opts) => {
+      calls.push({ url, body: opts?.body ? JSON.parse(opts.body) : undefined });
+      return { ok: true, status: 200, json: async () => response };
+    };
+    return { restore: () => { global.fetch = orig; }, calls };
+  }
+
+  test('DELETE resolves a MODEL_MAP alias to the real model before checking access and calling Ollama', async () => {
+    await withProxyEnv({
+      PROXY_API_KEY_MODELS: 'family:llama3.2:1b',
+      MODEL_MAP: JSON.stringify({ 'claude-3-haiku': 'llama3.2:1b' }),
+    }, async (m) => {
+      const fetchStub = stubFetchCapture({});
+      try {
+        const req = mockReq('family');
+        const res = mockRes();
+        await m.handleDeleteModel(req, res, 'claude-3-haiku');
+        assert.equal(res._status, 200, 'alias resolves to an allowed model, so the delete should succeed');
+        assert.equal(fetchStub.calls.length, 1);
+        assert.equal(fetchStub.calls[0].body.model, 'llama3.2:1b', 'Ollama must receive the real model name, not the alias');
+      } finally {
+        fetchStub.restore();
+      }
+    });
+  });
+
+  test('DELETE rejects a MODEL_MAP alias whose target is outside the caller\'s allow-list', async () => {
+    await withProxyEnv({
+      PROXY_API_KEY_MODELS: 'family:llama3.2:1b',
+      MODEL_MAP: JSON.stringify({ 'claude-3-opus': 'qwen2.5:72b' }),
+    }, async (m) => {
+      const fetchStub = stubFetchCapture({});
+      try {
+        const req = mockReq('family');
+        const res = mockRes();
+        await m.handleDeleteModel(req, res, 'claude-3-opus');
+        assert.equal(res._status, 403);
+        assert.equal(JSON.parse(res._body).error.type, 'permission_error');
+        assert.equal(fetchStub.calls.length, 0, 'Ollama should never be called for a disallowed alias target');
+      } finally {
+        fetchStub.restore();
+      }
+    });
+  });
+
+  test('pull resolves a MODEL_MAP alias to the real model before checking access and calling Ollama', async () => {
+    await withProxyEnv({
+      PROXY_API_KEY_MODELS: 'family:llama3.2:1b',
+      MODEL_MAP: JSON.stringify({ 'claude-3-haiku': 'llama3.2:1b' }),
+    }, async (m) => {
+      const fetchStub = stubFetchCapture({ status: 'success' });
+      try {
+        const req = mockReq('family');
+        const res = mockRes();
+        const body = JSON.stringify({ model: 'claude-3-haiku' });
+        req[Symbol.asyncIterator] = async function* () { yield Buffer.from(body); };
+        await m.handlePullModel(req, res);
+        assert.equal(res._status, 200, 'alias resolves to an allowed model, so the pull should succeed');
+        assert.equal(fetchStub.calls.length, 1);
+        assert.equal(fetchStub.calls[0].body.model, 'llama3.2:1b', 'Ollama must receive the real model name, not the alias');
+        assert.equal(JSON.parse(res._body).id, 'claude-3-haiku', 'response should still echo the requested alias as id');
+      } finally {
+        fetchStub.restore();
+      }
+    });
+  });
+
+  test('pull rejects a MODEL_MAP alias whose target is outside the caller\'s allow-list', async () => {
+    await withProxyEnv({
+      PROXY_API_KEY_MODELS: 'family:llama3.2:1b',
+      MODEL_MAP: JSON.stringify({ 'claude-3-opus': 'qwen2.5:72b' }),
+    }, async (m) => {
+      const fetchStub = stubFetchCapture({});
+      try {
+        const req = mockReq('family');
+        const res = mockRes();
+        const body = JSON.stringify({ model: 'claude-3-opus' });
+        req[Symbol.asyncIterator] = async function* () { yield Buffer.from(body); };
+        await m.handlePullModel(req, res);
+        assert.equal(res._status, 403);
+        assert.equal(JSON.parse(res._body).error.type, 'permission_error');
+        assert.equal(fetchStub.calls.length, 0, 'Ollama should never be called for a disallowed alias target');
+      } finally {
+        fetchStub.restore();
+      }
+    });
+  });
 });
 
 // ── POST /v1/messages/count_tokens — PROXY_API_KEY_MODELS enforcement ──────────
