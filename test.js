@@ -2433,6 +2433,32 @@ describe('handleOpenAICompletions', () => {
     }
   });
 
+  test('non-streaming: empty choices array returns 502 instead of an empty 200', async () => {
+    const restore = stubFetch({ choices: [], usage: {} });
+    try {
+      const req = mockReq({ model: 'llama3', prompt: 'Say hi' });
+      const res = mockRes();
+      await handleOpenAICompletions(req, res);
+      assert.equal(res._status, 502);
+      assert.equal(JSON.parse(res._body).error.type, 'ollama_error');
+    } finally {
+      restore();
+    }
+  });
+
+  test('non-streaming: choice with no message field returns 502 instead of crashing', async () => {
+    const restore = stubFetch({ choices: [{ finish_reason: 'stop' }], usage: {} });
+    try {
+      const req = mockReq({ model: 'llama3', prompt: 'Say hi' });
+      const res = mockRes();
+      await handleOpenAICompletions(req, res);
+      assert.equal(res._status, 502);
+      assert.equal(JSON.parse(res._body).error.type, 'ollama_error');
+    } finally {
+      restore();
+    }
+  });
+
   test('joins array prompt into a single string', async () => {
     let sentBody;
     const origFetch = global.fetch;
