@@ -912,8 +912,26 @@ function toOpenAIToolChoice(tc) {
   }
 }
 
-function sendSSE(res, event, data) {
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+// Writes a chunk to `res`, waiting for the 'drain' event if Node's write buffer is
+// already full (res.write() returns false) instead of letting writes pile up
+// unbounded in memory — the same backpressure pattern used by handleGetBatchResults,
+// applied here for the live streaming paths (model generation, OpenAI passthrough,
+// model pull progress) where a slow-reading client could otherwise let the proxy
+// buffer an entire long-running generation in the socket's internal write queue.
+function writeBackpressured(res, chunk) {
+  if (res.writableEnded) return Promise.resolve();
+  const ok = res.write(chunk);
+  if (ok !== false) return Promise.resolve();
+  return new Promise(resolve => {
+    const onDrain = () => { res.off('close', onClose); resolve(); };
+    const onClose = () => { res.off('drain', onDrain); resolve(); };
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+  });
+}
+
+async function sendSSE(res, event, data) {
+  await writeBackpressured(res, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 function newMsgId() {
@@ -1526,7 +1544,7 @@ async function handleMessages(req, res) {
   // chars/4 is the standard rough estimate; it gives a plausible non-zero value
   // with zero added latency since openaiReq is already built.
   const approxInputTokens = Math.ceil(JSON.stringify(openaiReq.messages).length / 4);
-  sendSSE(res, 'message_start', {
+  await sendSSE(res, 'message_start', {
     type: 'message_start',
     message: {
       id, type: 'message', role: 'assistant', content: [],
@@ -1552,7 +1570,7 @@ async function handleMessages(req, res) {
   let thinkIdx     = 0;         // anthropic index of the currently open thinking block
   let nextBlockIdx = 0;         // monotonic block-index counter shared by think/text/tool blocks
 
-  function routeThinkChunk(flush) {
+  async function routeThinkChunk(flush) {
     for (;;) {
       if (!thinkBuf.length) break;
 
@@ -1560,11 +1578,11 @@ async function handleMessages(req, res) {
         const tag = '<think>';
         if (thinkBuf.startsWith(tag)) {
           thinkIdx = nextBlockIdx++;
-          sendSSE(res, 'content_block_start', {
+          await sendSSE(res, 'content_block_start', {
             type: 'content_block_start', index: thinkIdx,
             content_block: { type: 'thinking', thinking: '' }
           });
-          sendSSE(res, 'ping', { type: 'ping' });
+          await sendSSE(res, 'ping', { type: 'ping' });
           thinkBuf = thinkBuf.slice(tag.length);
           thinkState = 'thinking';
           continue;
@@ -1580,15 +1598,15 @@ async function handleMessages(req, res) {
         const etag = '</think>';
         const ei = thinkBuf.indexOf(etag);
         if (ei !== -1) {
-          if (ei > 0) sendSSE(res, 'content_block_delta', {
+          if (ei > 0) await sendSSE(res, 'content_block_delta', {
             type: 'content_block_delta', index: thinkIdx,
             delta: { type: 'thinking_delta', thinking: thinkBuf.slice(0, ei) }
           });
-          sendSSE(res, 'content_block_delta', {
+          await sendSSE(res, 'content_block_delta', {
             type: 'content_block_delta', index: thinkIdx,
             delta: { type: 'signature_delta', signature: 'ollama-proxy-extracted' }
           });
-          sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkIdx });
+          await sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkIdx });
           thinkCount++;
           thinkBuf = thinkBuf.slice(ei + etag.length);
           thinkState = 'initial';
@@ -1600,7 +1618,7 @@ async function handleMessages(req, res) {
           ? thinkBuf.length
           : (lt > 0 ? lt : Math.max(0, thinkBuf.length - etag.length));
         if (safe > 0) {
-          sendSSE(res, 'content_block_delta', {
+          await sendSSE(res, 'content_block_delta', {
             type: 'content_block_delta', index: thinkIdx,
             delta: { type: 'thinking_delta', thinking: thinkBuf.slice(0, safe) }
           });
@@ -1617,7 +1635,7 @@ async function handleMessages(req, res) {
       if (ti === 0) {
         // Buffer starts with <think>: close open text block and switch back to 'initial'.
         if (textBlockOpen) {
-          sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
+          await sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
           textBlockOpen = false;
         }
         thinkState = 'initial';
@@ -1627,18 +1645,18 @@ async function handleMessages(req, res) {
         // Text before <think>: emit it, close text block, then let 'initial' open the think block.
         if (!textBlockOpen) {
           textBlockIdx = nextBlockIdx++;
-          sendSSE(res, 'content_block_start', {
+          await sendSSE(res, 'content_block_start', {
             type: 'content_block_start', index: textBlockIdx,
             content_block: { type: 'text', text: '' }
           });
-          sendSSE(res, 'ping', { type: 'ping' });
+          await sendSSE(res, 'ping', { type: 'ping' });
           textBlockOpen = true;
         }
-        sendSSE(res, 'content_block_delta', {
+        await sendSSE(res, 'content_block_delta', {
           type: 'content_block_delta', index: textBlockIdx,
           delta: { type: 'text_delta', text: thinkBuf.slice(0, ti) }
         });
-        sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
+        await sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
         textBlockOpen = false;
         thinkBuf = thinkBuf.slice(ti);
         thinkState = 'initial';
@@ -1652,14 +1670,14 @@ async function handleMessages(req, res) {
           if (safe) {
             if (!textBlockOpen) {
               textBlockIdx = nextBlockIdx++;
-              sendSSE(res, 'content_block_start', {
+              await sendSSE(res, 'content_block_start', {
                 type: 'content_block_start', index: textBlockIdx,
                 content_block: { type: 'text', text: '' }
               });
-              sendSSE(res, 'ping', { type: 'ping' });
+              await sendSSE(res, 'ping', { type: 'ping' });
               textBlockOpen = true;
             }
-            sendSSE(res, 'content_block_delta', {
+            await sendSSE(res, 'content_block_delta', {
               type: 'content_block_delta', index: textBlockIdx,
               delta: { type: 'text_delta', text: safe }
             });
@@ -1671,14 +1689,14 @@ async function handleMessages(req, res) {
       // No think tags — emit everything as a text delta.
       if (!textBlockOpen) {
         textBlockIdx = nextBlockIdx++;
-        sendSSE(res, 'content_block_start', {
+        await sendSSE(res, 'content_block_start', {
           type: 'content_block_start', index: textBlockIdx,
           content_block: { type: 'text', text: '' }
         });
-        sendSSE(res, 'ping', { type: 'ping' });
+        await sendSSE(res, 'ping', { type: 'ping' });
         textBlockOpen = true;
       }
-      sendSSE(res, 'content_block_delta', {
+      await sendSSE(res, 'content_block_delta', {
         type: 'content_block_delta', index: textBlockIdx,
         delta: { type: 'text_delta', text: thinkBuf }
       });
@@ -1691,21 +1709,21 @@ async function handleMessages(req, res) {
   // (thinking, text, tool_use). Shared by the normal finish_reason path, the
   // no-finish_reason fallback, and the mid-stream error path below so all three
   // leave the SSE stream in a valid state before the terminal event is sent.
-  function closeAllBlocks() {
-    routeThinkChunk(true);
+  async function closeAllBlocks() {
+    await routeThinkChunk(true);
     if (thinkState === 'thinking') {
-      sendSSE(res, 'content_block_delta', {
+      await sendSSE(res, 'content_block_delta', {
         type: 'content_block_delta', index: thinkIdx,
         delta: { type: 'signature_delta', signature: 'ollama-proxy-extracted' }
       });
-      sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkIdx });
+      await sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: thinkIdx });
       thinkCount++;
     }
     if (textBlockOpen) {
-      sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
+      await sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIdx });
     }
     for (const tb of Object.values(toolBlocks)) {
-      sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: tb.anthropicIndex });
+      await sendSSE(res, 'content_block_stop', { type: 'content_block_stop', index: tb.anthropicIndex });
     }
   }
 
@@ -1764,8 +1782,8 @@ async function handleMessages(req, res) {
           const message = typeof chunk.error === 'string'
             ? chunk.error
             : (chunk.error.message || JSON.stringify(chunk.error));
-          closeAllBlocks();
-          sendSSE(res, 'error', { type: 'error', error: { type: 'api_error', message } });
+          await closeAllBlocks();
+          await sendSSE(res, 'error', { type: 'error', error: { type: 'api_error', message } });
           streamErrored = true;
           break;
         }
@@ -1777,7 +1795,7 @@ async function handleMessages(req, res) {
         // Text delta — route through <think> state machine
         if (delta.content) {
           thinkBuf += delta.content;
-          routeThinkChunk(false);
+          await routeThinkChunk(false);
         }
 
         // Tool call deltas
@@ -1795,7 +1813,7 @@ async function handleMessages(req, res) {
                 name: tc.function?.name || '',
                 args: ''
               };
-              sendSSE(res, 'content_block_start', {
+              await sendSSE(res, 'content_block_start', {
                 type: 'content_block_start', index: ai,
                 content_block: {
                   type: 'tool_use',
@@ -1804,7 +1822,7 @@ async function handleMessages(req, res) {
                   input: {}
                 }
               });
-              sendSSE(res, 'ping', { type: 'ping' });
+              await sendSSE(res, 'ping', { type: 'ping' });
             }
 
             const tb = toolBlocks[oi];
@@ -1813,7 +1831,7 @@ async function handleMessages(req, res) {
 
             if (tc.function?.arguments) {
               tb.args += tc.function.arguments;
-              sendSSE(res, 'content_block_delta', {
+              await sendSSE(res, 'content_block_delta', {
                 type: 'content_block_delta', index: tb.anthropicIndex,
                 delta: { type: 'input_json_delta', partial_json: tc.function.arguments }
               });
@@ -1828,7 +1846,7 @@ async function handleMessages(req, res) {
           stopReason = choice.finish_reason === 'tool_calls' ? 'tool_use'
                      : choice.finish_reason === 'length'     ? 'max_tokens'
                      : 'end_turn';
-          closeAllBlocks();
+          await closeAllBlocks();
         }
       }
       if (streamErrored) break;
@@ -1840,15 +1858,15 @@ async function handleMessages(req, res) {
       // Guard against streams that end without an explicit finish_reason.
       if (!stopReason) {
         stopReason = 'end_turn';
-        closeAllBlocks();
+        await closeAllBlocks();
       }
       if (!res.writableEnded) {
-        sendSSE(res, 'message_delta', {
+        await sendSSE(res, 'message_delta', {
           type: 'message_delta',
           delta: { stop_reason: stopReason, stop_sequence: null },
           usage: { input_tokens: inputTokens, output_tokens: outputTokens, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
         });
-        sendSSE(res, 'message_stop', { type: 'message_stop' });
+        await sendSSE(res, 'message_stop', { type: 'message_stop' });
       }
     }
   } catch (e) {
@@ -1857,7 +1875,7 @@ async function handleMessages(req, res) {
         const timeoutMsg = idleTimedOut
           ? `No tokens received for ${PROXY_IDLE_TIMEOUT}ms — stream appears stuck`
           : `Ollama did not respond within ${PROXY_TIMEOUT}ms`;
-        sendSSE(res, 'error', {
+        await sendSSE(res, 'error', {
           type: 'error',
           error: { type: 'request_timeout', message: timeoutMsg }
         });
@@ -1866,7 +1884,7 @@ async function handleMessages(req, res) {
     } else {
       console.error('Stream error:', e.message);
       if (!res.writableEnded) {
-        sendSSE(res, 'error', { type: 'error', error: { type: 'stream_error', message: e.message } });
+        await sendSSE(res, 'error', { type: 'error', error: { type: 'stream_error', message: e.message } });
       }
     }
   } finally {
@@ -2173,15 +2191,15 @@ async function handlePullModel(req, res) {
         let obj;
         try { obj = JSON.parse(line); } catch { continue; }
         if (obj.status === 'success' || obj.status === 'already exists') success = true;
-        res.write(`data: ${JSON.stringify(obj)}\n\n`);
+        await writeBackpressured(res, `data: ${JSON.stringify(obj)}\n\n`);
       }
     }
     if (!res.writableEnded) {
-      res.write(`data: ${JSON.stringify({ id: pullReq.model, pulled: success, done: true })}\n\n`);
+      await writeBackpressured(res, `data: ${JSON.stringify({ id: pullReq.model, pulled: success, done: true })}\n\n`);
     }
   } catch (e) {
     if (e.name !== 'AbortError' && !res.writableEnded) {
-      res.write(`data: ${JSON.stringify({ error: { type: 'stream_error', message: e.message } })}\n\n`);
+      await writeBackpressured(res, `data: ${JSON.stringify({ error: { type: 'stream_error', message: e.message } })}\n\n`);
     }
   } finally {
     req.socket.off('close', onClientClose);
@@ -3690,22 +3708,22 @@ async function handleOpenAIChat(req, res) {
             }
           } catch {}
         }
-        res.write(line + '\n');
+        await writeBackpressured(res, line + '\n');
       }
     }
-    if (buf) res.write(buf); // flush any trailing partial line
+    if (buf) await writeBackpressured(res, buf); // flush any trailing partial line
   } catch (e) {
     if (e.name === 'AbortError') {
       if (timedOut && !res.writableEnded) {
         const timeoutMsg = idleTimedOut
           ? `No tokens received for ${PROXY_IDLE_TIMEOUT}ms — stream appears stuck`
           : `Ollama did not respond within ${PROXY_TIMEOUT}ms`;
-        res.write(`data: ${JSON.stringify({ error: { type: 'timeout_error', message: timeoutMsg } })}\n\n`);
+        await writeBackpressured(res, `data: ${JSON.stringify({ error: { type: 'timeout_error', message: timeoutMsg } })}\n\n`);
       }
     } else {
       console.error('OpenAI stream error:', e.message);
       if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify({ error: { type: 'stream_error', message: e.message } })}\n\n`);
+        await writeBackpressured(res, `data: ${JSON.stringify({ error: { type: 'stream_error', message: e.message } })}\n\n`);
       }
     }
   } finally {
@@ -3962,11 +3980,11 @@ async function handleOpenAICompletions(req, res) {
       buf = lines.pop();
 
       for (const line of lines) {
-        if (!line.startsWith('data: ')) { res.write(line + '\n'); continue; }
+        if (!line.startsWith('data: ')) { await writeBackpressured(res, line + '\n'); continue; }
         const raw = line.slice(6).trim();
-        if (raw === '[DONE]') { res.write('data: [DONE]\n\n'); continue; }
+        if (raw === '[DONE]') { await writeBackpressured(res, 'data: [DONE]\n\n'); continue; }
         let chunk;
-        try { chunk = JSON.parse(raw); } catch { res.write(line + '\n'); continue; }
+        try { chunk = JSON.parse(raw); } catch { await writeBackpressured(res, line + '\n'); continue; }
 
         if (chunk.usage) {
           inputTokens  = chunk.usage.prompt_tokens     || inputTokens;
@@ -3976,7 +3994,7 @@ async function handleOpenAICompletions(req, res) {
         // Pass a mid-stream {"error":...} chunk straight through (no `choices` to
         // convert) so callers see why generation stopped instead of a silent cutoff.
         if (chunk.error) {
-          res.write(`data: ${JSON.stringify({ error: chunk.error })}\n\n`);
+          await writeBackpressured(res, `data: ${JSON.stringify({ error: chunk.error })}\n\n`);
           continue;
         }
 
@@ -3989,22 +4007,22 @@ async function handleOpenAICompletions(req, res) {
           id, object: 'text_completion', created, model: effectiveModel,
           choices: [{ text, index: 0, logprobs: null, finish_reason: choice.finish_reason || null }],
         };
-        res.write(`data: ${JSON.stringify(completionsChunk)}\n\n`);
+        await writeBackpressured(res, `data: ${JSON.stringify(completionsChunk)}\n\n`);
       }
     }
-    if (buf) res.write(buf);
+    if (buf) await writeBackpressured(res, buf);
   } catch (e) {
     if (e.name === 'AbortError') {
       if (timedOut && !res.writableEnded) {
         const timeoutMsg = idleTimedOut
           ? `No tokens received for ${PROXY_IDLE_TIMEOUT}ms — stream appears stuck`
           : `Ollama did not respond within ${PROXY_TIMEOUT}ms`;
-        res.write(`data: ${JSON.stringify({ error: { type: 'timeout_error', message: timeoutMsg } })}\n\n`);
+        await writeBackpressured(res, `data: ${JSON.stringify({ error: { type: 'timeout_error', message: timeoutMsg } })}\n\n`);
       }
     } else {
       console.error('Completions stream error:', e.message);
       if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify({ error: { type: 'stream_error', message: e.message } })}\n\n`);
+        await writeBackpressured(res, `data: ${JSON.stringify({ error: { type: 'stream_error', message: e.message } })}\n\n`);
       }
     }
   } finally {
@@ -4440,4 +4458,6 @@ module.exports = {
   handleModels,
   handleModelById,
   handleDashboard,
+  // SSE backpressure internals exported for unit testing only.
+  writeBackpressured,
 };
