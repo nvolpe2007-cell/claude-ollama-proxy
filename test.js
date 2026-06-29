@@ -4438,6 +4438,92 @@ describe('Batch ownership / per-API-key isolation', () => {
     }
   });
 
+  // EventEmitter-based mock so res.write() can simulate a full write buffer (returning
+  // false) and later signal recovery via a real 'drain' event, the way Node's actual
+  // http.ServerResponse does.
+  function backpressureMockRes(failAfterWrites) {
+    const { EventEmitter } = require('events');
+    const res = new EventEmitter();
+    res._status = null;
+    res._body = '';
+    res._headers = {};
+    res._writeCount = 0;
+    res.writableEnded = false;
+    res.setHeader = (k, v) => { res._headers[k] = v; };
+    res.getHeader = (k) => res._headers[k];
+    res.writeHead = (status, headers) => { res._status = status; if (headers) Object.assign(res._headers, headers); };
+    res.write = (chunk) => {
+      res._body += chunk;
+      res._writeCount++;
+      return res._writeCount <= failAfterWrites ? false : true;
+    };
+    res.end = (chunk = '') => { res._body += chunk; res.writableEnded = true; };
+    return res;
+  }
+
+  test('handleGetBatchResults pauses on backpressure and resumes after drain', async () => {
+    const batch = makeBatch({
+      owner: 'nick',
+      requests: [
+        { custom_id: 'r1', params: {} },
+        { custom_id: 'r2', params: {} },
+        { custom_id: 'r3', params: {} },
+      ],
+      results: new Map([
+        ['r1', { type: 'succeeded', message: { id: 'm1' } }],
+        ['r2', { type: 'succeeded', message: { id: 'm2' } }],
+        ['r3', { type: 'succeeded', message: { id: 'm3' } }],
+      ]),
+    });
+    try {
+      const res = backpressureMockRes(1); // first write() reports a full buffer
+      const pending = handleGetBatchResults(mockReq('nick'), res, batch.id);
+      await new Promise(r => setImmediate(r));
+      assert.equal(res._writeCount, 1, 'should stop writing until drain fires');
+      assert.equal(res.writableEnded, false, 'should not end the response while paused');
+
+      res.emit('drain');
+      await pending;
+
+      assert.equal(res._writeCount, 3, 'all results should be written once drained');
+      assert.equal(res.writableEnded, true);
+      const lines = res._body.trim().split('\n').map(l => JSON.parse(l));
+      assert.deepEqual(lines.map(l => l.custom_id), ['r1', 'r2', 'r3']);
+    } finally {
+      _batches.delete(batch.id);
+    }
+  });
+
+  test('handleGetBatchResults stops writing once the client disconnects mid-stream', async () => {
+    const batch = makeBatch({
+      owner: 'nick',
+      requests: [
+        { custom_id: 'r1', params: {} },
+        { custom_id: 'r2', params: {} },
+        { custom_id: 'r3', params: {} },
+      ],
+      results: new Map([
+        ['r1', { type: 'succeeded', message: { id: 'm1' } }],
+        ['r2', { type: 'succeeded', message: { id: 'm2' } }],
+        ['r3', { type: 'succeeded', message: { id: 'm3' } }],
+      ]),
+    });
+    try {
+      const res = backpressureMockRes(1); // first write() reports a full buffer
+      const pending = handleGetBatchResults(mockReq('nick'), res, batch.id);
+      await new Promise(r => setImmediate(r));
+      assert.equal(res._writeCount, 1, 'should be paused waiting on drain');
+
+      res.writableEnded = true; // client disconnected while paused
+      res.emit('close');
+      await pending;
+
+      assert.equal(res._writeCount, 1, 'should not write further lines after disconnect');
+    } finally {
+      _batches.delete(batch.id);
+    }
+  });
+
   test('handleCancelBatch returns 404 and does not cancel a batch owned by a different key', async () => {
     const batch = makeBatch({ owner: 'nick', status: 'in_progress', ended_at: null });
     try {

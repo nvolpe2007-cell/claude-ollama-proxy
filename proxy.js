@@ -2692,12 +2692,26 @@ async function handleGetBatchResults(req, res, batchId) {
     return;
   }
   res.writeHead(200, { 'Content-Type': 'application/x-jsonl' });
+  // A batch can hold up to MAX_BATCH_REQUESTS (100,000) results, all already in memory —
+  // unlike every other streaming handler here, nothing paces these writes against a slow
+  // upstream fetch. Without honouring res.write()'s backpressure signal, a slow client
+  // would let Node buffer the entire multi-megabyte response in memory before the socket
+  // ever drains, and concurrent requests against a large batch could exhaust memory.
   for (const item of batch.requests) {
+    if (res.writableEnded) break;
     const result = batch.results.get(item.custom_id)
       || { type: 'errored', error: { type: 'internal_error', message: 'No result recorded' } };
-    res.write(JSON.stringify({ custom_id: item.custom_id, result }) + '\n');
+    const ok = res.write(JSON.stringify({ custom_id: item.custom_id, result }) + '\n');
+    if (ok === false && !res.writableEnded) {
+      await new Promise(resolve => {
+        const onDrain = () => { res.off('close', onClose); resolve(); };
+        const onClose = () => { res.off('drain', onDrain); resolve(); };
+        res.once('drain', onDrain);
+        res.once('close', onClose);
+      });
+    }
   }
-  res.end();
+  if (!res.writableEnded) res.end();
 }
 
 async function handleCancelBatch(req, res, batchId) {
