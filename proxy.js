@@ -3892,6 +3892,11 @@ async function handleOpenAICompletions(req, res) {
     req.socket.off('close', onClientClose);
     clearTO();
     const choice = data.choices?.[0];
+    if (!choice || !choice.message) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'ollama_error', message: 'Empty choices in Ollama response' } }));
+      return;
+    }
     const promptTok     = data.usage?.prompt_tokens     || 0;
     const completionTok = data.usage?.completion_tokens || 0;
     recordTokens(promptTok, completionTok, effectiveModel, req._apiKeyName);
@@ -3903,10 +3908,10 @@ async function handleOpenAICompletions(req, res) {
       created: Math.floor(Date.now() / 1000),
       model: effectiveModel,
       choices: [{
-        text: choice?.message?.content || '',
+        text: choice.message.content || '',
         index: 0,
         logprobs: null,
-        finish_reason: choice?.finish_reason || 'stop',
+        finish_reason: choice.finish_reason || 'stop',
       }],
       usage: {
         prompt_tokens:     promptTok,
