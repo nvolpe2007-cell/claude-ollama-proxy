@@ -2168,6 +2168,106 @@ describe('handleDeleteModel / handlePullModel — model access control', () => {
   });
 });
 
+describe('handlePullModel — streaming backpressure', () => {
+  const { handlePullModel } = require('./proxy');
+
+  function mockReq(body) {
+    return {
+      headers: {},
+      socket: { remoteAddress: '127.0.0.1', once() {}, off() {} },
+      [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify(body)); },
+    };
+  }
+
+  // EventEmitter-based mock so res.write() can simulate a full write buffer (returning
+  // false) and later signal recovery via a real 'drain' event, the way Node's actual
+  // http.ServerResponse does. Mirrors the helper used for handleMessages/handleOpenAIChat/
+  // handleOpenAICompletions.
+  function backpressureMockRes(failAfterWrites) {
+    const { EventEmitter } = require('events');
+    const res = new EventEmitter();
+    res.headersSent = false;
+    res.writableEnded = false;
+    res._status = null;
+    res._body = '';
+    res._headers = {};
+    res._writeCount = 0;
+    res.setHeader = (k, v) => { res._headers[k] = v; };
+    res.getHeader = (k) => res._headers[k];
+    res.writeHead = (status, headers) => { res._status = status; res.headersSent = true; if (headers) Object.assign(res._headers, headers); };
+    res.write = (chunk) => {
+      res._body += chunk;
+      res._writeCount++;
+      return res._writeCount <= failAfterWrites ? false : true;
+    };
+    res.end = (chunk = '') => { res._body += chunk; res.writableEnded = true; };
+    return res;
+  }
+
+  // Stubs global.fetch to return raw NDJSON lines (Ollama's /api/pull progress format),
+  // one line per body.getReader().read() call — distinct from the SSE `data: `-prefixed
+  // stub used by the other handlers' streaming tests.
+  function stubStreamFetch(ndjsonLines) {
+    const enc = new TextEncoder();
+    let pos = 0;
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      body: {
+        getReader() {
+          return {
+            async read() {
+              if (pos >= ndjsonLines.length) return { done: true, value: undefined };
+              return { done: false, value: enc.encode(ndjsonLines[pos++] + '\n') };
+            },
+            releaseLock() {},
+          };
+        },
+      },
+    });
+    return () => { global.fetch = orig; };
+  }
+
+  test('streaming: pauses on backpressure and resumes after drain', async () => {
+    const restore = stubStreamFetch([
+      JSON.stringify({ status: 'pulling manifest' }),
+      JSON.stringify({ status: 'success' }),
+    ]);
+    try {
+      const res = backpressureMockRes(1); // first SSE write() reports a full buffer
+      const pending = handlePullModel(mockReq({ model: 'llama3.2:1b', stream: true }), res);
+      await new Promise(r => setImmediate(r));
+      assert.equal(res._writeCount, 1, 'should stop writing until drain fires');
+      assert.equal(res.writableEnded, false, 'should not end the response while paused');
+
+      res.emit('drain');
+      await pending;
+
+      assert.equal(res.writableEnded, true);
+      assert.ok(res._body.includes('"pulled":true'), 'should emit the final pulled:true event');
+    } finally { restore(); }
+  });
+
+  test('streaming: stops writing once the client disconnects mid-stream', async () => {
+    const restore = stubStreamFetch([
+      JSON.stringify({ status: 'pulling manifest' }),
+      JSON.stringify({ status: 'success' }),
+    ]);
+    try {
+      const res = backpressureMockRes(1); // first SSE write() reports a full buffer
+      const pending = handlePullModel(mockReq({ model: 'llama3.2:1b', stream: true }), res);
+      await new Promise(r => setImmediate(r));
+      assert.equal(res._writeCount, 1, 'should be paused waiting on drain');
+
+      res.writableEnded = true; // client disconnected while paused
+      res.emit('close');
+      await pending;
+
+      assert.equal(res._writeCount, 1, 'should not write further SSE events after disconnect');
+    } finally { restore(); }
+  });
+});
+
 // ── POST /v1/messages/count_tokens — PROXY_API_KEY_MODELS enforcement ──────────
 // handleCountTokens resolved the model and forwarded it straight to Ollama's
 // /api/tokenize endpoint without ever checking the caller's model allow-list,
@@ -2528,6 +2628,78 @@ describe('handleOpenAICompletions', () => {
       assert.ok(errLine, 'should write an error data line');
       const parsed = JSON.parse(errLine.slice(6));
       assert.equal(parsed.error.message, 'model crashed');
+    } finally { restore(); }
+  });
+
+  // EventEmitter-based mock so res.write() can simulate a full write buffer (returning
+  // false) and later signal recovery via a real 'drain' event, the way Node's actual
+  // http.ServerResponse does. Mirrors the helper used for handleGetBatchResults/handleMessages.
+  function backpressureMockRes(failAfterWrites) {
+    const { EventEmitter } = require('events');
+    const res = new EventEmitter();
+    res.headersSent = false;
+    res.writableEnded = false;
+    res._status = null;
+    res._body = '';
+    res._headers = {};
+    res._writeCount = 0;
+    res.setHeader = (k, v) => { res._headers[k] = v; };
+    res.getHeader = (k) => res._headers[k];
+    res.writeHead = (status, headers) => {
+      res._status = status; res.headersSent = true;
+      if (headers) for (const [k, v] of Object.entries(headers)) res._headers[k] = v;
+    };
+    res.write = (chunk) => {
+      res._body += chunk;
+      res._writeCount++;
+      return res._writeCount <= failAfterWrites ? false : true;
+    };
+    res.end = (chunk = '') => { res._body += chunk; res.writableEnded = true; };
+    return res;
+  }
+
+  test('streaming: pauses on backpressure and resumes after drain', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const req = mockReq({ prompt: 'hi', stream: true });
+      const res = backpressureMockRes(1); // first SSE line write() reports a full buffer
+      const pending = handleOpenAICompletions(req, res);
+      await new Promise(r => setImmediate(r));
+      assert.equal(res._writeCount, 1, 'should stop writing until drain fires');
+      assert.equal(res.writableEnded, false, 'should not end the response while paused');
+
+      res.emit('drain');
+      await pending;
+
+      assert.equal(res.writableEnded, true);
+      assert.ok(res._body.includes('[DONE]'), 'all lines including [DONE] should flush once drained');
+    } finally { restore(); }
+  });
+
+  test('streaming: stops writing once the client disconnects mid-stream', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const req = mockReq({ prompt: 'hi', stream: true });
+      const res = backpressureMockRes(1); // first SSE line write() reports a full buffer
+      const pending = handleOpenAICompletions(req, res);
+      await new Promise(r => setImmediate(r));
+      assert.equal(res._writeCount, 1, 'should be paused waiting on drain');
+
+      res.writableEnded = true; // client disconnected while paused
+      res.emit('close');
+      await pending;
+
+      assert.equal(res._writeCount, 1, 'should not write further lines after disconnect');
     } finally { restore(); }
   });
 });
@@ -3192,6 +3364,74 @@ describe('handleMessages', () => {
       await handleMessages(mockReq({ messages: [{ role: 'user', content: 'ok' }], stream: true }), res);
       const events = parseSse(res._body);
       assert.equal(events[events.length - 1].event, 'message_stop');
+    } finally { restore(); }
+  });
+
+  // EventEmitter-based mock so res.write() can simulate a full write buffer (returning
+  // false) and later signal recovery via a real 'drain' event, the way Node's actual
+  // http.ServerResponse does. Mirrors the helper used for handleGetBatchResults.
+  function backpressureMockRes(failAfterWrites) {
+    const { EventEmitter } = require('events');
+    const res = new EventEmitter();
+    res.headersSent = false;
+    res.writableEnded = false;
+    res._status = null;
+    res._body = '';
+    res._headers = {};
+    res._writeCount = 0;
+    res.setHeader = (k, v) => { res._headers[k] = v; };
+    res.getHeader = (k) => res._headers[k];
+    res.writeHead = (status, headers) => { res._status = status; res.headersSent = true; if (headers) Object.assign(res._headers, headers); };
+    res.write = (chunk) => {
+      res._body += chunk;
+      res._writeCount++;
+      return res._writeCount <= failAfterWrites ? false : true;
+    };
+    res.end = (chunk = '') => { res._body += chunk; res.writableEnded = true; };
+    return res;
+  }
+
+  test('streaming: pauses on backpressure and resumes after drain', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"content":"!"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = backpressureMockRes(1); // first SSE write() reports a full buffer
+      const pending = handleMessages(mockReq({ messages: [{ role: 'user', content: 'Hello' }], stream: true }), res);
+      await new Promise(r => setImmediate(r));
+      assert.equal(res._writeCount, 1, 'should stop writing until drain fires');
+      assert.equal(res.writableEnded, false, 'should not end the response while paused');
+
+      res.emit('drain');
+      await pending;
+
+      assert.equal(res.writableEnded, true);
+      const events = parseSse(res._body);
+      assert.equal(events[events.length - 1].event, 'message_stop');
+    } finally { restore(); }
+  });
+
+  test('streaming: stops writing once the client disconnects mid-stream', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}',
+      'data: {"choices":[{"index":0,"delta":{"content":"!"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = backpressureMockRes(1); // first SSE write() reports a full buffer
+      const pending = handleMessages(mockReq({ messages: [{ role: 'user', content: 'Hello' }], stream: true }), res);
+      await new Promise(r => setImmediate(r));
+      assert.equal(res._writeCount, 1, 'should be paused waiting on drain');
+
+      res.writableEnded = true; // client disconnected while paused
+      res.emit('close');
+      await pending;
+
+      assert.equal(res._writeCount, 1, 'should not write further SSE events after disconnect');
     } finally { restore(); }
   });
 
@@ -5015,6 +5255,76 @@ describe('handleOpenAIChat', () => {
       await handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'ping' }], stream: true }), res);
       assert.equal(res._headers['X-Accel-Buffering'], 'no',
         'streaming OpenAI passthrough must include X-Accel-Buffering: no');
+    } finally { restore(); }
+  });
+
+  // EventEmitter-based mock so res.write() can simulate a full write buffer (returning
+  // false) and later signal recovery via a real 'drain' event, the way Node's actual
+  // http.ServerResponse does. Mirrors the helper used for handleGetBatchResults/handleMessages.
+  function backpressureMockRes(failAfterWrites) {
+    const { EventEmitter } = require('events');
+    const res = new EventEmitter();
+    res.headersSent = false;
+    res.writableEnded = false;
+    res._status = null;
+    res._body = '';
+    res._headers = {};
+    res._writeCount = 0;
+    res.setHeader = (k, v) => { res._headers[k] = v; };
+    res.getHeader = (k) => res._headers[k];
+    res.writeHead = (status, headers) => {
+      res._status = status; res.headersSent = true;
+      if (headers) for (const [k, v] of Object.entries(headers)) res._headers[k] = v;
+    };
+    res.write = (chunk) => {
+      res._body += chunk;
+      res._writeCount++;
+      return res._writeCount <= failAfterWrites ? false : true;
+    };
+    res.end = (chunk = '') => { res._body += chunk; res.writableEnded = true; };
+    return res;
+  }
+
+  test('streaming: pauses on backpressure and resumes after drain', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}',
+      'data: {"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = backpressureMockRes(1); // first SSE line write() reports a full buffer
+      const pending = handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'hi' }], stream: true }), res);
+      await new Promise(r => setImmediate(r));
+      assert.equal(res._writeCount, 1, 'should stop writing until drain fires');
+      assert.equal(res.writableEnded, false, 'should not end the response while paused');
+
+      res.emit('drain');
+      await pending;
+
+      assert.equal(res.writableEnded, true);
+      assert.ok(res._body.includes('[DONE]'), 'all lines including [DONE] should flush once drained');
+    } finally { restore(); }
+  });
+
+  test('streaming: stops writing once the client disconnects mid-stream', async () => {
+    const restore = stubStreamFetch([
+      'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}',
+      'data: {"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}',
+      'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}',
+      'data: [DONE]',
+    ]);
+    try {
+      const res = backpressureMockRes(1); // first SSE line write() reports a full buffer
+      const pending = handleOpenAIChat(mockReq({ messages: [{ role: 'user', content: 'hi' }], stream: true }), res);
+      await new Promise(r => setImmediate(r));
+      assert.equal(res._writeCount, 1, 'should be paused waiting on drain');
+
+      res.writableEnded = true; // client disconnected while paused
+      res.emit('close');
+      await pending;
+
+      assert.equal(res._writeCount, 1, 'should not write further lines after disconnect');
     } finally { restore(); }
   });
 
