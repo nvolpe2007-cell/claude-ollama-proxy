@@ -22,6 +22,7 @@ const {
   toOpenAIMessages,
   toOpenAITools,
   toOpenAIToolChoice,
+  validateToolChoice,
   extractThinkingParts,
   documentBlockToText,
   imageBlockToOpenAI,
@@ -154,6 +155,39 @@ describe('validateTools', () => {
     assert.match(validateTools([{}]).error, /non-empty string `name`/);
     assert.match(validateTools([{ name: '' }]).error, /non-empty string `name`/);
     assert.match(validateTools([{ name: 123 }]).error, /non-empty string `name`/);
+  });
+});
+
+// ── validateToolChoice ───────────────────────────────────────────────────────
+
+describe('validateToolChoice', () => {
+  test('accepts absent or null tool_choice', () => {
+    assert.deepEqual(validateToolChoice(undefined), {});
+    assert.deepEqual(validateToolChoice(null), {});
+  });
+
+  test('accepts well-formed tool_choice values', () => {
+    assert.deepEqual(validateToolChoice({ type: 'auto' }), {});
+    assert.deepEqual(validateToolChoice({ type: 'none' }), {});
+    assert.deepEqual(validateToolChoice({ type: 'any' }), {});
+    assert.deepEqual(validateToolChoice({ type: 'tool', name: 'get_weather' }), {});
+  });
+
+  test('rejects a non-object tool_choice', () => {
+    assert.match(validateToolChoice('auto').error, /must be an object with a string `type`/);
+    assert.match(validateToolChoice(42).error, /must be an object with a string `type`/);
+    assert.match(validateToolChoice([]).error, /must be an object with a string `type`/);
+  });
+
+  test('rejects tool_choice missing a string type', () => {
+    assert.match(validateToolChoice({}).error, /must be an object with a string `type`/);
+    assert.match(validateToolChoice({ type: 123 }).error, /must be an object with a string `type`/);
+  });
+
+  test('rejects type "tool" without a non-empty string name, the case that crashes toOpenAIToolChoice silently', () => {
+    assert.match(validateToolChoice({ type: 'tool' }).error, /non-empty string `name`/);
+    assert.match(validateToolChoice({ type: 'tool', name: '' }).error, /non-empty string `name`/);
+    assert.match(validateToolChoice({ type: 'tool', name: 123 }).error, /non-empty string `name`/);
   });
 });
 
