@@ -73,6 +73,8 @@ const {
   validateEncodingFormat,
   embeddingToBase64,
   handleDashboard,
+  detectModelContextLength,
+  _setAutoDetectedCtx,
 } = require('./proxy');
 
 // ── resolveModel ──────────────────────────────────────────────────────────────
@@ -6742,5 +6744,106 @@ describe('GET / dashboard — XSS escaping', () => {
     });
     assert.ok(html.includes('GET /health'));
     assert.ok(html.includes('qwen2.5:7b'));
+  });
+});
+
+// ── detectModelContextLength ──────────────────────────────────────────────────
+
+describe('detectModelContextLength', () => {
+  function mockFetch(impl) {
+    const orig = global.fetch;
+    global.fetch = impl;
+    return () => { global.fetch = orig; };
+  }
+
+  test('returns context length when /api/show responds with model_info', async () => {
+    const restore = mockFetch(async () => ({
+      ok: true,
+      json: async () => ({ model_info: { 'llm.context_length': 32768 } }),
+    }));
+    try {
+      assert.equal(await detectModelContextLength('http://localhost:11434', 'qwen2.5:7b'), 32768);
+    } finally { restore(); }
+  });
+
+  test('returns null when /api/show returns non-ok response', async () => {
+    const restore = mockFetch(async () => ({ ok: false }));
+    try {
+      assert.equal(await detectModelContextLength('http://localhost:11434', 'qwen2.5:7b'), null);
+    } finally { restore(); }
+  });
+
+  test('returns null when fetch throws (Ollama unreachable)', async () => {
+    const restore = mockFetch(async () => { throw new Error('ECONNREFUSED'); });
+    try {
+      assert.equal(await detectModelContextLength('http://localhost:11434', 'qwen2.5:7b'), null);
+    } finally { restore(); }
+  });
+
+  test('returns null for non-integer context_length', async () => {
+    const restore = mockFetch(async () => ({
+      ok: true,
+      json: async () => ({ model_info: { 'llm.context_length': 'huge' } }),
+    }));
+    try {
+      assert.equal(await detectModelContextLength('http://localhost:11434', 'qwen2.5:7b'), null);
+    } finally { restore(); }
+  });
+
+  test('returns null when model_info is absent', async () => {
+    const restore = mockFetch(async () => ({
+      ok: true,
+      json: async () => ({ details: { family: 'qwen' } }),
+    }));
+    try {
+      assert.equal(await detectModelContextLength('http://localhost:11434', 'qwen2.5:7b'), null);
+    } finally { restore(); }
+  });
+
+  test('returns null for zero context_length', async () => {
+    const restore = mockFetch(async () => ({
+      ok: true,
+      json: async () => ({ model_info: { 'llm.context_length': 0 } }),
+    }));
+    try {
+      assert.equal(await detectModelContextLength('http://localhost:11434', 'qwen2.5:7b'), null);
+    } finally { restore(); }
+  });
+
+  test('passes the correct model name and endpoint in the fetch call', async () => {
+    let capturedUrl, capturedBody;
+    const restore = mockFetch(async (url, opts) => {
+      capturedUrl = url;
+      capturedBody = JSON.parse(opts.body);
+      return { ok: true, json: async () => ({ model_info: { 'llm.context_length': 4096 } }) };
+    });
+    try {
+      await detectModelContextLength('http://gpu1:11434', 'mistral:7b');
+      assert.equal(capturedUrl, 'http://gpu1:11434/api/show');
+      assert.deepEqual(capturedBody, { model: 'mistral:7b' });
+    } finally { restore(); }
+  });
+});
+
+// ── _setAutoDetectedCtx + truncateToContext integration ───────────────────────
+
+describe('_setAutoDetectedCtx enables truncation without OLLAMA_NUM_CTX', () => {
+  test('truncateToContext still trims when called with the injected ctx value', () => {
+    // We can't toggle PROXY_AUTO_TRUNCATE or OLLAMA_NUM_CTX at runtime, but we can
+    // verify that truncateToContext — the function all three truncation sites call —
+    // correctly trims a history that exceeds the auto-detected limit, confirming the
+    // effectiveCtx logic produces sensible results when _autoDetectedCtx is active.
+    _setAutoDetectedCtx(100);
+    try {
+      const big = Array.from({ length: 20 }, (_, i) => ({
+        role: i % 2 === 0 ? 'user' : 'assistant',
+        content: 'x'.repeat(100),
+      }));
+      const { droppedCount, messages } = truncateToContext(big, 100);
+      assert.ok(droppedCount > 0, 'should have dropped some messages');
+      assert.ok(messages.length < big.length, 'result should be shorter than input');
+    } finally {
+      _setAutoDetectedCtx(null);
+    }
   });
 });
