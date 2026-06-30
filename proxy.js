@@ -239,6 +239,37 @@ const PROXY_MAX_BODY_SIZE = (() => {
 // Opt-in (default false) so existing deployments see no behaviour change.
 const PROXY_AUTO_TRUNCATE = process.env.PROXY_AUTO_TRUNCATE === 'true';
 
+// Auto-detected context window from Ollama's /api/show response. Populated at
+// startup when PROXY_AUTO_TRUNCATE=true and OLLAMA_NUM_CTX is not explicitly
+// configured, so truncation works without requiring users to look up and set the
+// model's native context window size themselves.
+let _autoDetectedCtx = null;
+
+// Test hook — lets unit tests inject a context window value without a live Ollama.
+// Reset to null after each test. Exported for unit testing.
+function _setAutoDetectedCtx(v) { _autoDetectedCtx = v; }
+
+// Queries Ollama's /api/show endpoint to learn a model's native context window.
+// Returns the context length as a positive integer, or null if unavailable
+// (Ollama unreachable, model not pulled, or field absent in older Ollama versions).
+// Exported for unit testing.
+async function detectModelContextLength(ollamaBase, modelName) {
+  try {
+    const r = await fetch(`${ollamaBase}/api/show`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: modelName }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    const ctxLen = data.model_info?.['llm.context_length'];
+    return (Number.isInteger(ctxLen) && ctxLen > 0) ? ctxLen : null;
+  } catch {
+    return null;
+  }
+}
+
 // Optional path to a JSON file where the Messages Batch API state (requests + results)
 // is persisted after every change and reloaded at startup. Without this, batches and
 // their results live only in memory and are silently lost if the proxy restarts —
@@ -1369,14 +1400,17 @@ async function handleMessages(req, res) {
   if (OLLAMA_KEEP_ALIVE) openaiReq.keep_alive = OLLAMA_KEEP_ALIVE;
 
   // Auto-truncate message history to prevent "context length exceeded" errors.
-  // Only active when PROXY_AUTO_TRUNCATE=true and OLLAMA_NUM_CTX is set.
-  if (PROXY_AUTO_TRUNCATE && OLLAMA_NUM_CTX) {
+  // Active when PROXY_AUTO_TRUNCATE=true and either OLLAMA_NUM_CTX is set or
+  // the model's context window was auto-detected from Ollama's /api/show at startup.
+  const _truncCtx1 = OLLAMA_NUM_CTX || _autoDetectedCtx;
+  if (PROXY_AUTO_TRUNCATE && _truncCtx1) {
     const origEst = Math.ceil(JSON.stringify(openaiReq.messages).length / 4);
-    const { messages: trimmed, droppedCount } = truncateToContext(openaiReq.messages, OLLAMA_NUM_CTX);
+    const { messages: trimmed, droppedCount } = truncateToContext(openaiReq.messages, _truncCtx1);
     if (droppedCount > 0) {
       openaiReq.messages = trimmed;
       const newEst = Math.ceil(JSON.stringify(trimmed).length / 4);
-      console.warn(`[auto-truncate] Dropped ${droppedCount} message(s): ~${origEst} → ~${newEst} est. tokens (OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX})`);
+      const src = OLLAMA_NUM_CTX ? `OLLAMA_NUM_CTX=${_truncCtx1}` : `auto-detected ctx=${_truncCtx1}`;
+      console.warn(`[auto-truncate] Dropped ${droppedCount} message(s): ~${origEst} → ~${newEst} est. tokens (${src})`);
       res.setHeader('x-context-truncated', String(droppedCount));
     }
   }
@@ -2349,11 +2383,13 @@ async function processBatchRequest(anthropicReq, ollamaBase, apiKeyName) {
   if (OLLAMA_NUM_CTX)    openaiReq.num_ctx    = OLLAMA_NUM_CTX;
   if (OLLAMA_KEEP_ALIVE) openaiReq.keep_alive = OLLAMA_KEEP_ALIVE;
 
-  if (PROXY_AUTO_TRUNCATE && OLLAMA_NUM_CTX) {
-    const { messages: trimmed, droppedCount } = truncateToContext(openaiReq.messages, OLLAMA_NUM_CTX);
+  const _truncCtx2 = OLLAMA_NUM_CTX || _autoDetectedCtx;
+  if (PROXY_AUTO_TRUNCATE && _truncCtx2) {
+    const { messages: trimmed, droppedCount } = truncateToContext(openaiReq.messages, _truncCtx2);
     if (droppedCount > 0) {
       openaiReq.messages = trimmed;
-      console.warn(`[auto-truncate/batch] Dropped ${droppedCount} message(s) to fit OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX}`);
+      const src = OLLAMA_NUM_CTX ? `OLLAMA_NUM_CTX=${_truncCtx2}` : `auto-detected ctx=${_truncCtx2}`;
+      console.warn(`[auto-truncate/batch] Dropped ${droppedCount} message(s) to fit ${src}`);
     }
   }
 
@@ -3571,13 +3607,15 @@ async function handleOpenAIChat(req, res) {
     }
   }
 
-  if (PROXY_AUTO_TRUNCATE && OLLAMA_NUM_CTX) {
+  const _truncCtx3 = OLLAMA_NUM_CTX || _autoDetectedCtx;
+  if (PROXY_AUTO_TRUNCATE && _truncCtx3) {
     const origEst = Math.ceil(JSON.stringify(openaiReq.messages).length / 4);
-    const { messages: trimmed, droppedCount } = truncateToContext(openaiReq.messages, OLLAMA_NUM_CTX);
+    const { messages: trimmed, droppedCount } = truncateToContext(openaiReq.messages, _truncCtx3);
     if (droppedCount > 0) {
       openaiReq.messages = trimmed;
       const newEst = Math.ceil(JSON.stringify(trimmed).length / 4);
-      console.warn(`[auto-truncate] Dropped ${droppedCount} message(s): ~${origEst} → ~${newEst} est. tokens (OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX})`);
+      const src = OLLAMA_NUM_CTX ? `OLLAMA_NUM_CTX=${_truncCtx3}` : `auto-detected ctx=${_truncCtx3}`;
+      console.warn(`[auto-truncate] Dropped ${droppedCount} message(s): ~${origEst} → ~${newEst} est. tokens (${src})`);
       res.setHeader('x-context-truncated', String(droppedCount));
     }
   }
@@ -4252,7 +4290,7 @@ if (require.main === module) {
     console.log(`  Think : ${PROXY_FORCE_THINK ? 'forced (think:true on every request — set PROXY_FORCE_THINK=false to disable)' : 'client-controlled (set PROXY_FORCE_THINK=true to always enable for thinking models)'}`);
     console.log(`  Warmup: ${PROXY_WARMUP ? 'enabled — pre-loading model on startup' : 'disabled (set PROXY_WARMUP=true to pre-load model)'}`);
     if (PROXY_AUTO_TRUNCATE) {
-      console.log(`  AutoTruncate: enabled — drops oldest turns when est. input > ${OLLAMA_NUM_CTX ? OLLAMA_NUM_CTX + ' tokens' : 'OLLAMA_NUM_CTX (not set — truncation inactive until OLLAMA_NUM_CTX is configured)'}`);
+      console.log(`  AutoTruncate: enabled — drops oldest turns when est. input > ${OLLAMA_NUM_CTX ? OLLAMA_NUM_CTX + ' tokens' : '(auto-detecting ctx window from Ollama /api/show; set OLLAMA_NUM_CTX to override)'}`);
     }
     console.log(`  Batches: ${PROXY_BATCH_PERSIST_PATH ? `persisted to ${PROXY_BATCH_PERSIST_PATH}` : 'in-memory only (set PROXY_BATCH_PERSIST_PATH to survive restarts)'}`);
     const rlGlobal = RATE_LIMIT_RPM         ? `global ${RATE_LIMIT_RPM} req/min`     : 'no global limit';
@@ -4285,6 +4323,23 @@ if (require.main === module) {
           console.warn(`  Warning: ${failures.length} Ollama host(s) unreachable at startup:`);
           failures.forEach(f => console.warn(`    ${f}`));
           console.warn('  Requests will fail until Ollama is running. Start with: ollama serve\n');
+        }
+      });
+    }
+
+    // Auto-detect the model's context window from Ollama's /api/show when
+    // PROXY_AUTO_TRUNCATE=true but OLLAMA_NUM_CTX was not explicitly configured.
+    // Fires non-blocking so the server starts accepting requests immediately;
+    // truncation activates as soon as the response arrives (typically <1 s).
+    if (PROXY_AUTO_TRUNCATE && !OLLAMA_NUM_CTX) {
+      setImmediate(async () => {
+        const host = OLLAMA_HOSTS[0];
+        const ctx = await detectModelContextLength(host, MODEL);
+        if (ctx) {
+          _autoDetectedCtx = ctx;
+          console.log(`  AutoTruncate: auto-detected ${MODEL} context window = ${ctx} tokens (set OLLAMA_NUM_CTX to override)\n`);
+        } else {
+          console.warn(`  AutoTruncate: could not auto-detect context window for ${MODEL} from ${host} — set OLLAMA_NUM_CTX manually\n`);
         }
       });
     }
@@ -4380,6 +4435,9 @@ module.exports = {
   PROXY_TRUST_PROXY,
   PROXY_AUTO_TRUNCATE,
   truncateToContext,
+  _autoDetectedCtx,
+  _setAutoDetectedCtx,
+  detectModelContextLength,
   toOpenAIMessages,
   toOpenAITools,
   toOpenAIToolChoice,
