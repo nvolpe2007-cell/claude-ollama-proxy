@@ -912,6 +912,23 @@ function toOpenAIToolChoice(tc) {
   }
 }
 
+// Validates a request's optional `tool_choice` field. toOpenAIToolChoice() reads
+// `tc.name` unguarded when `type` is 'tool', so a missing or non-string `name`
+// (e.g. `tool_choice: { type: 'tool' }`) would silently produce a malformed
+// OpenAI tool_choice (`{ type: 'function', function: { name: undefined } }`)
+// forwarded to Ollama instead of a clear 400. Returns { error } when invalid,
+// or {} when tool_choice is absent/null or well-formed. Exported for unit testing.
+function validateToolChoice(toolChoice) {
+  if (toolChoice === undefined || toolChoice === null) return {};
+  if (typeof toolChoice !== 'object' || Array.isArray(toolChoice) || typeof toolChoice.type !== 'string') {
+    return { error: '`tool_choice` must be an object with a string `type`' };
+  }
+  if (toolChoice.type === 'tool' && (typeof toolChoice.name !== 'string' || !toolChoice.name)) {
+    return { error: "`tool_choice` with type 'tool' requires a non-empty string `name`" };
+  }
+  return {};
+}
+
 function sendSSE(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
@@ -1317,6 +1334,15 @@ async function handleMessages(req, res) {
     clearTO();
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: systemResult.error } }));
+    return;
+  }
+
+  const toolChoiceResult = validateToolChoice(anthropicReq.tool_choice);
+  if (toolChoiceResult.error) {
+    req.socket.off('close', onClientClose);
+    clearTO();
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: toolChoiceResult.error } }));
     return;
   }
 
@@ -2335,6 +2361,9 @@ async function processBatchRequest(anthropicReq, ollamaBase, apiKeyName) {
   };
   const tools = toOpenAITools(anthropicReq.tools);
   if (tools) openaiReq.tools = tools;
+  const toolChoiceResult = validateToolChoice(anthropicReq.tool_choice);
+  if (toolChoiceResult.error)
+    return { type: 'errored', error: { type: 'invalid_request_error', message: toolChoiceResult.error } };
   const toolChoice = toOpenAIToolChoice(anthropicReq.tool_choice);
   if (toolChoice !== undefined) openaiReq.tool_choice = toolChoice;
   if (anthropicReq.temperature          !== undefined) openaiReq.temperature          = anthropicReq.temperature;
@@ -2591,6 +2620,12 @@ async function handleCreateBatch(req, res) {
     if (batchSystemResult.error) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchSystemResult.error}` } }));
+      return;
+    }
+    const batchToolChoiceResult = validateToolChoice(r.params.tool_choice);
+    if (batchToolChoiceResult.error) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Request '${r.custom_id}': ${batchToolChoiceResult.error}` } }));
       return;
     }
     const batchMaxTokensResult = resolveMaxTokens(r.params.max_tokens);
@@ -4383,6 +4418,7 @@ module.exports = {
   toOpenAIMessages,
   toOpenAITools,
   toOpenAIToolChoice,
+  validateToolChoice,
   extractThinkingParts,
   documentBlockToText,
   imageBlockToOpenAI,
