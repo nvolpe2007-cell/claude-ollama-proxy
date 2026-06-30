@@ -1476,11 +1476,12 @@ async function handleMessages(req, res) {
       }
     }
     if (msg.tool_calls) {
-      for (const tc of msg.tool_calls) {
+      for (let i = 0; i < msg.tool_calls.length; i++) {
+        const tc = msg.tool_calls[i];
         let input = {};
-        try { input = JSON.parse(tc.function.arguments); }
+        try { input = JSON.parse(tc.function?.arguments); }
         catch { console.warn(`[tool-call] Model returned non-JSON arguments for tool "${tc.function?.name}", defaulting to {}: ${tc.function?.arguments}`); }
-        content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+        content.push({ type: 'tool_use', id: tc.id || `toolu_${i}`, name: tc.function?.name || '', input });
       }
     }
 
@@ -2401,11 +2402,12 @@ async function processBatchRequest(anthropicReq, ollamaBase, apiKeyName) {
     }
   }
   if (msg.tool_calls) {
-    for (const tc of msg.tool_calls) {
+    for (let i = 0; i < msg.tool_calls.length; i++) {
+      const tc = msg.tool_calls[i];
       let input = {};
-      try { input = JSON.parse(tc.function.arguments); }
+      try { input = JSON.parse(tc.function?.arguments); }
       catch { console.warn(`[tool-call] Model returned non-JSON arguments for tool "${tc.function?.name}", defaulting to {}: ${tc.function?.arguments}`); }
-      content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+      content.push({ type: 'tool_use', id: tc.id || `toolu_${i}`, name: tc.function?.name || '', input });
     }
   }
 
