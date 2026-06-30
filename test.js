@@ -5455,6 +5455,27 @@ describe('truncateToContext', () => {
     assert.ok(droppedCount >= 2, `expected droppedCount >=2, got ${droppedCount}`);
     assert.equal(messages[0].role, 'user');
   });
+
+  test('drops a single trailing non-user message instead of leaving it dangling', () => {
+    // Regression: the post-loop cleanup used to stop once only 1 message remained,
+    // even if that lone message was not 'user' — silently breaking the "always starts
+    // with a user role" guarantee and forwarding an invalid orphaned message to Ollama
+    // (e.g. a 'tool' result whose assistant tool-call message had already been dropped).
+    const m = [{ role: 'assistant', content: 'Z'.repeat(5000) }];
+    const { messages, droppedCount } = truncateToContext(m, 1);
+    assert.deepEqual(messages, []);
+    assert.equal(droppedCount, 1);
+  });
+
+  test('drops a dangling tool result with no system message down to empty', () => {
+    const m = [
+      { role: 'assistant', content: 'A'.repeat(2000), tool_calls: [{ id: 'c1' }] },
+      { role: 'tool',      tool_call_id: 'c1', content: 'result' },
+    ];
+    const { messages, droppedCount } = truncateToContext(m, 1);
+    assert.deepEqual(messages, []);
+    assert.equal(droppedCount, 2);
+  });
 });
 
 // ── handleEmbeddings ──────────────────────────────────────────────────────────
