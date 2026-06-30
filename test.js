@@ -3052,6 +3052,30 @@ describe('handleMessages', () => {
     } finally { restore(); }
   });
 
+  test('non-streaming: tool_use generates fallback id when Ollama omits it', async () => {
+    const restore = stubFetch({
+      choices: [{
+        message: {
+          content: null,
+          // id field deliberately absent — some Ollama models omit it
+          tool_calls: [{ function: { name: 'search', arguments: '{"q":"test"}' } }],
+        },
+        finish_reason: 'tool_calls',
+      }],
+      usage: { prompt_tokens: 5, completion_tokens: 2 },
+    });
+    try {
+      const res = mockRes();
+      await handleMessages(mockReq({ messages: [{ role: 'user', content: 'Search' }], stream: false }), res);
+      const body = JSON.parse(res._body);
+      const tu = body.content.find(c => c.type === 'tool_use');
+      assert.ok(tu, 'should have tool_use block');
+      assert.ok(tu.id, 'tool_use.id must be non-empty (fallback generated)');
+      assert.match(tu.id, /^toolu_0$/, 'fallback id should be toolu_<index>');
+      assert.equal(tu.name, 'search');
+    } finally { restore(); }
+  });
+
   test('non-streaming: empty choices array returns 502', async () => {
     const restore = stubFetch({ choices: [], usage: {} });
     try {
@@ -4212,6 +4236,47 @@ describe('processBatch — malformed Ollama responses', () => {
       assert.ok(warns.some(w => w.includes('[tool-call]') && w.includes('get_weather')));
     } finally {
       console.warn = origWarn;
+      global.fetch = orig;
+      _batches.delete(batch.id);
+    }
+  });
+
+  test('tool_use generates fallback id when Ollama omits it (batch path)', async () => {
+    const batch = {
+      id:              'msgbatch_missing_tool_id_test',
+      status:          'in_progress',
+      expires_at:      new Date(Date.now() + 60_000).toISOString(),
+      ended_at:        null,
+      cancelRequested: false,
+      requests: [
+        { custom_id: 'r1', params: { messages: [], model: 'test', max_tokens: 1 } },
+      ],
+      results: new Map(),
+    };
+    _batches.set(batch.id, batch);
+
+    const orig = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200,
+      json: async () => ({
+        choices: [{
+          // id field deliberately absent — some Ollama models omit it
+          message: { content: null, tool_calls: [{ function: { name: 'lookup', arguments: '{}' } }] },
+          finish_reason: 'tool_calls',
+        }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+    });
+
+    try {
+      await processBatch(batch);
+      const result = batch.results.get('r1');
+      assert.equal(result.type, 'succeeded');
+      const tu = result.message.content.find(c => c.type === 'tool_use');
+      assert.ok(tu, 'should have tool_use block');
+      assert.ok(tu.id, 'tool_use.id must be non-empty (fallback generated)');
+      assert.match(tu.id, /^toolu_0$/, 'fallback id should be toolu_<index>');
+    } finally {
       global.fetch = orig;
       _batches.delete(batch.id);
     }
