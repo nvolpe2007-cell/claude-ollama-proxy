@@ -729,8 +729,13 @@ function truncateToContext(messages, maxInputTokens) {
 
   // Post-loop cleanup: if the outer while stopped at KEEP_LAST but the head is still
   // not a user message (e.g. last 2 are [assistant, user]), drop orphaned non-user
-  // messages until we reach a user or only 1 message remains.
-  while (history.length > 1 && history[0]?.role !== 'user') {
+  // messages until we reach a user message — even down to an empty array. A lone
+  // trailing non-user message (e.g. a dangling 'tool' result whose corresponding
+  // assistant tool-call message was just dropped, or a single orphaned 'assistant'
+  // message) is just as invalid as a 2-message non-user head, so the floor here must
+  // be 0, not 1 — otherwise the documented "always starts with a user role" guarantee
+  // is silently broken for the single-message case.
+  while (history.length > 0 && history[0]?.role !== 'user') {
     history.shift();
     droppedCount++;
   }
