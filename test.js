@@ -6744,3 +6744,158 @@ describe('GET / dashboard — XSS escaping', () => {
     assert.ok(html.includes('qwen2.5:7b'));
   });
 });
+
+// ── PROXY_MAX_INPUT_TOKENS ──────────────────────────────────────────────────
+// Loads a fresh proxy module with PROXY_MAX_INPUT_TOKENS set so the constant
+// is captured at the value we want, then restores the module cache. Same pattern
+// as withHosts / withTrustProxy used elsewhere.
+
+function withMaxInputTokens(limit, fn) {
+  const modKey = require.resolve('./proxy');
+  const savedMod = require.cache[modKey];
+  let freshProxy;
+  try {
+    process.env.PROXY_MAX_INPUT_TOKENS = String(limit);
+    delete require.cache[modKey];
+    freshProxy = require('./proxy');
+  } finally {
+    delete process.env.PROXY_MAX_INPUT_TOKENS;
+    delete require.cache[modKey];
+    require.cache[modKey] = savedMod;
+  }
+  return fn(freshProxy);
+}
+
+describe('PROXY_MAX_INPUT_TOKENS', () => {
+  // Shared mock helpers (copied from the handleMessages describe block above).
+  function mockReq(body) {
+    return {
+      headers: {},
+      socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+      method: 'POST',
+      url: '/v1/messages',
+      [Symbol.asyncIterator]: async function* () { yield JSON.stringify(body); },
+    };
+  }
+  function mockRes() {
+    const res = {
+      headersSent: false, writableEnded: false,
+      _status: null, _body: '', _headers: {},
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(status) { this._status = status; this.headersSent = true; },
+      write(chunk) { this._body += chunk; },
+      end(chunk = '') { this._body += chunk; this.writableEnded = true; },
+      once() {}, on() {}, off() {},
+    };
+    return res;
+  }
+  function stubFetch(resp) {
+    const orig = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => resp, text: async () => JSON.stringify(resp), body: null });
+    return () => { global.fetch = orig; };
+  }
+
+  // Build a minimal valid Ollama response so the fetch path succeeds.
+  const ollamaResp = {
+    choices: [{ message: { content: 'hi', role: 'assistant' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 5, completion_tokens: 1 },
+  };
+
+  test('exported constant is null when env var is unset', () => {
+    const { PROXY_MAX_INPUT_TOKENS } = require('./proxy');
+    assert.equal(PROXY_MAX_INPUT_TOKENS, null);
+  });
+
+  test('exported constant reflects the configured value', () => {
+    withMaxInputTokens(500, (mod) => {
+      assert.equal(mod.PROXY_MAX_INPUT_TOKENS, 500);
+    });
+  });
+
+  test('handleMessages: 400 when estimated input tokens exceed limit', async () => {
+    await withMaxInputTokens(1, async (mod) => {
+      // A message with many chars will easily exceed 1 est. token.
+      const longContent = 'x'.repeat(400); // ~100 est. tokens
+      const req = mockReq({ messages: [{ role: 'user', content: longContent }] });
+      const res = mockRes();
+      await mod.handleMessages(req, res);
+      assert.equal(res._status, 400);
+      const body = JSON.parse(res._body);
+      assert.equal(body.error.type, 'invalid_request_error');
+      assert.match(body.error.message, /PROXY_MAX_INPUT_TOKENS/);
+    });
+  });
+
+  test('handleMessages: succeeds when estimated input tokens are within limit', async () => {
+    await withMaxInputTokens(100000, async (mod) => {
+      const restore = stubFetch(ollamaResp);
+      try {
+        const req = mockReq({ messages: [{ role: 'user', content: 'hi' }] });
+        const res = mockRes();
+        await mod.handleMessages(req, res);
+        assert.equal(res._status, 200);
+      } finally { restore(); }
+    });
+  });
+
+  test('handleOpenAIChat: 400 when estimated input tokens exceed limit', async () => {
+    await withMaxInputTokens(1, async (mod) => {
+      const longContent = 'x'.repeat(400);
+      const openAiReq = {
+        headers: {},
+        socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+        method: 'POST', url: '/v1/chat/completions',
+        [Symbol.asyncIterator]: async function* () {
+          yield JSON.stringify({ model: 'llama3', messages: [{ role: 'user', content: longContent }] });
+        },
+      };
+      const res = mockRes();
+      await mod.handleOpenAIChat(openAiReq, res);
+      assert.equal(res._status, 400);
+      const body = JSON.parse(res._body);
+      assert.equal(body.error.type, 'invalid_request_error');
+      assert.match(body.error.message, /PROXY_MAX_INPUT_TOKENS/);
+    });
+  });
+
+  test('handleOpenAICompletions: 400 when estimated input tokens exceed limit', async () => {
+    await withMaxInputTokens(1, async (mod) => {
+      const longPrompt = 'x'.repeat(400);
+      const completionReq = {
+        headers: {},
+        socket: { once: () => {}, off: () => {}, remoteAddress: '127.0.0.1' },
+        method: 'POST', url: '/v1/completions',
+        [Symbol.asyncIterator]: async function* () {
+          yield JSON.stringify({ model: 'llama3', prompt: longPrompt, max_tokens: 10 });
+        },
+      };
+      const res = mockRes();
+      await mod.handleOpenAICompletions(completionReq, res);
+      assert.equal(res._status, 400);
+      const body = JSON.parse(res._body);
+      assert.equal(body.error.type, 'invalid_request_error');
+      assert.match(body.error.message, /PROXY_MAX_INPUT_TOKENS/);
+    });
+  });
+
+  test('processBatchRequest: returns errored when estimated input tokens exceed limit', async () => {
+    await withMaxInputTokens(1, async (mod) => {
+      const longContent = 'x'.repeat(400);
+      const result = await mod.processBatchRequest(
+        { messages: [{ role: 'user', content: longContent }], max_tokens: 100 },
+        'http://localhost:11434',
+        'default'
+      );
+      assert.equal(result.type, 'errored');
+      assert.equal(result.error.type, 'invalid_request_error');
+      assert.match(result.error.message, /PROXY_MAX_INPUT_TOKENS/);
+    });
+  });
+
+  test('warning logged and constant is null for non-numeric PROXY_MAX_INPUT_TOKENS', () => {
+    withMaxInputTokens('notanumber', (mod) => {
+      assert.equal(mod.PROXY_MAX_INPUT_TOKENS, null);
+    });
+  });
+});
