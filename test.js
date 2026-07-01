@@ -70,6 +70,7 @@ const {
   _batches,
   truncateToContext,
   handleEmbeddings,
+  handleCountTokens,
   validateEncodingFormat,
   embeddingToBase64,
   handleDashboard,
@@ -2370,6 +2371,60 @@ describe('handleCountTokens — model access control', () => {
         fetchStub.restore();
       }
     });
+  });
+});
+
+// ── handleCountTokens — input validation ──────────────────────────────────────
+// handleCountTokens used a non-standard '{"error":"bad json"}' flat string for
+// the JSON parse error instead of the Anthropic nested error format, and never
+// called validateTools — both inconsistencies with every other handler.
+
+describe('handleCountTokens — input validation', () => {
+  function makeReq(rawBody) {
+    const req = {
+      headers: {},
+      socket: { remoteAddress: '127.0.0.1', once() {}, off() {} },
+      _apiKeyName: 'default',
+    };
+    req[Symbol.asyncIterator] = async function* () { yield Buffer.from(rawBody); };
+    return req;
+  }
+  function makeRes() {
+    return {
+      _status: null, _body: '', _headers: {},
+      writableEnded: false,
+      setHeader(k, v) { this._headers[k] = v; },
+      getHeader(k) { return this._headers[k]; },
+      writeHead(s, h) { this._status = s; if (h) Object.assign(this._headers, h); },
+      end(c = '') { this._body += c; this.writableEnded = true; },
+    };
+  }
+
+  test('returns standard invalid_request_error (not flat string) for malformed JSON body', async () => {
+    const res = makeRes();
+    await handleCountTokens(makeReq('{bad json}'), res);
+    assert.equal(res._status, 400);
+    assert.equal(res._headers['Content-Type'], 'application/json');
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.ok(typeof body.error.message === 'string' && body.error.message.length > 0);
+  });
+
+  test('returns 400 invalid_request_error for non-array tools', async () => {
+    const res = makeRes();
+    await handleCountTokens(makeReq(JSON.stringify({ model: 'qwen2.5:7b', messages: [{ role: 'user', content: 'hi' }], tools: 'not-an-array' })), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.ok(body.error.message.includes('tools'));
+  });
+
+  test('returns 400 invalid_request_error for a tool entry missing a name', async () => {
+    const res = makeRes();
+    await handleCountTokens(makeReq(JSON.stringify({ model: 'qwen2.5:7b', messages: [{ role: 'user', content: 'hi' }], tools: [{ description: 'no name field' }] })), res);
+    assert.equal(res._status, 400);
+    const body = JSON.parse(res._body);
+    assert.equal(body.error.type, 'invalid_request_error');
   });
 });
 
