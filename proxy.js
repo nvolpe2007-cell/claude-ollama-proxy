@@ -2913,7 +2913,7 @@ async function handleCountTokens(req, res) {
   const body = await readBody(req);
   let anthropicReq;
   try { anthropicReq = JSON.parse(body); }
-  catch { res.writeHead(400); res.end('{"error":"bad json"}'); return; }
+  catch { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Request body is not valid JSON' } })); return; }
 
   if (!Array.isArray(anthropicReq.messages)) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -2939,6 +2939,13 @@ async function handleCountTokens(req, res) {
   if (ctSystemResult.error) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: ctSystemResult.error } }));
+    return;
+  }
+
+  const ctToolsResult = validateTools(anthropicReq.tools);
+  if (ctToolsResult.error) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: ctToolsResult.error } }));
     return;
   }
 
