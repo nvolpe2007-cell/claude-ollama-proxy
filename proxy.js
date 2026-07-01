@@ -198,6 +198,24 @@ const PROXY_HARD_MAX_TOKENS = (() => {
   }
   return Math.floor(n);
 })();
+// Hard ceiling on estimated input tokens per request. Uses the same chars/4 heuristic as
+// PROXY_AUTO_TRUNCATE. Requests whose estimated input tokens exceed this value are rejected
+// with 400 invalid_request_error before reaching Ollama, so the GPU isn't even queued.
+// Complements PROXY_HARD_MAX_TOKENS (output cap) and PROXY_MAX_BODY_SIZE (byte cap) to give
+// operators a complete three-lever request-budget control. Useful on shared deployments where
+// a single large-context request can monopolise the GPU prefill phase even when output is short.
+// Applies to POST /v1/messages, /v1/chat/completions, /v1/completions, and batch items.
+// The estimate runs AFTER PROXY_AUTO_TRUNCATE (if active), so truncation still takes effect
+// first. Default: no limit.
+const PROXY_MAX_INPUT_TOKENS = (() => {
+  if (!process.env.PROXY_MAX_INPUT_TOKENS) return null;
+  const n = Number(process.env.PROXY_MAX_INPUT_TOKENS);
+  if (!Number.isFinite(n) || n < 1) {
+    console.warn('Warning: PROXY_MAX_INPUT_TOKENS must be a positive integer, ignoring');
+    return null;
+  }
+  return Math.floor(n);
+})();
 // Optional system prompt injected before every request's system field.
 // Useful for enforcing consistent model behavior across all callers without modifying clients.
 // When the client also supplies a system prompt, the proxy's prompt is prepended (separated by
@@ -1381,6 +1399,17 @@ async function handleMessages(req, res) {
     }
   }
 
+  if (PROXY_MAX_INPUT_TOKENS) {
+    const estInputTokens = Math.ceil(JSON.stringify(openaiReq.messages).length / 4);
+    if (estInputTokens > PROXY_MAX_INPUT_TOKENS) {
+      req.socket.off('close', onClientClose);
+      clearTO();
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Estimated input tokens (~${estInputTokens}) exceed PROXY_MAX_INPUT_TOKENS limit of ${PROXY_MAX_INPUT_TOKENS}` } }));
+      return;
+    }
+  }
+
   debugLog(`→ Ollama [${ollamaBase}]`, openaiReq);
 
   let ollamaRes;
@@ -2357,6 +2386,12 @@ async function processBatchRequest(anthropicReq, ollamaBase, apiKeyName) {
     }
   }
 
+  if (PROXY_MAX_INPUT_TOKENS) {
+    const estInputTokens = Math.ceil(JSON.stringify(openaiReq.messages).length / 4);
+    if (estInputTokens > PROXY_MAX_INPUT_TOKENS)
+      return { type: 'errored', error: { type: 'invalid_request_error', message: `Estimated input tokens (~${estInputTokens}) exceed PROXY_MAX_INPUT_TOKENS limit of ${PROXY_MAX_INPUT_TOKENS}` } };
+  }
+
   let ollamaRes;
   try {
     ollamaRes = await fetchWithRetry(`${ollamaBase}/v1/chat/completions`, {
@@ -3239,6 +3274,7 @@ function handleDashboard(req, res) {
     timeout:            PROXY_TIMEOUT,
     idleTimeout:        PROXY_IDLE_TIMEOUT,
     maxBodySize:        PROXY_MAX_BODY_SIZE,
+    maxInputTokens:     PROXY_MAX_INPUT_TOKENS,
     systemPrompt:       PROXY_SYSTEM_PROMPT ? PROXY_SYSTEM_PROMPT.slice(0, 120) + (PROXY_SYSTEM_PROMPT.length > 120 ? '…' : '') : null,
     ollamaOptions:      Object.keys(OLLAMA_OPTIONS).length > 0 ? JSON.stringify(OLLAMA_OPTIONS) : null,
     maxConcurrency:     PROXY_MAX_CONCURRENCY,
@@ -3340,6 +3376,7 @@ async function refresh(){
   g+=row('TLS',badge(C.tls,'HTTPS','HTTP'));
   g+=row('Default max_tokens',fmt(C.maxTokens));
   if(C.hardMaxTokens)g+=row('Hard max_tokens cap',fmt(C.hardMaxTokens));
+  if(C.maxInputTokens)g+=row('Max input tokens (est.)',fmt(C.maxInputTokens));
   g+=row('Context (num_ctx)',C.numCtx?fmt(C.numCtx):'model default');
   if(C.keepAlive)g+=row('Keep-alive',C.keepAlive);
   if(C.timeout)g+=row('Timeout',fmt(C.timeout)+' ms');
@@ -3579,6 +3616,17 @@ async function handleOpenAIChat(req, res) {
       const newEst = Math.ceil(JSON.stringify(trimmed).length / 4);
       console.warn(`[auto-truncate] Dropped ${droppedCount} message(s): ~${origEst} → ~${newEst} est. tokens (OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX})`);
       res.setHeader('x-context-truncated', String(droppedCount));
+    }
+  }
+
+  if (PROXY_MAX_INPUT_TOKENS) {
+    const estInputTokens = Math.ceil(JSON.stringify(openaiReq.messages).length / 4);
+    if (estInputTokens > PROXY_MAX_INPUT_TOKENS) {
+      req.socket.off('close', onClientClose);
+      clearTO();
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Estimated input tokens (~${estInputTokens}) exceed PROXY_MAX_INPUT_TOKENS limit of ${PROXY_MAX_INPUT_TOKENS}` } }));
+      return;
     }
   }
 
@@ -3842,6 +3890,17 @@ async function handleOpenAICompletions(req, res) {
 
   if (PROXY_SYSTEM_PROMPT) {
     chatReq.messages.unshift({ role: 'system', content: PROXY_SYSTEM_PROMPT });
+  }
+
+  if (PROXY_MAX_INPUT_TOKENS) {
+    const estInputTokens = Math.ceil(JSON.stringify(chatReq.messages).length / 4);
+    if (estInputTokens > PROXY_MAX_INPUT_TOKENS) {
+      req.socket.off('close', onClientClose);
+      clearTO();
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Estimated input tokens (~${estInputTokens}) exceed PROXY_MAX_INPUT_TOKENS limit of ${PROXY_MAX_INPUT_TOKENS}` } }));
+      return;
+    }
   }
 
   debugLog(`→ Ollama [${ollamaBase}] (completions)`, chatReq);
@@ -4247,6 +4306,7 @@ if (require.main === module) {
     console.log(`  IdleTimeout: ${PROXY_IDLE_TIMEOUT ? `${PROXY_IDLE_TIMEOUT}ms idle stream timeout` : 'none (set PROXY_IDLE_TIMEOUT to abort stuck streams)'}`);
     console.log(`  MaxTok: default max_tokens=${PROXY_MAX_TOKENS}${PROXY_HARD_MAX_TOKENS ? ` (hard cap: ${PROXY_HARD_MAX_TOKENS})` : ' (set PROXY_HARD_MAX_TOKENS to cap)'}`);
     console.log(`  MaxBody: ${PROXY_MAX_BODY_SIZE ? `${PROXY_MAX_BODY_SIZE} B per request` : 'unlimited (set PROXY_MAX_BODY_SIZE to limit)'}`);
+    if (PROXY_MAX_INPUT_TOKENS) console.log(`  MaxInput: max ~${PROXY_MAX_INPUT_TOKENS} est. input tokens per request (set PROXY_MAX_INPUT_TOKENS)`);
     if (PROXY_SYSTEM_PROMPT) console.log(`  SysPrompt: ${PROXY_SYSTEM_PROMPT.slice(0, 80)}${PROXY_SYSTEM_PROMPT.length > 80 ? '…' : ''}`);
     console.log(`  Logs  : format=${LOG_FORMAT} level=${LOG_LEVEL} (LOG_FORMAT=json for structured; LOG_LEVEL=debug for full request/response bodies)`);
     console.log(`  Think : ${PROXY_FORCE_THINK ? 'forced (think:true on every request — set PROXY_FORCE_THINK=false to disable)' : 'client-controlled (set PROXY_FORCE_THINK=true to always enable for thinking models)'}`);
@@ -4375,6 +4435,7 @@ module.exports = {
   validateEncodingFormat,
   embeddingToBase64,
   PROXY_HARD_MAX_TOKENS,
+  PROXY_MAX_INPUT_TOKENS,
   PROXY_IDLE_TIMEOUT,
   PROXY_FORCE_THINK,
   PROXY_TRUST_PROXY,
