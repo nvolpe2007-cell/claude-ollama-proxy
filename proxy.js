@@ -3,6 +3,7 @@ const https  = require('https');
 const fs     = require('fs');
 const path   = require('path');
 const crypto = require('crypto');
+const zlib   = require('zlib');
 
 let PROXY_VERSION = 'unknown';
 try { PROXY_VERSION = require('./package.json').version; } catch {}
@@ -359,6 +360,50 @@ function sanitizeForLog(obj, maxChars = 200) {
     return out;
   }
   return obj;
+}
+
+// Minimum response body size (bytes) before gzip compression is attempted.
+// Below this threshold the gzip header overhead exceeds the savings.
+const MIN_COMPRESS_SIZE = 860;
+
+// Sends a complete (non-streaming) JSON response, compressing with gzip when
+// the client advertises support via Accept-Encoding: gzip and the body is large
+// enough that compression pays off. Streaming SSE/NDJSON responses must NOT use
+// this — they need per-chunk flushing that is incompatible with block compression.
+//
+// bodyOrObj may be:
+//   - a plain JS value  → serialised with JSON.stringify
+//   - a string          → sent as-is (allows pre-formatted JSON e.g. with indentation)
+//   - a Buffer          → sent as-is (pre-encoded)
+//
+// extraHeaders (optional) are merged into the response headers after
+// Content-Type: application/json; caller-supplied keys take precedence.
+//
+// Exported for unit testing.
+async function sendJSON(req, res, status, bodyOrObj, extraHeaders) {
+  const body = Buffer.isBuffer(bodyOrObj)
+    ? bodyOrObj
+    : Buffer.from(typeof bodyOrObj === 'string' ? bodyOrObj : JSON.stringify(bodyOrObj));
+  const ae = String(req.headers?.['accept-encoding'] || '');
+  const headers = Object.assign({ 'Content-Type': 'application/json' }, extraHeaders);
+  if (body.length >= MIN_COMPRESS_SIZE && ae.includes('gzip')) {
+    try {
+      const compressed = await new Promise((resolve, reject) =>
+        zlib.gzip(body, (err, r) => (err ? reject(err) : resolve(r)))
+      );
+      headers['Content-Encoding'] = 'gzip';
+      headers['Vary'] = 'Accept-Encoding';
+      headers['Content-Length'] = String(compressed.length);
+      if (!res.headersSent) res.writeHead(status, headers);
+      res.end(compressed);
+      return;
+    } catch (e) {
+      console.warn(`[gzip] compression failed, sending uncompressed: ${e.message}`);
+    }
+  }
+  headers['Content-Length'] = String(body.length);
+  if (!res.headersSent) res.writeHead(status, headers);
+  res.end(body);
 }
 
 // Extracts a human-readable error string from an Ollama error response body.
@@ -1488,8 +1533,7 @@ async function handleMessages(req, res) {
     const completionTok = data.usage?.completion_tokens || 0;
     recordTokens(promptTok, completionTok, effectiveModel, req._apiKeyName);
     res._logMeta = { model: effectiveModel, tokensIn: promptTok, tokensOut: completionTok };
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    await sendJSON(req, res, 200, {
       id: newMsgId(),
       type: 'message',
       role: 'assistant',
@@ -1505,7 +1549,7 @@ async function handleMessages(req, res) {
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0
       }
-    }));
+    });
     return;
   }
 
@@ -1938,8 +1982,7 @@ async function handleModels(req, res) {
       };
     });
 
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ object: 'list', data: [...ollamaModels, ...aliasModels] }));
+  await sendJSON(req, res, 200, { object: 'list', data: [...ollamaModels, ...aliasModels] });
 }
 
 async function handleModelById(req, res, modelId) {
@@ -2017,8 +2060,7 @@ async function handleModelById(req, res, modelId) {
     if (showData.template) resp.template  = showData.template;
   }
 
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(resp));
+  await sendJSON(req, res, 200, resp);
 }
 
 // DELETE /v1/models/:id — deletes a model from Ollama via DELETE /api/delete.
@@ -2900,13 +2942,12 @@ async function handleEmbeddings(req, res) {
 
   const toEmbeddingValue = embedReq.encoding_format === 'base64' ? embeddingToBase64 : (emb) => emb;
 
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
+  await sendJSON(req, res, 200, {
     object: 'list',
     data: embeddings.map((emb, i) => ({ object: 'embedding', embedding: toEmbeddingValue(emb), index: i })),
     model: effectiveModel,
     usage: { prompt_tokens: promptTokens, total_tokens: promptTokens },
-  }));
+  });
 }
 
 async function handleCountTokens(req, res) {
@@ -2979,8 +3020,7 @@ async function handleCountTokens(req, res) {
     inputTokens = Math.ceil(prompt.length / 4);
   }
 
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ input_tokens: inputTokens }));
+  await sendJSON(req, res, 200, { input_tokens: inputTokens });
 }
 
 async function handleHealth(req, res) {
@@ -3024,8 +3064,7 @@ async function handleHealth(req, res) {
 
   const status = !allOk ? 'degraded' : (modelAvailable === false ? 'degraded' : 'ok');
 
-  res.writeHead(anyOk ? 200 : 503, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
+  await sendJSON(req, res, anyOk ? 200 : 503, {
     status,
     proxy: 'running',
     version: PROXY_VERSION,
@@ -3040,7 +3079,7 @@ async function handleHealth(req, res) {
     } : {}),
     port: Number(PORT),
     timestamp: new Date().toISOString()
-  }));
+  });
 }
 
 async function handleMetrics(req, res) {
@@ -3055,8 +3094,7 @@ async function handleMetrics(req, res) {
   for (const [name, m] of Object.entries(_metrics.apiKeysUsed)) {
     apiKeysUsage[name] = { requests: m.requests, tokens_in: m.tokensIn, tokens_out: m.tokensOut };
   }
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
+  await sendJSON(req, res, 200, JSON.stringify({
     uptime_seconds:      Math.floor((Date.now() - _metrics.startTime) / 1000),
     requests_total:      _metrics.requests,
     status_codes:        _metrics.statusCodes,
@@ -3645,8 +3683,7 @@ async function handleOpenAIChat(req, res) {
     const completionTok = data.usage?.completion_tokens || 0;
     recordTokens(promptTok, completionTok, effectiveModel, req._apiKeyName);
     res._logMeta = { model: effectiveModel, tokensIn: promptTok, tokensOut: completionTok };
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(data));
+    await sendJSON(req, res, 200, data);
     return;
   }
 
@@ -4264,6 +4301,7 @@ if (require.main === module) {
       console.log(`  Queue    : up to ${PROXY_MAX_QUEUE_SIZE} requests queued${PROXY_MAX_QUEUE_TIMEOUT ? ` (${PROXY_MAX_QUEUE_TIMEOUT}ms timeout)` : ' (no timeout)'}`);
     if (Object.keys(OLLAMA_OPTIONS).length > 0)
       console.log(`  Options: OLLAMA_OPTIONS=${JSON.stringify(OLLAMA_OPTIONS)}`);
+    console.log(`  Gzip  : non-streaming JSON responses ≥ ${MIN_COMPRESS_SIZE} B compressed when client sends Accept-Encoding: gzip`);
     console.log('');
 
     // Non-blocking Ollama connectivity check. Skipped when PROXY_WARMUP=true because the
@@ -4454,4 +4492,6 @@ module.exports = {
   handleModels,
   handleModelById,
   handleDashboard,
+  sendJSON,
+  MIN_COMPRESS_SIZE,
 };
