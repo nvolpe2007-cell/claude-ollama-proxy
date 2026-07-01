@@ -3,6 +3,7 @@ const https  = require('https');
 const fs     = require('fs');
 const path   = require('path');
 const crypto = require('crypto');
+const zlib   = require('zlib');
 
 let PROXY_VERSION = 'unknown';
 try { PROXY_VERSION = require('./package.json').version; } catch {}
@@ -914,6 +915,23 @@ function toOpenAIToolChoice(tc) {
 
 function sendSSE(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+// Sends a non-streaming response with optional gzip compression when the client
+// supports it (Accept-Encoding: gzip). Adds Vary: Accept-Encoding for correctness.
+// Never use for SSE streaming paths — those write directly to res.
+function sendCompressed(req, res, statusCode, headers, body) {
+  const accept = req.headers?.['accept-encoding'] || '';
+  if (accept.includes('gzip')) {
+    try {
+      const buf = zlib.gzipSync(Buffer.from(body));
+      res.writeHead(statusCode, { ...headers, 'Content-Encoding': 'gzip', 'Vary': 'Accept-Encoding' });
+      res.end(buf);
+      return;
+    } catch { /* fall through to uncompressed */ }
+  }
+  res.writeHead(statusCode, { ...headers, 'Vary': 'Accept-Encoding' });
+  res.end(body);
 }
 
 function newMsgId() {
@@ -3055,8 +3073,7 @@ async function handleMetrics(req, res) {
   for (const [name, m] of Object.entries(_metrics.apiKeysUsed)) {
     apiKeysUsage[name] = { requests: m.requests, tokens_in: m.tokensIn, tokens_out: m.tokensOut };
   }
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
+  sendCompressed(req, res, 200, { 'Content-Type': 'application/json' }, JSON.stringify({
     uptime_seconds:      Math.floor((Date.now() - _metrics.startTime) / 1000),
     requests_total:      _metrics.requests,
     status_codes:        _metrics.statusCodes,
@@ -3208,8 +3225,7 @@ async function handleMetricsPrometheus(req, res) {
   out.push(`proxy_request_latency_avg_ms ${latAvg}`);
   out.push('');
 
-  res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
-  res.end(out.join('\n') + '\n');
+  sendCompressed(req, res, 200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' }, out.join('\n') + '\n');
 }
 
 // GET / — live HTML dashboard showing proxy health, metrics, and model usage.
@@ -3443,8 +3459,7 @@ setInterval(refresh,5000);
 </body>
 </html>`;
 
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(html);
+  sendCompressed(req, res, 200, { 'Content-Type': 'text/html; charset=utf-8' }, html);
 }
 
 // Accepts OpenAI-format POST /v1/chat/completions requests and forwards them to Ollama,
@@ -4454,4 +4469,5 @@ module.exports = {
   handleModels,
   handleModelById,
   handleDashboard,
+  sendCompressed,
 };

@@ -73,6 +73,7 @@ const {
   validateEncodingFormat,
   embeddingToBase64,
   handleDashboard,
+  sendCompressed,
 } = require('./proxy');
 
 // ── resolveModel ──────────────────────────────────────────────────────────────
@@ -6742,5 +6743,61 @@ describe('GET / dashboard — XSS escaping', () => {
     });
     assert.ok(html.includes('GET /health'));
     assert.ok(html.includes('qwen2.5:7b'));
+  });
+});
+
+// ── sendCompressed ────────────────────────────────────────────────────────────
+
+describe('sendCompressed', () => {
+  function mockRes() {
+    const res = { _code: null, _headers: null, _body: null };
+    res.writeHead = (code, headers) => { res._code = code; res._headers = headers; };
+    res.end = (body) => { res._body = body; };
+    return res;
+  }
+
+  test('returns uncompressed body when Accept-Encoding is absent', () => {
+    const req = { headers: {} };
+    const res = mockRes();
+    sendCompressed(req, res, 200, { 'Content-Type': 'text/plain' }, 'hello');
+    assert.equal(res._code, 200);
+    assert.equal(res._body, 'hello');
+    assert.equal(res._headers['Content-Encoding'], undefined);
+    assert.equal(res._headers['Vary'], 'Accept-Encoding');
+  });
+
+  test('returns uncompressed body when req has no headers object', () => {
+    const req = {};
+    const res = mockRes();
+    sendCompressed(req, res, 200, { 'Content-Type': 'text/plain' }, 'hello');
+    assert.equal(res._code, 200);
+    assert.equal(res._body, 'hello');
+    assert.equal(res._headers['Vary'], 'Accept-Encoding');
+  });
+
+  test('returns gzip-compressed body when Accept-Encoding includes gzip', () => {
+    const zlib = require('zlib');
+    const req = { headers: { 'accept-encoding': 'gzip, deflate' } };
+    const res = mockRes();
+    const body = 'compress me';
+    sendCompressed(req, res, 200, { 'Content-Type': 'text/plain' }, body);
+    assert.equal(res._code, 200);
+    assert.equal(res._headers['Content-Encoding'], 'gzip');
+    assert.equal(res._headers['Vary'], 'Accept-Encoding');
+    // Decompress and verify round-trip.
+    const decompressed = zlib.gunzipSync(res._body).toString();
+    assert.equal(decompressed, body);
+  });
+
+  test('Vary: Accept-Encoding header is present in both compressed and uncompressed paths', () => {
+    const paths = [
+      { headers: {} },
+      { headers: { 'accept-encoding': 'gzip' } },
+    ];
+    for (const req of paths) {
+      const res = mockRes();
+      sendCompressed(req, res, 200, { 'Content-Type': 'application/json' }, '{}');
+      assert.equal(res._headers['Vary'], 'Accept-Encoding', `Vary missing for accept-encoding=${req.headers['accept-encoding']}`);
+    }
   });
 });
